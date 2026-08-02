@@ -2416,6 +2416,7 @@ void retro_run(void)
    rumble_frames();
 
    FDD_IsReading = 0;
+   SASI_IsAccessing = 0;
 
    if (     (menu_mode == menu_out)
          && (  Config.AudioDesyncHack

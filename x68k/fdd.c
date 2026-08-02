@@ -36,6 +36,8 @@ static int (*Write[4])(int, FDCID*, uint8_t*, int)       = { 0, XDF_Write,      
 static int (*GetCurrentID[4])(int, FDCID*)                     = { 0, XDF_GetCurrentID, D88_GetCurrentID, DIM_GetCurrentID };
 
 int FDD_IsReading                                              = 0;
+/* アクセスランプをドライブ別に光らせるための直近アクセスドライブ番号 (WebX68k向け) */
+int FDD_AccessDrive                                            = -1;
 
 int FDD_StateAction(StateMem *sm, int load, int data_only)
 {
@@ -239,6 +241,7 @@ int FDD_Read(int drv, FDCID* id, uint8_t* buf)
 	if ( Read[type] )
 	{
 		FDD_IsReading = 1;
+		FDD_AccessDrive = drv;
 		return Read[type](drv, id, buf);
 	}
 	return 0;
@@ -262,7 +265,11 @@ int FDD_Write(int drv, FDCID* id, uint8_t* buf, int del)
 	if ( (drv<0)||(drv>3) ) return 0;
 	type = fdd.Types[drv];
 	if ( Write[type] )
+	{
+		FDD_IsReading = 1;
+		FDD_AccessDrive = drv;
 		return Write[type](drv, id, buf, del);
+	}
 	return 0;
 }
 

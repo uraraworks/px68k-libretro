@@ -26,6 +26,8 @@ static uint8_t SASI_Error        = 0;
 static uint8_t SASI_SenseStatBuf[4];
 static uint8_t SASI_SenseStatPtr = 0;
 
+int SASI_IsAccessing = 0;
+
 int SASI_StateAction(StateMem *sm, int load, int data_only)
 {
 	SFORMAT StateRegs[] = 
@@ -149,6 +151,7 @@ uint8_t FASTCALL SASI_Read(uint32_t adr)
 	{
 		if ((SASI_Phase==3)&&(SASI_RW))
 		{
+			SASI_IsAccessing = 1;
 			ret = SASI_Buf[SASI_BufPtr++];
 			if (SASI_BufPtr==256)
 			{
@@ -351,6 +354,7 @@ void FASTCALL SASI_Write(uint32_t adr, uint8_t data)
 		}
 		else if ((SASI_Phase==3) && (!SASI_RW))
 		{
+			SASI_IsAccessing = 1;
 			SASI_Buf[SASI_BufPtr++] = data;
 			if (SASI_BufPtr==256)
 			{

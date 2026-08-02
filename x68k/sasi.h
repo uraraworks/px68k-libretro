@@ -10,4 +10,8 @@ void FASTCALL SASI_Write(uint32_t adr, uint8_t data);
 int SASI_IsReady(void);
 int SASI_StateAction(StateMem *sm, int load, int data_only);
 
+/* Misc: HDD(SASI)アクセスランプ用。データ転送が発生したフレームで1になる。
+ * WebX68k向け。retro_run() の毎フレーム先頭で0クリアされる想定。 */
+extern int SASI_IsAccessing;
+
 #endif /* _WINX68K_SASI_H */
