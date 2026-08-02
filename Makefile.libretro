@@ -151,6 +151,11 @@ else ifneq (,$(findstring android,$(platform)))
 	CXX = arm-linux-androideabi-g++
 	FLAGS += -D__LINUX__ -DARM -marm
 
+# Emscripten
+else ifeq ($(platform), emscripten)
+	TARGET := $(TARGET_NAME)_libretro_$(platform).bc
+	STATIC_LINKING = 1
+
 # crosspi arm
 else ifneq (,$(findstring crosspi,$(platform)))
 	CC = arm-linux-gnueabihf-gcc
