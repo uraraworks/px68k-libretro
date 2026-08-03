@@ -11,5 +11,7 @@ px68k-ios/px68k-ios.xcodeproj/xcuserdata
 *.o
 *.so
 *.dll
+# emscripten ビルド(WebX68k の scripts/build-core.sh)の中間生成物
+*.bc
 libretro/libs
 libretro/obj
