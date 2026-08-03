@@ -126,3 +126,32 @@ void Mouse_StartCapture(int flag)
 	else if (!flag && MouseSW)
 		MouseSW = 0;
 }
+
+
+/*
+ *	Peek accumulated state (for WebX68k host-side wiring diagnostics)
+ *
+ *	MouseDX/DY are only drained by Mouse_SetData(), which the guest triggers
+ *	through the SCC. Without guest software polling the mouse, MouseX/MouseY
+ *	stay zero, so these accessors are the only way to confirm from the host
+ *	that mouse events actually reach the core.
+ */
+float Mouse_PeekDX(void)
+{
+	return MouseDX;
+}
+
+float Mouse_PeekDY(void)
+{
+	return MouseDY;
+}
+
+int Mouse_PeekStat(void)
+{
+	return MouseStat;
+}
+
+int Mouse_IsEnabled(void)
+{
+	return MouseSW;
+}
