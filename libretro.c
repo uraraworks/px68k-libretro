@@ -2025,29 +2025,24 @@ static const LRKCNV KeyTable[] = {
    { RETROK_PRINT,         0x52 }, /* symbol input (kigou) */
    { RETROK_SCROLLOCK,     0x53 }, /* registration (touroku) */
    { RETROK_F11,           0x54 }, /* HELP */
-#if 0
-   { NC,                   0x55 }, /* XF1 */
-   { NC,                   0x56 }, /* XF2 */
-   { NC,                   0x57 }, /* XF3 */
-   { NC,                   0x58 }, /* XF4 */
-   { NC,                   0x59 }, /* XF5 */
+   /* WebX68k fork: direct RETROK mappings; keep KeyTable1 for COMPOSE compatibility. */
+   { RETROK_EURO,          0x55 }, /* XF1: RETROK_EURO */
+   { RETROK_UNDO,          0x56 }, /* XF2: RETROK_UNDO */
+   { RETROK_OEM_102,       0x57 }, /* XF3: RETROK_OEM_102 */
+   { RETROK_BROWSER_BACK,  0x58 }, /* XF4: RETROK_BROWSER_BACK */
+   { RETROK_BROWSER_FORWARD, 0x59 }, /* XF5: RETROK_BROWSER_FORWARD */
 
-   { NC,                   0x5a }, /* KANA */
-   { NC,                   0x5b }, /* ROMAN Alphabet */
-   { NC,                   0x5c }, /* Enter code */
-#endif
+   { RETROK_BROWSER_REFRESH, 0x5a }, /* KANA: RETROK_BROWSER_REFRESH */
+   { RETROK_BROWSER_STOP,  0x5b }, /* ROMAN Alphabet: RETROK_BROWSER_STOP */
+   { RETROK_BROWSER_SEARCH, 0x5c }, /* Enter code: RETROK_BROWSER_SEARCH */
    { RETROK_CAPSLOCK,      0x5d }, /* CAPSLOCK */
 
    { RETROK_INSERT,        0x5e }, /* INSERT */
-#if 0
-   { NC,                   0x5f }, /* Hiragana */
-   { NC,                   0x60 }, /* Full-width */
-#endif
+   { RETROK_BROWSER_FAVORITES, 0x5f }, /* Hiragana: RETROK_BROWSER_FAVORITES */
+   { RETROK_BROWSER_HOME,  0x60 }, /* Full-width: RETROK_BROWSER_HOME */
    { RETROK_BREAK,         0x61 },  /* BREAK */
    { RETROK_PAUSE,         0x61 },  /* BREAK (allow shift+break combo) */
-#if 0
-   { NC,                   0x62 }, /* COPY */
-#endif
+   { RETROK_VOLUME_MUTE,   0x62 }, /* COPY: RETROK_VOLUME_MUTE */
    { RETROK_F1,            0x63},  /* F1 */
    { RETROK_F2,            0x64},  /* F2 */
    { RETROK_F3,            0x65},  /* F3 */
@@ -2458,7 +2453,8 @@ void retro_run(void)
       Mouse_Event(2,0,0);
    }
 
-   for(i = 0; i < 320; i++)
+   /* WebX68k の専用キー(RETROK_EURO 以降)もポーリング対象に含める。 */
+   for(i = 0; i < RETROK_LAST; i++)
       Core_Key_State[i] = input_state_cb(0, RETRO_DEVICE_KEYBOARD, 0, i) ? 0x80: 0;
 
    Core_Key_State[RETROK_XFX] = 0;
@@ -2526,4 +2522,3 @@ void retro_run(void)
    /* TODO/FIXME - hardcoded pitch here */
    video_cb(videoBuffer, retrow, retroh, /*retrow*/ 800 << 1);
 }
-
