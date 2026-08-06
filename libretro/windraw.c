@@ -40,9 +40,13 @@
 #include "keyboard.h"
 
 #define		SCREEN_WIDTH		768
-#define		FULLSCREEN_WIDTH	800
+#define		FULLSCREEN_WIDTH	1024
+#define		FULLSCREEN_HEIGHT	1024
+#define		MENU_WIDTH		800
 
 extern uint16_t *videoBuffer;
+/* video_cb へ渡す stride(pixel単位)。通常画面は FULLSCREEN_WIDTH、メニュー時は MENU_WIDTH */
+uint32_t retro_pitch = FULLSCREEN_WIDTH;
 uint16_t menu_buffer[800*600];
 
 extern uint8_t Debug_Text, Debug_Grp, Debug_Sp;
@@ -57,7 +61,7 @@ void WinDraw_Init(void)
 	WinDraw_Pal16G = 0x07e0;
 	WinDraw_Pal16B = 0x001f;
 
-	ScrBuf         = malloc(800 * 600 * 2);
+	ScrBuf         = malloc(FULLSCREEN_WIDTH * FULLSCREEN_HEIGHT * 2);
 }
 
 void WinDraw_Cleanup(void)
@@ -92,6 +96,7 @@ void FASTCALL WinDraw_Draw(void)
 		retroh=TextDotY;
 	}
 
+	retro_pitch = FULLSCREEN_WIDTH;
 	videoBuffer = (uint16_t*)ScrBuf;
 }
 
@@ -1003,6 +1008,7 @@ void WinDraw_DrawMenu(int menu_state, int mkey_pos, int mkey_y, int *mval_y)
 	set_mlocateC(2, 12);
 	draw_str(menu_item_desc[mkey_y]);
 
+	retro_pitch = MENU_WIDTH;
 	videoBuffer=(uint16_t*)menu_buffer;
 
 }
@@ -1056,6 +1062,7 @@ void WinDraw_DrawMenufile(struct menu_flist *mfl)
 
 	p6m.mbcolor = 0x0; /* switch back to transparent mode */
 
+	retro_pitch = MENU_WIDTH;
 	videoBuffer=(uint16_t*)menu_buffer;
 }
 

@@ -189,7 +189,15 @@ static void CRTC_ScreenChanged(void)
 {
    static int last_vidmode = -1;
 
-	if ((CRTC_Regs[0x29] & 0x14) == 0x10)
+	if (CRTC_Regs[0x29] & 0x08)
+	{
+		/* R20 b3-b2=10: vertical 1024 lines (interlace, e.g. 1024x848).
+		 * b4 (high reso) is also set in this mode, so it must be tested
+		 * before the "HighReso 256dot" case below. */
+		TextDotY *= 2;
+		CRTC_VStep = 4;
+	}
+	else if ((CRTC_Regs[0x29] & 0x14) == 0x10)
 	{
 		TextDotY /= 2;
 		CRTC_VStep = 1;

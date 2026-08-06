@@ -15,7 +15,7 @@
 uint8_t	TVRAM[0x80000];
 static uint8_t TextDrawWork[1024*1024];
 uint8_t	TextDirtyLine[1024];
-uint8_t	Text_TrFlag[1024];
+uint8_t	Text_TrFlag[1040];	/* 1024ドットモードでは 16..TextDotX+16 まで参照される */
 
 /* pattern table */
 static uint8_t TextDrawPattern[2048*4];

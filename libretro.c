@@ -139,6 +139,7 @@ static int16_t soundbuf[1024 * 2];
 static int soundbuf_size;
 
 uint16_t *videoBuffer;
+extern uint32_t retro_pitch;
 
 enum {
    menu_out,
@@ -1580,7 +1581,7 @@ void retro_get_system_info(struct retro_system_info *info)
 void retro_get_system_av_info(struct retro_system_av_info *info)
 {
    /* FIXME handle PAL/NTSC */
-   struct retro_game_geometry geom   = { retrow, retroh, 800, 600, 4.0 / 3.0 };
+   struct retro_game_geometry geom   = { retrow, retroh, 1024, 1024, 4.0 / 3.0 };
    struct retro_system_timing timing = { FRAMERATE, SOUNDRATE };
    info->geometry                    = geom;
    info->timing                      = timing;
@@ -2519,6 +2520,6 @@ void retro_run(void)
       midi_cb.flush();
 
    audio_batch_cb((const int16_t*)soundbuf, soundbuf_size);
-   /* TODO/FIXME - hardcoded pitch here */
-   video_cb(videoBuffer, retrow, retroh, /*retrow*/ 800 << 1);
+
+   video_cb(videoBuffer, retrow, retroh, retro_pitch << 1);
 }
