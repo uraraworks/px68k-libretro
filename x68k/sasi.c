@@ -27,6 +27,12 @@ static uint8_t SASI_SenseStatBuf[4];
 static uint8_t SASI_SenseStatPtr = 0;
 
 int SASI_IsAccessing = 0;
+/*
+ * ゲストが HDD へ書き込んだかどうか (WebX68k向け)。
+ * SASI_IsAccessing は読み書き両方で立ちフレームごとにクリアされるが、こちらは
+ * 「前回ホストが保存してから書き込みがあったか」なので自動クリアしない。
+ */
+int SASI_Dirty = 0;
 
 int SASI_StateAction(StateMem *sm, int load, int data_only)
 {
@@ -269,6 +275,7 @@ static void SASI_CheckCmd(void)
          SASI_RW = 0;
          SASI_BufPtr = 0;
          SASI_Stat = 0;
+         SASI_Dirty = 1;
          memset(SASI_Buf, 0, 256);
          result = SASI_Seek();
          if ( (result==0)||(result==-1) )

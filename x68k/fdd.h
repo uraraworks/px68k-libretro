@@ -46,5 +46,6 @@ int FDD_StateAction(StateMem *sm, int load, int data_only);
 extern int FDD_IsReading;
 /* アクセスランプをドライブ別に光らせるための直近アクセスドライブ番号 (WebX68k向け) */
 extern int FDD_AccessDrive;
+extern int FDD_DirtyMask;
 
 #endif /* _WINX68K_FDD_H */

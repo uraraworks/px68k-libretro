@@ -38,6 +38,13 @@ static int (*GetCurrentID[4])(int, FDCID*)                     = { 0, XDF_GetCur
 int FDD_IsReading                                              = 0;
 /* アクセスランプをドライブ別に光らせるための直近アクセスドライブ番号 (WebX68k向け) */
 int FDD_AccessDrive                                            = -1;
+/*
+ * ゲストがディスクへ書き込んだドライブのビットマスク (WebX68k向け)。
+ * アクセスランプ(FDD_IsReading/FDD_AccessDrive)は読み込みでも立つうえ retro_run() の
+ * 毎フレーム先頭で 0 クリアされるが、こちらは「前回ホストが吸い出してから書き込みが
+ * あったか」を表すので自動クリアしない。ホスト側が保存を終えた時点で明示的に落とす。
+ */
+int FDD_DirtyMask                                              = 0;
 
 int FDD_StateAction(StateMem *sm, int load, int data_only)
 {
@@ -228,7 +235,10 @@ int FDD_WriteID(int drv, int trk, uint8_t* buf, int num)
 	if ( (drv<0)||(drv>3) ) return 0;
 	type = fdd.Types[drv];
 	if ( WriteID[type] )
+	{
+		FDD_DirtyMask |= (1 << drv);
 		return WriteID[type](drv, trk, buf, num);
+	}
 	return 0;
 }
 
@@ -268,6 +278,7 @@ int FDD_Write(int drv, FDCID* id, uint8_t* buf, int del)
 	{
 		FDD_IsReading = 1;
 		FDD_AccessDrive = drv;
+		FDD_DirtyMask |= (1 << drv);
 		return Write[type](drv, id, buf, del);
 	}
 	return 0;

@@ -13,5 +13,6 @@ int SASI_StateAction(StateMem *sm, int load, int data_only);
 /* Misc: HDD(SASI)アクセスランプ用。データ転送が発生したフレームで1になる。
  * WebX68k向け。retro_run() の毎フレーム先頭で0クリアされる想定。 */
 extern int SASI_IsAccessing;
+extern int SASI_Dirty;
 
 #endif /* _WINX68K_SASI_H */
