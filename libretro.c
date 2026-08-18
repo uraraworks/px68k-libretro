@@ -80,12 +80,14 @@ const float framerates[2][2] = {
 char	winx68k_dir[2048];
 char	winx68k_ini[2048];
 
-uint16_t	VLINE_TOTAL = 567;
+uint16_t	VLINE_TOTAL = 260;
 uint32_t	VLINE = 0;
 uint32_t	vline = 0;
 
 #define SOUNDRATE 44100.0
-#define SNDSZ round(SOUNDRATE / FRAMERATE)
+#define SOUNDBUF_CAPACITY 2048
+#define CRTC_MIN_FRAMERATE 30.0f
+#define CRTC_MAX_FRAMERATE 130.0f
 
 static int firstcall          = 1;
 
@@ -132,10 +134,44 @@ int CHANGEAV              = 0;
 int CHANGEAV_TIMING       = 0; /* Separate change of geometry from change of refresh rate */
 int VID_MODE              = MODE_NORM; /* what framerate we start in */
 static float FRAMERATE;
+
+static float current_crtc_framerate(void)
+{
+   const int adjust = Config.AdjustFrameRates ? MODES_COMPAT : MODES_ACTUAL;
+   const int mode = VID_MODE == MODE_HIGH ? MODE_HIGH : MODE_NORM;
+   const float base = framerates[adjust][mode];
+   const uint32_t nominal_clocks = mode == MODE_HIGH ? VSYNC_HIGH : VSYNC_NORM;
+   const uint32_t frame_clocks = CRTC_GetFrameClocks();
+   float fps;
+
+   if (frame_clocks == 0)
+      return base;
+
+   fps = base * (float)nominal_clocks / (float)frame_clocks;
+   if (fps < CRTC_MIN_FRAMERATE)
+      fps = CRTC_MIN_FRAMERATE;
+   else if (fps > CRTC_MAX_FRAMERATE)
+      fps = CRTC_MAX_FRAMERATE;
+
+   return fps;
+}
+
+static int current_soundbuf_size(void)
+{
+   const float fps = FRAMERATE > 0.0f ? FRAMERATE : MODE_NORM_ACTUAL;
+   int samples = (int)round(SOUNDRATE / fps);
+
+   if (samples < 1)
+      samples = 1;
+   else if (samples > SOUNDBUF_CAPACITY)
+      samples = SOUNDBUF_CAPACITY;
+
+   return samples;
+}
 uint32_t libretro_supports_input_bitmasks = 0;
 unsigned int total_usec   = (unsigned int) -1;
 
-static int16_t soundbuf[1024 * 2];
+static int16_t soundbuf[SOUNDBUF_CAPACITY * 2];
 static int soundbuf_size;
 
 uint16_t *videoBuffer;
@@ -2187,9 +2223,11 @@ static void WinX68k_Exec(void)
 
    vline     = 0;
    clk_count = -ICount;
-   clk_total = (CRTC_Regs[0x29] & 0x10) ? VSYNC_HIGH : VSYNC_NORM;
+   clk_total = (int)CRTC_GetFrameClocks();
+   if (clk_total <= 0)
+      clk_total = (CRTC_Regs[0x29] & 0x10) ? VSYNC_HIGH : VSYNC_NORM;
 
-   clk_total = (clk_total*Config.clockmhz)/10;
+   clk_total = (int)(((int64_t)clk_total * Config.clockmhz) / 10);
    clkdiv    = Config.clockmhz;
 
 #if 0
@@ -2214,7 +2252,7 @@ static void WinX68k_Exec(void)
    }
 
    ICount  += clk_total;
-   clk_next = (clk_total/VLINE_TOTAL);
+   clk_next = (clk_total / (VLINE_TOTAL ? VLINE_TOTAL : 1));
    hsync    = 1;
 
    do
@@ -2323,7 +2361,7 @@ static void WinX68k_Exec(void)
          DSound_Send0(clk_line);
 
          vline++;
-         clk_next  = (clk_total*(vline+1))/VLINE_TOTAL;
+         clk_next  = (int)(((int64_t)clk_total * (vline + 1)) / (VLINE_TOTAL ? VLINE_TOTAL : 1));
          hsync     = 1;
       }
    } while (vline < VLINE_TOTAL);
@@ -2355,11 +2393,18 @@ static void WinX68k_Exec(void)
       WinDraw_Draw();
 
    t_end = timeGetTime();
-   if ((int)(t_end - t_start) > ((CRTC_Regs[0x29] & 0x10) ? 14 : 16))
    {
-      FrameSkipQueue += ((t_end - t_start) / ((CRTC_Regs[0x29] & 0x10) ? 14 : 16)) + 1;
-      if (FrameSkipQueue > 100)
-         FrameSkipQueue = 100;
+      uint32_t frame_time_ms = FRAMERATE > 0.0f
+            ? (uint32_t)(1000.0f / FRAMERATE + 0.5f)
+            : ((CRTC_Regs[0x29] & 0x10) ? 18U : 16U);
+      if (frame_time_ms < 1)
+         frame_time_ms = 1;
+      if ((t_end - t_start) > frame_time_ms)
+      {
+         FrameSkipQueue += ((t_end - t_start) / frame_time_ms) + 1;
+         if (FrameSkipQueue > 100)
+            FrameSkipQueue = 100;
+      }
    }
 }
 
@@ -2376,7 +2421,7 @@ void retro_run(void)
       firstcall     = 0;
       /* Initialization done */
       update_variables(0);
-      soundbuf_size = SNDSZ;
+      soundbuf_size = current_soundbuf_size();
       return;
    }
 
@@ -2387,14 +2432,17 @@ void retro_run(void)
    {
       if (CHANGEAV_TIMING)
       {
-         struct retro_system_av_info system_av_info;
-         retro_get_system_av_info(&system_av_info);
-         FRAMERATE                            = framerates[Config.AdjustFrameRates][VID_MODE];
-         system_av_info.timing.fps            = FRAMERATE;
-         environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &system_av_info);
-         setup_frame_time_cb();
-         CHANGEAV_TIMING                      = 0;
-         CHANGEAV                             = 0;
+         const float new_framerate = current_crtc_framerate();
+
+         if (fabsf(new_framerate - FRAMERATE) > 0.0001f)
+         {
+            struct retro_system_av_info system_av_info;
+            FRAMERATE = new_framerate;
+            retro_get_system_av_info(&system_av_info);
+            environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &system_av_info);
+            setup_frame_time_cb();
+         }
+         CHANGEAV_TIMING = 0;
       }
       if (CHANGEAV)
       {
@@ -2405,7 +2453,7 @@ void retro_run(void)
          environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &system_av_info);
          CHANGEAV                             = 0;
       }
-      soundbuf_size                           = SNDSZ;
+      soundbuf_size                           = current_soundbuf_size();
    }
 
    input_poll_cb();

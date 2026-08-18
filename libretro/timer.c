@@ -1,5 +1,5 @@
 /*
- *   55.6fpsキープ用たいまー
+ * 現在のCRTCタイミングに基づくフレーム進行用タイマー
  */
 #include "common.h"
 #include "crtc.h"
@@ -30,7 +30,10 @@ uint16_t Timer_GetCount(void)
 {
 	uint32_t ticknow   = timeGetUsec();
 	uint32_t dif       = ticknow-tick;
-	uint32_t TIMEBASE  = ((CRTC_Regs[0x29]&0x10)?VSYNC_HIGH:VSYNC_NORM);
+	uint32_t TIMEBASE  = CRTC_GetFrameClocks();
+
+	if (TIMEBASE == 0)
+		TIMEBASE = (CRTC_Regs[0x29] & 0x10) ? VSYNC_HIGH : VSYNC_NORM;
 	timercnt          += dif*10;  /* switch from msec to usec */
 	tick               = ticknow;
 	if (timercnt >= TIMEBASE)

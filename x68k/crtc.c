@@ -34,12 +34,14 @@ uint8_t	VCReg1[2] = {0, 0};
 uint8_t	VCReg2[2] = {0, 0};
 
 uint8_t	CRTC_RCFlag[2] = {0, 0};
-int HSYNC_CLK = 324;
+int HSYNC_CLK = 626;
 extern int VID_MODE, CHANGEAV_TIMING;
+
+static void CRTC_UpdateHSyncClock(void);
 
 int CRTC_StateAction(StateMem *sm, int load, int data_only)
 {
-   int vidmode, ret; 
+   int vidmode = VID_MODE, ret; 
 	SFORMAT StateRegs[] =
 	{
 		SFARRAY(CRTC_Regs, 48),
@@ -74,19 +76,14 @@ int CRTC_StateAction(StateMem *sm, int load, int data_only)
 		SFEND
 	};
 
-   if (!load)
-      vidmode = VID_MODE;
-
 	ret = PX68KSS_StateAction(sm, load, data_only, StateRegs, "X68K_CRTC_VCTRL", false);
 
    if (load)
    {
-      if (VID_MODE != vidmode)
-      {
-         CHANGEAV_TIMING = 1;
-         VID_MODE = vidmode;
-         
-      }
+      VLINE_TOTAL = ((((uint16_t)CRTC_Regs[8] << 8) + CRTC_Regs[9]) & 1023) + 1;
+      CRTC_UpdateHSyncClock();
+      VID_MODE = !!vidmode;
+      CHANGEAV_TIMING = 1;
    }
 
 	return ret;
@@ -183,6 +180,105 @@ void CRTC_Init(void)
 
 	TextScrollX = 0;
 	TextScrollY = 0;
+
+	/* Reset to the standard 15 kHz, 260-line timing until the guest
+	 * programs R00/R04/R20. */
+	VLINE_TOTAL = 260;
+	HSYNC_CLK = (VSYNC_NORM + (VLINE_TOTAL / 2)) / VLINE_TOTAL;
+	VID_MODE = 0;
+	CHANGEAV_TIMING = 1;
+}
+
+#define CRTC_TIMING_CLOCK       10000000ULL
+#define CRTC_MIN_FRAME_CLOCKS   (10000000U / 130U)
+#define CRTC_MAX_FRAME_CLOCKS   (10000000U / 30U)
+
+static int CRTC_GetHorizontalTiming(uint32_t *oscillator, uint32_t *divider,
+      uint32_t *columns)
+{
+   const uint8_t r20 = CRTC_Regs[0x29];
+
+   /* R00 is an 8-bit horizontal-total register. A zero value immediately
+    * after reset is treated as not programmed yet. */
+   if (CRTC_Regs[0x01] == 0)
+      return 0;
+
+   *columns = (uint32_t)CRTC_Regs[0x01] + 1;
+
+   if (!(r20 & 0x10))
+   {
+      *oscillator = 38863632U;
+      *divider = ((r20 & 0x03) == 0x01) ? 4U : 8U;
+   }
+   else
+   {
+      switch (r20 & 0x03)
+      {
+         case 0x00:
+            *oscillator = 69551900U;
+            *divider = 6U;
+            break;
+         case 0x01:
+            *oscillator = 69551900U;
+            *divider = 3U;
+            break;
+         case 0x02:
+            *oscillator = 69551900U;
+            *divider = 2U;
+            break;
+         default:
+            *oscillator = 50349800U;
+            *divider = 2U;
+            break;
+      }
+   }
+
+   return 1;
+}
+
+static void CRTC_UpdateHSyncClock(void)
+{
+   uint32_t oscillator, divider, columns;
+   uint64_t numerator;
+
+   if (!CRTC_GetHorizontalTiming(&oscillator, &divider, &columns))
+      return;
+
+   /* One CRTC column is eight dots. Convert the selected dot clock to
+    * cycles of the core's 10 MHz timing base. */
+   numerator = CRTC_TIMING_CLOCK * divider * 8U * columns;
+   HSYNC_CLK = (int)((numerator + oscillator / 2U) / oscillator);
+   if (HSYNC_CLK < 1)
+      HSYNC_CLK = 1;
+}
+
+uint32_t CRTC_GetFrameClocks(void)
+{
+   uint32_t oscillator, divider, columns;
+   uint64_t clocks;
+
+   if (VLINE_TOTAL != 0 &&
+       CRTC_GetHorizontalTiming(&oscillator, &divider, &columns))
+   {
+      const uint64_t numerator = CRTC_TIMING_CLOCK * divider * 8U *
+            columns * VLINE_TOTAL;
+      clocks = (numerator + oscillator / 2U) / oscillator;
+   }
+   else
+   {
+      clocks = (HSYNC_CLK > 0 && VLINE_TOTAL != 0)
+            ? (uint64_t)HSYNC_CLK * VLINE_TOTAL
+            : ((CRTC_Regs[0x29] & 0x10) ? VSYNC_HIGH : VSYNC_NORM);
+   }
+
+   /* Extreme guest-programmed timings must not overflow the CPU/audio
+    * scheduling paths. 30 Hz still covers interlaced display modes. */
+   if (clocks < CRTC_MIN_FRAME_CLOCKS)
+      clocks = CRTC_MIN_FRAME_CLOCKS;
+   else if (clocks > CRTC_MAX_FRAME_CLOCKS)
+      clocks = CRTC_MAX_FRAME_CLOCKS;
+
+   return (uint32_t)clocks;
 }
 
 static void CRTC_ScreenChanged(void)
@@ -245,17 +341,24 @@ void FASTCALL CRTC_Write(uint32_t adr, uint8_t data)
    };
 
    uint8_t reg     = (uint8_t)(adr&0x3f);
+   uint8_t old_data;
    if (adr<0xe80400)
    {
       if ( reg>=0x30 ) return;
-      if (CRTC_Regs[reg]==data) return;
+      old_data = CRTC_Regs[reg];
+      if (old_data==data) return;
       CRTC_Regs[reg] = data;
       TVRAM_SetAllDirty();
       switch(reg)
       {
          case 0x00:
          case 0x01:
-            /* HTOTAL */
+            /* R00 determines the horizontal period independently of R04. */
+            if (reg == 0x01)
+            {
+               CRTC_UpdateHSyncClock();
+               CHANGEAV_TIMING = 1;
+            }
             break;
          case 0x02:
          case 0x03:
@@ -276,9 +379,21 @@ void FASTCALL CRTC_Write(uint32_t adr, uint8_t data)
             break;
          case 0x08:
          case 0x09:
-            VLINE_TOTAL = (((uint16_t)CRTC_Regs[8]<<8)+CRTC_Regs[9]) & 1023;
-            HSYNC_CLK = ((CRTC_Regs[0x29]&0x10)?VSYNC_HIGH:VSYNC_NORM)/VLINE_TOTAL;
+         {
+            uint16_t total = ((((uint16_t)CRTC_Regs[8] << 8) + CRTC_Regs[9]) & 1023) + 1;
+
+            if (VLINE_TOTAL != total)
+            {
+               /*
+                * R04 changes the number of scanlines, not their duration.
+                * Keeping HSYNC_CLK constant lets vertical-only CRTC changes
+                * alter the refresh rate as they do on real hardware.
+                */
+               VLINE_TOTAL = total;
+               CHANGEAV_TIMING = 1;
+            }
             break;
+         }
          case 0x0a:
          case 0x0b:
             /* VSYNC end */
@@ -300,8 +415,12 @@ void FASTCALL CRTC_Write(uint32_t adr, uint8_t data)
             TVRAM_SetAllDirty();
             break;
          case 0x29:
-            HSYNC_CLK = ((CRTC_Regs[0x29]&0x10)?VSYNC_HIGH:VSYNC_NORM)/VLINE_TOTAL;
-            TextDotY = CRTC_VEND-CRTC_VSTART;
+            if ((old_data ^ data) & 0x13)
+            {
+               CRTC_UpdateHSyncClock();
+               CHANGEAV_TIMING = 1;
+            }
+            TextDotY = CRTC_VEND - CRTC_VSTART;
             CRTC_ScreenChanged();
             break;
          case 0x10:
