@@ -28,6 +28,7 @@ extern	uint32_t GrphScrollX[4];
 extern	uint32_t GrphScrollY[4];
 
 void CRTC_Init(void);
+uint32_t CRTC_GetFrameClocks(void);
 
 void CRTC_RasterCopy(void);
 
