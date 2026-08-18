@@ -37,6 +37,8 @@ uint8_t	CRTC_RCFlag[2] = {0, 0};
 int HSYNC_CLK = 626;
 extern int VID_MODE, CHANGEAV_TIMING;
 
+static void CRTC_UpdateHSyncClock(void);
+
 int CRTC_StateAction(StateMem *sm, int load, int data_only)
 {
    int vidmode = VID_MODE, ret; 
@@ -78,6 +80,8 @@ int CRTC_StateAction(StateMem *sm, int load, int data_only)
 
    if (load)
    {
+      VLINE_TOTAL = ((((uint16_t)CRTC_Regs[8] << 8) + CRTC_Regs[9]) & 1023) + 1;
+      CRTC_UpdateHSyncClock();
       VID_MODE = !!vidmode;
       CHANGEAV_TIMING = 1;
    }
