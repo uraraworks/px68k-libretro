@@ -29,7 +29,7 @@ extern	uint32_t GrphScrollY[4];
 
 void CRTC_Init(void);
 
-void CRTC_RasterCopy(void);
+void CRTC_HorizontalFrontPorch(void);
 
 uint8_t FASTCALL CRTC_Read(uint32_t adr);
 void FASTCALL CRTC_Write(uint32_t adr, uint8_t data);

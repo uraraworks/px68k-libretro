@@ -2305,6 +2305,10 @@ static void WinX68k_Exec(void)
                WinDraw_DrawLine();
          }
 
+         /* Raster copy runs after this raster's display period and before
+          * the next raster's horizontal sync. */
+         CRTC_HorizontalFrontPorch();
+
          ADPCM_PreUpdate(clk_line);
          OPM_Timer(clk_line);
          MIDI_Timer(clk_line);
