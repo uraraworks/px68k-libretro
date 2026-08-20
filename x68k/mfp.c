@@ -147,7 +147,7 @@ void MFP_Init(void)
 static uint8_t GetGPIP(void)
 {
 	uint8_t ret = 0x20; /* bit 5 is always 1 */
-	int hpos    = (int)(ICount % HSYNC_CLK);
+	int hpos    = (int)(m68000_current_icount() % HSYNC_CLK);
 
 	if ((vline >= CRTC_VSTART) && (vline < CRTC_VEND))
 		ret     |= 0x13;
