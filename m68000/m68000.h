@@ -33,6 +33,9 @@ enum
 
 extern	int	m68000_ICountBk;
 extern	int	ICount;
+extern int m68000_Executing;
+
+int m68000_current_icount(void);
 
 void m68000_init(void);
 void m68000_reset(void);

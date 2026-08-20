@@ -21,6 +21,16 @@ struct Cyclone m68k;
 
 int m68000_ICountBk;
 int ICount;
+int m68000_Executing;
+
+int m68000_current_icount(void)
+{
+#if defined (HAVE_MUSASHI)
+	if (m68000_Executing)
+		return ICount - m68k_cycles_run();
+#endif
+	return ICount;
+}
 
 int m68000_StateAction(StateMem *sm, int load, int data_only)
 {

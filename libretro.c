@@ -2258,6 +2258,27 @@ static void WinX68k_Exec(void)
    do
    {
       int m, n = (ICount > CLOCK_SLICE) ? CLOCK_SLICE : ICount;
+      int until_display_start = -1;
+      int until_display_end = -1;
+
+      if (HSYNC_CLK > 0 && CRTC_Regs[0x01] != 0)
+      {
+         int hpos = ICount % HSYNC_CLK;
+         /* Keep these display boundaries aligned with GetGPIP() in x68k/mfp.c. */
+         int display_start = (int)CRTC_Regs[0x07] * HSYNC_CLK / CRTC_Regs[0x01];
+         int display_end = (int)CRTC_Regs[0x05] * HSYNC_CLK / CRTC_Regs[0x01];
+         until_display_end = (hpos > display_end)
+               ? hpos - display_end
+               : hpos + HSYNC_CLK - display_end;
+
+         until_display_start = (hpos > display_start)
+               ? hpos - display_start
+               : hpos + HSYNC_CLK - display_start;
+         if (until_display_start > 0 && n > until_display_start)
+            n = until_display_start;
+         if (until_display_end > 0 && n > until_display_end)
+            n = until_display_end;
+      }
 
       if ( hsync )
       {
@@ -2296,7 +2317,9 @@ static void WinX68k_Exec(void)
 #elif defined (HAVE_C68K)
          C68k_Exec(&C68K, n);
 #elif defined (HAVE_MUSASHI)
+         m68000_Executing = 1;
          m68k_execute(n);
+         m68000_Executing = 0;
 #endif /* HAVE_C68K */ /* HAVE_MUSASHI */
          m          = (n-m68000_ICountBk);
          ClkUsed   += m*10;
@@ -2306,6 +2329,11 @@ static void WinX68k_Exec(void)
          ICount    -= m;
          clk_count += m;
       }
+
+      /* ICount decreases, so the lower GPIP display boundary is the
+       * display-end transition where the horizontal front porch begins. */
+      if (until_display_end > 0 && m >= until_display_end)
+         CRTC_HorizontalFrontPorch();
 
       MFP_Timer(usedclk);
       RTC_Timer(usedclk);

@@ -33,6 +33,7 @@ uint8_t	VCReg0[2] = {0, 0};
 uint8_t	VCReg1[2] = {0, 0};
 uint8_t	VCReg2[2] = {0, 0};
 
+/* Legacy save-state field; raster-copy scheduling no longer uses it. */
 uint8_t	CRTC_RCFlag[2] = {0, 0};
 int HSYNC_CLK = 626;
 extern int VID_MODE, CHANGEAV_TIMING;
@@ -89,11 +90,15 @@ int CRTC_StateAction(StateMem *sm, int load, int data_only)
 	return ret;
 }
 
-void CRTC_RasterCopy(void)
+static void CRTC_RasterCopy(void)
 {
 	uint32_t line = (((uint32_t)CRTC_Regs[0x2d])<<2);
 	uint32_t src  = (((uint32_t)CRTC_Regs[0x2c])<<9);
 	uint32_t dst  = (((uint32_t)CRTC_Regs[0x2d])<<9);
+
+	/* No selected plane or an identical source/destination is a no-op. */
+	if (!(CRTC_Regs[0x2b] & 0x0f) || src == dst)
+		return;
 
 {
 	static const uint32_t off[4] = { 0, 0x20000, 0x40000, 0x60000 };
@@ -114,6 +119,18 @@ void CRTC_RasterCopy(void)
 }
 
 	TVRAM_RCUpdate();
+}
+
+/*
+ * Horizontal front porch
+ *
+ * Operation-port bit 3 is a level-controlled enable. While it remains set,
+ * raster copy runs once per horizontal front porch using the current R21/R22.
+ */
+void CRTC_HorizontalFrontPorch(void)
+{
+	if (CRTC_Mode & 8)
+		CRTC_RasterCopy();
 }
 
 /*
@@ -170,6 +187,10 @@ void FASTCALL VCtrl_Write(uint32_t adr, uint8_t data)
 void CRTC_Init(void)
 {
 	memset(CRTC_Regs, 0, 48);
+	CRTC_Mode = 0;
+	CRTC_FastClr = 0;
+	CRTC_FastClrLine = 0;
+	CRTC_FastClrMask = 0;
 	memset(GrphScrollX, 0, sizeof(GrphScrollX));
 	memset(GrphScrollY, 0, sizeof(GrphScrollY));
 
@@ -474,27 +495,15 @@ void FASTCALL CRTC_Write(uint32_t adr, uint8_t data)
          case 0x2a:
          case 0x2b:
             break;
-         case 0x2c:				/* Turn on the raster copy of the CRTC operation port (and leave it on), */
-         case 0x2d:				/* Apparently it's also permissible to change only the Src/Dst (like Dracula) */
-            CRTC_RCFlag[reg-0x2c] = 1;	/* Is it executed after changing Dst? */
-            if ((CRTC_Mode&8)&&/*(CRTC_RCFlag[0])&&*/(CRTC_RCFlag[1]))
-            {
-               CRTC_RasterCopy();
-               CRTC_RCFlag[0] = 0;
-               CRTC_RCFlag[1] = 0;
-            }
+         case 0x2c:
+         case 0x2d:
+            CRTC_RCFlag[reg-0x2c] = 1;
             break;
       }
    }
    else if (adr==0xe80481)
    {					/* CRTC operation port */
       CRTC_Mode = (data|(CRTC_Mode&2));
-      if (CRTC_Mode&8)
-      {				/* Raster Copy */
-         CRTC_RasterCopy();
-         CRTC_RCFlag[0] = 0;
-         CRTC_RCFlag[1] = 0;
-      }
       if (CRTC_Mode&2) /* FastClear */
       {
          CRTC_FastClrLine = vline;
