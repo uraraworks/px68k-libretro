@@ -370,7 +370,7 @@ void FASTCALL CRTC_Write(uint32_t adr, uint8_t data)
             break;
          case 0x2c:
          case 0x2d:
-            /* R22 changes take effect at the next horizontal front porch. */
+            CRTC_RCFlag[reg-0x2c] = 1;
             break;
       }
    }
