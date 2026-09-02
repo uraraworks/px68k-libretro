@@ -45,6 +45,10 @@ extern int webx68k_scsi_rom_byte(int i);
  * (SCSI_SpcRegIndex/SCSI_SpcSelectCheck のコメントも参照)。 */
 extern int webx68k_scsi_spc_ints_sel(void);
 extern int webx68k_scsi_spc_ints_timeout(void);
+/* セレクトに応答するSCSI IDに相当するTEMP($ea0017)値(既定1)。
+ * TEMPの値がこれと一致したときだけセレクト成功にする(応答する相手を1つに絞る)。
+ * core-shim.c の js_scsi_spc_target 参照。 */
+extern int webx68k_scsi_spc_target(void);
 extern int webx68k_scsi_spc_ssts(void);
 extern int webx68k_scsi_spc_psns(void);
 /* 掃引モード(-2)での開始値。本物ROMは1回の起動でPSNS/SSTSを16回程度しか
@@ -1339,10 +1343,14 @@ static void SCSI_SpcSstsSetTc0Bit(int on, const char *reason)
 
 
 /* セレクト(SCMD書き込みで上位3bitが$001)への応答。
- * 「TEMPが0以外、かつホスト側にイメージがある」を成功条件とする
- * (これも実測ではなく仮説)。成功/タイムアウトのどちらのビットを
- * INTS に立てるかは再ビルドせずホストから振れる
- * (webx68k_scsi_spc_ints_sel/timeout、既定 $08/$20)。
+ * 「TEMPが webx68k_scsi_spc_target() の値と一致し、かつホスト側に
+ * イメージがある」を成功条件とする(これも実測ではなく仮説)。
+ * 2026-09-02: 従来は「TEMPが0以外」だけを条件にしていたため、どのIDを
+ * 選んでも必ず成功し、ROMからは同じディスクが8台見えていた(欠陥)。
+ * 応答する相手を1つに絞るため、TEMPの値が webx68k_scsi_spc_target()
+ * (既定1)と一致したときだけ成功にする。
+ * 成功/タイムアウトのどちらのビットを INTS に立てるかは再ビルドせず
+ * ホストから振れる(webx68k_scsi_spc_ints_sel/timeout、既定 $08/$20)。
  * 成功時は SSTS/PSNS にもホスト指定値を反映する。SSTSは既定(-1)なら
  * SCSI_SpcSstsSetBit7 の状態機械に任せ、それ以外(固定値/掃引)は
  * 従来どおりの扱い。 */
@@ -1357,6 +1365,7 @@ static void SCSI_SpcSelectCheck(uint8_t scmd)
 	int idx_temp = SCSI_SpcRegIndex(SCSI_SPC_ADR_TEMP);
 	uint8_t temp;
 	int size;
+	int target;
 	int ok;
 	uint8_t ints_bit;
 
@@ -1365,7 +1374,8 @@ static void SCSI_SpcSelectCheck(uint8_t scmd)
 
 	temp = SCSISpcReg[idx_temp];
 	size = webx68k_scsi_get_size();
-	ok = (temp != 0 && size > 0);
+	target = webx68k_scsi_spc_target();
+	ok = ((int)temp == target && size > 0);
 	SCSISpcSelectOk = ok;
 
 	ints_bit = (uint8_t)(ok ? webx68k_scsi_spc_ints_sel() : webx68k_scsi_spc_ints_timeout());
@@ -1377,8 +1387,8 @@ static void SCSI_SpcSelectCheck(uint8_t scmd)
 	 * 出続けると容易にログが数十MBへ膨らむ(実測)ため。 */
 	if (log_cb && SCSI_BusPcAllow(m68000_get_reg(M68K_PC)) && SCSI_BusLogGate())
 		log_cb(RETRO_LOG_INFO,
-			"[SCSI-SPC] セレクト scmd=$%02x temp=$%02x size=%d -> %s ints|=$%02x\n",
-			scmd, temp, size, ok ? "成功" : "タイムアウト", ints_bit);
+			"[SCSI-SPC] セレクト scmd=$%02x TEMP=$%02x 期待=$%02x size=%d -> %s ints|=$%02x\n",
+			scmd, temp, (unsigned)target, size, ok ? "成功" : "タイムアウト", ints_bit);
 
 	if (ok)
 	{
@@ -1613,8 +1623,10 @@ static void SCSI_SpcSetPhase(SCSI_SpcPhase_t phase, const char *reason)
 }
 
 /* CDBが確定したところでコマンドを解釈し、応答を組み立てる。
- * 対応コマンドはTEST UNIT READY($00)/INQUIRY($12)/READ CAPACITY($25)/
- * READ(6)($08)/READ(10)($28)のみ。それ以外はデータ無しでSTATUSへ進める。
+ * 対応コマンドはTEST UNIT READY($00)/REZERO UNIT($01)/REQUEST SENSE($03)/
+ * INQUIRY($12)/MODE SENSE($1a)/START-STOP UNIT($1b)/READ CAPACITY($25)/
+ * READ(6)($08)/READ(10)($28)。それ以外はデータ無しでSTATUSへ進め、
+ * ログに「未対応」と明示する(見落とし防止)。
  * 応答データがあればDATAINへ、無ければ直接STATUSへ遷移する。 */
 static void SCSI_SpcHandleCommand(void)
 {
@@ -1630,9 +1642,33 @@ static void SCSI_SpcHandleCommand(void)
 			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] コマンド=TEST UNIT READY -> データ無し\n");
 		break;
 
-	case 0x12:	/* INQUIRY: 36バイト固定応答 */
+	case 0x01:	/* REZERO UNIT: データ無しで正常終了 */
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] コマンド=REZERO UNIT -> データ無し\n");
+		break;
+
+	case 0x1b:	/* START-STOP UNIT: データ無しで正常終了 */
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] コマンド=START-STOP UNIT -> データ無し\n");
+		break;
+
+	case 0x03:	/* REQUEST SENSE: 18バイト、先頭$70(現行エラー無し)、残りゼロ */
 	{
 		uint8_t *b = SCSISpcDataBuf;
+		memset(b, 0x00, 18);
+		b[0] = 0x70;
+		SCSISpcDataLen = 18;
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] コマンド=REQUEST SENSE -> 18バイト応答(エラー無し)\n");
+		break;
+	}
+
+	case 0x12:	/* INQUIRY: 36バイト固定応答。CDBバイト4(割り当て長)がそれより
+			 * 小さければその長さに切る。 */
+	{
+		uint8_t *b = SCSISpcDataBuf;
+		unsigned int alloc = SCSISpcCdb[4];
+		unsigned int len = 36;
 		memset(b, 0x20, 36);
 		b[0] = 0x00;	/* 直接アクセスデバイス */
 		b[1] = 0x00;
@@ -1642,9 +1678,40 @@ static void SCSI_SpcHandleCommand(void)
 		memcpy(b + 8, "WebX68k ", 8);
 		memcpy(b + 16, "SCSI DISK       ", 16);
 		memcpy(b + 32, "1.0 ", 4);
-		SCSISpcDataLen = 36;
+		if (alloc > 0 && alloc < len)
+			len = alloc;
+		SCSISpcDataLen = (int)len;
 		if (log_cb && SCSI_BusLogGate())
-			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] コマンド=INQUIRY -> 36バイト応答\n");
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] コマンド=INQUIRY 割当長=%u -> %uバイト応答\n",
+				alloc, len);
+		break;
+	}
+
+	case 0x1a:	/* MODE SENSE(6): 最小限の応答(当てはめ)。
+			 * ブロック記述子つきで、データ長/媒体種別($00)/装置固有($00)/
+			 * ブロック記述子長($08)、続けてブロック記述子
+			 * (密度コード$00 + ブロック数3バイト(当てはめで0) + 予約1バイト
+			 * + ブロック長3バイト=$000200)を返す。CDBバイト4(割り当て長)を
+			 * 超えないよう切る。 */
+	{
+		uint8_t *b = SCSISpcDataBuf;
+		unsigned int alloc = SCSISpcCdb[4];
+		unsigned int len = 12;
+		memset(b, 0x00, len);
+		b[0] = 0x0b;	/* モードデータ長(この後に続くバイト数) */
+		b[1] = 0x00;	/* 媒体種別 */
+		b[2] = 0x00;	/* 装置固有パラメータ */
+		b[3] = 0x08;	/* ブロック記述子長 */
+		b[4] = 0x00;	/* 密度コード */
+		b[5] = 0x00; b[6] = 0x00; b[7] = 0x00;	/* ブロック数(当てはめで0) */
+		b[8] = 0x00;	/* 予約 */
+		b[9] = 0x00; b[10] = 0x02; b[11] = 0x00;	/* ブロック長=512 */
+		if (alloc > 0 && alloc < len)
+			len = alloc;
+		SCSISpcDataLen = (int)len;
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] コマンド=MODE SENSE 割当長=%u -> %uバイト応答(当てはめ)\n",
+				alloc, len);
 		break;
 	}
 
