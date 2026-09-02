@@ -2500,6 +2500,7 @@ void retro_run(void)
 
       WinX68k_Exec();
    }
+   SCSI_LogPcIfRealRom();
 
    mouse_x       = input_state_cb(0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_X);
    mouse_y       = input_state_cb(0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_Y);

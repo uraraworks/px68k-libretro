@@ -40,6 +40,17 @@ extern unsigned int webx68k_scsi_drv_next(void);
 extern int webx68k_scsi_rom_len(void);
 extern int webx68k_scsi_rom_byte(int i);
 
+/* SPC(MB89352)のセレクト応答をホストから振るための欄。本物ROM使用時のみ使う。
+ * $ea0001+2n というレジスタの当てはめは実測ではなく知識であり未実測
+ * (SCSI_SpcRegIndex/SCSI_SpcSelectCheck のコメントも参照)。 */
+extern int webx68k_scsi_spc_ints_sel(void);
+extern int webx68k_scsi_spc_ints_timeout(void);
+extern int webx68k_scsi_spc_ssts(void);
+extern int webx68k_scsi_spc_psns(void);
+/* PCTL($ea0011)書き込みでSSTSのbit7を落とすかどうか(既定1=落とす)。
+ * 実測に基づく仕様ではなく実験的な規則。詳細は SCSI_SpcWrite コメント参照。 */
+extern int webx68k_scsi_spc_clear_on_pctl(void);
+
 uint8_t	SCSIIPL[0x2000];
 
 /* SCSI IOCS 観測フックのログ件数 (詳細は SCSI_IOCSPort_Write を参照) */
@@ -67,9 +78,38 @@ static int SCSIZeroCallCount = 0;
  * BPB表ポインタ)を飛ばし、窓への書き込みも SCSIIPL へ反映しない(ROMのまま)。 */
 static int SCSIUsingRealRom = 0;
 
+/* 本物ROM使用時のみ、ゲストPCを定期的にログへ出す診断
+ * ([SCSI-PC])。retro_run から毎フレーム呼ばれる想定。
+ * 60フレームに1回サンプルし、上限40行で止める。 */
+static int SCSIPcLogFrameCount = 0;
+static int SCSIPcLogCount = 0;
+
+void SCSI_LogPcIfRealRom(void)
+{
+	if (!SCSIUsingRealRom)
+		return;
+	if (SCSIPcLogCount >= 40)
+		return;
+	SCSIPcLogFrameCount++;
+	if (SCSIPcLogFrameCount % 60 != 0)
+		return;
+	if (log_cb)
+		log_cb(RETRO_LOG_INFO, "[SCSI-PC] frame=%d pc=$%08x\n",
+			SCSIPcLogFrameCount, (unsigned)m68000_get_reg(M68K_PC));
+	SCSIPcLogCount++;
+}
+
+/* SPC(MB89352)レジスタの簡易状態(本物ROM使用時のみ有効)。
+ * 詳細・実測/未実測の区別は SCSI_SpcRegIndex 付近のコメントを参照。 */
+#define SCSI_SPC_REG_COUNT 16
+static uint8_t SCSISpcReg[SCSI_SPC_REG_COUNT];
+
 /* $ea0000〜$ea1fff 全域への読み書きの統合ログ([SCSI-BUS])。
  * 同じ(番地,種別,PC)が連続するときは数えるだけにし、変化した時点で
- * まとめて1行出す(「×N回」)。上限4000件で、達したらその旨を1回だけ出す。 */
+ * まとめて1行出す(「×N回」)。上限4000件で、達したらその旨を1回だけ出す。
+ * この上限(SCSI_BusLogGate)は [SCSI-SPC] の追加診断ログとも共通で、
+ * SPC域も例外なくここでカウントされる(詳細は SCSI_BusLogGate の
+ * コメントを参照)。 */
 #define SCSI_BUS_LOG_MAX    4000
 static int SCSIBusLogCount = 0;
 static int SCSIBusLogCapped = 0;
@@ -81,7 +121,8 @@ static int SCSIBusRunCount = 0;
 
 /* SPC(SCSIコントローラ)のポート領域。ROMがSPCをどう叩くかを見るのが
  * 今回の観測目的そのものなので、下の命令フェッチ除外heuristicに関わらず
- * この範囲への読み書きは必ずログへ出す。 */
+ * この範囲への読み書きは必ずログへ出す。ただし出力件数の上限
+ * (SCSI_BUS_LOG_MAX)自体は除外判定と無関係に全域で共通に効く。 */
 #define SCSI_SPC_PORT_LO    0x00ea0000
 #define SCSI_SPC_PORT_HI    0x00ea0020	/* 排他的上限 ($ea001f まで) */
 
@@ -97,6 +138,75 @@ static void SCSI_BusReportExcluded(void)
 	SCSIBusFetchExcludedReported = 1;
 	if (SCSIBusFetchExcluded > 0 && log_cb)
 		log_cb(RETRO_LOG_INFO, "[SCSI-BUS] 命令フェッチとみなして除外: %d件\n", SCSIBusFetchExcluded);
+}
+
+/* SCSI_BUS_LOG_MAX の上限は [SCSI-BUS] の通常行だけでなく、SPC域の
+ * 追加診断ログ([SCSI-SPC] のセレクト応答・INTSクリアなど)にも共通で
+ * 適用する。「SPC域はフェッチ除外heuristicの対象外」というのは
+ * SCSI_BusLog 内の除外判定だけの話であり、上限そのものは全ログで
+ * 共有する(そうしないと本物ROMのセレクトやり直しループでSPCの
+ * 追加診断行だけが無制限に出て34MB級のログになる、という実測不具合
+ * があった)。ログを出す全箇所はこの関数を通すこと。 */
+static int SCSI_BusLogGate(void)
+{
+	if (SCSIBusLogCapped)
+		return 0;
+	if (SCSIBusLogCount >= SCSI_BUS_LOG_MAX)
+	{
+		SCSIBusLogCapped = 1;
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "[SCSI-BUS] ログ上限(%d件)に達したため以降は出力を止める\n", SCSI_BUS_LOG_MAX);
+		SCSI_BusReportExcluded();
+		return 0;
+	}
+	SCSIBusLogCount++;
+	return 1;
+}
+
+/* 同じPC(命令アドレス)からのログ対象アクセスが通算で閾値を超えたら、
+ * そのPCからは以後ログを出さず件数だけ数え続ける。
+ *
+ * 採った圧縮方式: 実測では本物ROMが $ea0009(INTS)→$ea0005(SCMD)→…と
+ * 数命令おきに複数レジスタを巡回するため、直前1件だけを見る既存の
+ * run-length圧縮(SCSIBusRunCount)では捕まらない(「直近16件の並び一致」
+ * を検出する案も検討したが、リングバッファと部分列比較が要り実装が
+ * 複雑になるため見送った)。代わりに「同じPCからの通算件数が32件を
+ * 超えたらそのPC以降は出さない」という単純な方式を採用する。
+ * PCはハッシュ表を使わず線形探索(想定エントリ数は数個程度)。
+ * テーブルが埋まった場合(想定外に多種のPCが来た場合)は制限せず
+ * 常に許可する(安全側に倒す)。 */
+#define SCSI_BUS_PC_TRACK      64
+#define SCSI_BUS_PC_THRESHOLD  32
+static uint32_t SCSIBusPcTrackPc[SCSI_BUS_PC_TRACK];
+static int SCSIBusPcTrackCount[SCSI_BUS_PC_TRACK];
+static int SCSIBusPcTrackUsed = 0;
+
+static int SCSI_BusPcAllow(uint32_t pc)
+{
+	int i;
+	for (i = 0; i < SCSIBusPcTrackUsed; i++)
+	{
+		if (SCSIBusPcTrackPc[i] == pc)
+		{
+			SCSIBusPcTrackCount[i]++;
+			if (SCSIBusPcTrackCount[i] == SCSI_BUS_PC_THRESHOLD + 1)
+			{
+				if (log_cb)
+					log_cb(RETRO_LOG_INFO,
+						"[SCSI-BUS] pc=$%08x からのログ対象アクセスが通算%d件を超えたため、"
+						"以後このPCからのログを止める(件数のみ数え続ける)\n",
+						(unsigned)pc, SCSI_BUS_PC_THRESHOLD);
+			}
+			return SCSIBusPcTrackCount[i] <= SCSI_BUS_PC_THRESHOLD;
+		}
+	}
+	if (SCSIBusPcTrackUsed < SCSI_BUS_PC_TRACK)
+	{
+		SCSIBusPcTrackPc[SCSIBusPcTrackUsed] = pc;
+		SCSIBusPcTrackCount[SCSIBusPcTrackUsed] = 1;
+		SCSIBusPcTrackUsed++;
+	}
+	return 1;
 }
 
 /* ストラテジ(ホストコマンド $40)呼び出し時に a5 で渡された要求ヘッダの
@@ -115,9 +225,8 @@ static void SCSI_BusLogFlush(void)
 {
 	if (SCSIBusLastIsWrite < 0)
 		return;
-	if (SCSIBusLogCount < SCSI_BUS_LOG_MAX)
+	if (SCSI_BusPcAllow(SCSIBusLastPC) && SCSI_BusLogGate())
 	{
-		SCSIBusLogCount++;
 		if (log_cb)
 		{
 			if (SCSIBusRunCount <= 1)
@@ -129,13 +238,6 @@ static void SCSI_BusLogFlush(void)
 					SCSIBusLogCount, SCSIBusLastIsWrite ? "W" : "R",
 					(unsigned)SCSIBusLastAddr, SCSIBusLastValue, (unsigned)SCSIBusLastPC, SCSIBusRunCount);
 		}
-	}
-	else if (!SCSIBusLogCapped)
-	{
-		SCSIBusLogCapped = 1;
-		if (log_cb)
-			log_cb(RETRO_LOG_INFO, "[SCSI-BUS] ログ上限(%d件)に達したため以降は出力を止める\n", SCSI_BUS_LOG_MAX);
-		SCSI_BusReportExcluded();
 	}
 	SCSIBusLastIsWrite = -1;
 	SCSIBusRunCount = 0;
@@ -268,11 +370,13 @@ void SCSI_Init(void)
 	SCSIBusLogCapped = 0;
 	SCSIBusLastIsWrite = -1;
 	SCSIBusRunCount = 0;
+	SCSIBusPcTrackUsed = 0;
 	SCSIUsingRealRom = 0;
 	SCSIReqHeaderAddr = 0;
 	SCSIReqInitCount = 0;
 	memset(SCSITableCallCount, 0, sizeof(SCSITableCallCount));
 	memset(SCSIIPL, 0, 0x2000);
+	memset(SCSISpcReg, 0, sizeof(SCSISpcReg));
 
 	/* 本物の外部SCSIボードROMイメージ(8192バイト)が流し込まれていれば、
 	 * 自前スタブの代わりにそれを使う。逆アセンブルはせず、本物を走らせて
@@ -912,12 +1016,258 @@ void SCSI_Cleanup(void)
 #define SCSI_WINDOW_LO 0x00ea0100
 #define SCSI_WINDOW_HI 0x00ea0800	/* 排他的上限 ($ea07ff まで) */
 
+/* ---- SPC(MB89352)レジスタの簡易状態(本物ROM使用時のみ有効) ----
+ *
+ * 実測(本物の外部SCSIボードROMをpx68kに読ませて観測)で、ROMは
+ * $ea0001,03,05,...,$ea001f という「奇数番地」だけを叩いていた。
+ * 「$ea0001+2n がn番目のレジスタ」という当てはめ、および各レジスタの
+ * 役割(SCMD/INTS/PSNS/SSTS/TEMPなど、下の SCSI_SPC_ADR_* の名前)は
+ * MB89352の一般知識からの当てはめであって実測ではない。番地そのもの
+ * (どのオフセットに何回どんな値が書かれたか)だけが実測結果である。
+ *
+ * 自前スタブ経路(SCSIUsingRealRom==0)の挙動はここでは一切変えない。
+ * SCSI_Write/SCSI_Read のどちらも、本物ROM使用時に限りこの配列を
+ * 経由するよう分岐する(配列本体は SCSIUsingRealRom 付近で宣言)。 */
+
+/* レジスタ名は実測ではなく当てはめ(上記コメント参照)。 */
+#define SCSI_SPC_ADR_SCTL   0x00ea0003	/* コントロールレジスタ(当てはめ)。bit7=リセットと解釈(実測: 本物ROMが$90を書く) */
+#define SCSI_SPC_ADR_SCMD   0x00ea0005	/* コマンドレジスタ。上位3bit=$001でセレクトと解釈(未実測の当てはめ)。上位3bit=$000はバス開放と解釈(未実測の当てはめ) */
+#define SCSI_SPC_ADR_PSNS   0x00ea000b	/* フェーズ信号(当てはめ) */
+#define SCSI_SPC_ADR_INTS   0x00ea0009	/* 割り込み要因(当てはめ) */
+#define SCSI_SPC_ADR_SSTS   0x00ea000d	/* SPCステータス(当てはめ)。bit7=セレクト成立中(実測: 後述のSCSI_SpcSstsSetBit7コメント参照) */
+#define SCSI_SPC_ADR_TEMP   0x00ea0017	/* テンポラリレジスタ(当てはめ)。0以外でイメージありとみなす */
+#define SCSI_SPC_ADR_PCTL   0x00ea0011	/* パリティ制御レジスタ(当てはめ)。実測: 本物ROMが再試行の入口
+					 * ($ea1030)でここへ$00を書いたあと $ea1034 でSSTSを読みに
+					 * 来ており、bit7が立ったままだと $ea1038 で無限ループする
+					 * (PCサンプラで実測)。この書き込みを「接続の終わり」とみなして
+					 * SSTSのbit7を落とすのは実機の仕様ではなく、再試行のたびに
+					 * 観測を1つ進めるための実験的な規則(SCSI_SpcWrite参照)。 */
+
+/* adr($ea0000〜$ea001fのSPC領域内)を SCSISpcReg の添字に変換する。
+ * 実測されたアクセスはすべて奇数番地だったため n=(adr-$ea0001)/2 とする。
+ * 偶数番地(実測なし)は -1 を返し、呼び出し側は何もしない。 */
+static int SCSI_SpcRegIndex(uint32_t adr)
+{
+	if (adr < SCSI_SPC_PORT_LO || adr >= SCSI_SPC_PORT_HI)
+		return -1;
+	if (!(adr & 1))
+		return -1;
+	return (int)((adr - (SCSI_SPC_PORT_LO + 1)) >> 1);
+}
+
+/* SSTS($ea000d) の bit7 を状態として管理する。
+ *
+ * 実測(本物SCSI ROMをpx68kに読ませ、SSTSの値を読み出しのたびに
+ * 0→255と変える掃引で観測): pc=$ea1034 の読み出しはbit7が立っていると
+ * 先へ進まず、pc=$ea109a の読み出しはbit7($80)が立った瞬間に抜けた。
+ * この2点の実測から「SSTSのbit7はセレクトが成立して接続中であることを
+ * 表す状態であり、固定値ではいけない」と読む(bit7の意味づけ自体は
+ * 当てはめであり、実測として言えるのは上の2点のみ)。
+ *
+ * この状態機械が効くのは webx68k_scsi_spc_ssts() が既定値 -1 を返す
+ * ときだけ。-2(従来どおりの掃引モード)は SCSI_SpcSweepRead が読み出す
+ * たびに上書きするため無関係、0以上(固定値)は従来どおりホスト指定値を
+ * そのまま使う。 */
+static void SCSI_SpcSstsSetBit7Reason(int on, const char *reason)
+{
+	int idx = SCSI_SpcRegIndex(SCSI_SPC_ADR_SSTS);
+	uint8_t before, after;
+
+	if (webx68k_scsi_spc_ssts() != -1)
+		return;	/* 固定値/掃引モードでは状態機械を使わない */
+
+	before = SCSISpcReg[idx];
+	after = on ? (uint8_t)(before | 0x80) : (uint8_t)(before & (uint8_t)~0x80);
+	if (after == before)
+		return;
+	SCSISpcReg[idx] = after;
+
+	if (log_cb && SCSI_BusPcAllow(m68000_get_reg(M68K_PC)) && SCSI_BusLogGate())
+		log_cb(RETRO_LOG_INFO, "[SCSI-SPC] SSTS bit7=%d (状態機械, 理由=%s, pc=$%08x)\n",
+			on ? 1 : 0, reason ? reason : "?", (unsigned)m68000_get_reg(M68K_PC));
+}
+
+
+/* セレクト(SCMD書き込みで上位3bitが$001)への応答。
+ * 「TEMPが0以外、かつホスト側にイメージがある」を成功条件とする
+ * (これも実測ではなく仮説)。成功/タイムアウトのどちらのビットを
+ * INTS に立てるかは再ビルドせずホストから振れる
+ * (webx68k_scsi_spc_ints_sel/timeout、既定 $08/$20)。
+ * 成功時は SSTS/PSNS にもホスト指定値を反映する。SSTSは既定(-1)なら
+ * SCSI_SpcSstsSetBit7 の状態機械に任せ、それ以外(固定値/掃引)は
+ * 従来どおりの扱い。 */
+static void SCSI_SpcSelectCheck(uint8_t scmd)
+{
+	int idx_ints = SCSI_SpcRegIndex(SCSI_SPC_ADR_INTS);
+	int idx_temp = SCSI_SpcRegIndex(SCSI_SPC_ADR_TEMP);
+	uint8_t temp;
+	int size;
+	int ok;
+	uint8_t ints_bit;
+
+	if ((scmd & 0xe0) != 0x20)
+		return;	/* セレクト以外のコマンドとみなし何もしない */
+
+	temp = SCSISpcReg[idx_temp];
+	size = webx68k_scsi_get_size();
+	ok = (temp != 0 && size > 0);
+
+	ints_bit = (uint8_t)(ok ? webx68k_scsi_spc_ints_sel() : webx68k_scsi_spc_ints_timeout());
+	SCSISpcReg[idx_ints] |= ints_bit;
+
+	/* この診断ログも [SCSI-BUS] と共通の上限(SCSI_BusLogGate)・PC単位の
+	 * 抑制(SCSI_BusPcAllow)を通す。本物ROMがセレクト失敗→SSTS再読出し→
+	 * 別IDでセレクトやり直し、を延々繰り返すケースでここが無制限に
+	 * 出続けると容易にログが数十MBへ膨らむ(実測)ため。 */
+	if (log_cb && SCSI_BusPcAllow(m68000_get_reg(M68K_PC)) && SCSI_BusLogGate())
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-SPC] セレクト scmd=$%02x temp=$%02x size=%d -> %s ints|=$%02x\n",
+			scmd, temp, size, ok ? "成功" : "タイムアウト", ints_bit);
+
+	if (ok)
+	{
+		int ssts = webx68k_scsi_spc_ssts();
+		int psns = webx68k_scsi_spc_psns();
+		if (ssts == -1)
+			SCSI_SpcSstsSetBit7Reason(1, "セレクト成立");	/* 既定は状態機械: セレクト成立でbit7を立てる */
+		else if (ssts >= 0)
+			SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_SSTS)] = (uint8_t)ssts;
+		if (psns >= 0)
+			SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_PSNS)] = (uint8_t)psns;
+		if (log_cb && (ssts >= 0 || psns >= 0) &&
+			SCSI_BusPcAllow(m68000_get_reg(M68K_PC)) && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] セレクト成功でssts=$%02x psns=$%02x を設定\n",
+				(unsigned)SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_SSTS)],
+				(unsigned)SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_PSNS)]);
+	}
+}
+
+/* SPCレジスタへの書き込み(本物ROM使用時のみ呼ばれる)。
+ * INTS($ea0009)への書き込みは「割り込み要因のクリア」とみなし、
+ * 書かれた値のビットを落とす(INTS &= ~data)。実測でROMは
+ * W $ea0009=$00 を行っており、これが「全クリア」の意味なのか
+ * 「$00のビットを落とす(=無変化)」の意味なのかは未実測。
+ * ここでは data==0 のときを全クリアと解釈する(仮説)。
+ * それ以外のレジスタは配列へ記録するのみだが、SCMD($ea0005)への
+ * 書き込みは追加でセレクト判定を行い、上位3bitが$000(バス開放と
+ * 解釈)ならSSTSのbit7を状態機械経由で落とす。SCTL($ea0003)への
+ * 書き込みでbit7($80、実測ではリセットで$90が書かれた)が立っている
+ * ときも同様にbit7を落とす。加えてPCTL($ea0011)への書き込みでも
+ * 落とす(実験的な規則。実測で本物ROMは再試行の入口で「変数読み→
+ * PCTLに$00書き込み→SSTS読み出し」という並びを取っており、SSTSの
+ * bit7が立ったままだと先へ進めず無限ループしていたため、PCTL書き込み
+ * を「接続の終わり」とみなして落とすことにした。実機の仕様として
+ * 測ったものではなく、webx68k_scsi_spc_clear_on_pctl() で無効化できる)。
+ * いずれも SCSI_SpcSstsSetBit7Reason を参照。 */
+static void SCSI_SpcWrite(uint32_t adr, uint8_t data)
+{
+	int idx = SCSI_SpcRegIndex(adr);
+	if (idx < 0)
+		return;
+
+	if (adr == SCSI_SPC_ADR_INTS)
+	{
+		uint8_t before = SCSISpcReg[idx];
+		uint8_t after = (data == 0) ? 0 : (uint8_t)(before & ~data);
+		SCSISpcReg[idx] = after;
+		/* [SCSI-BUS]と共通の上限・PC単位の抑制を通す(理由は
+		 * SCSI_SpcSelectCheck 側のコメントを参照)。 */
+		if (log_cb && SCSI_BusPcAllow(m68000_get_reg(M68K_PC)) && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] INTSクリア data=$%02x before=$%02x after=$%02x\n",
+				data, before, after);
+		return;
+	}
+
+	SCSISpcReg[idx] = data;
+
+	if (adr == SCSI_SPC_ADR_SCMD)
+	{
+		SCSI_SpcSelectCheck(data);
+		if ((data & 0xe0) == 0x00)
+			SCSI_SpcSstsSetBit7Reason(0, "SCMDバス開放");	/* バス開放(上位3bit=$000)でbit7を落とす */
+	}
+	else if (adr == SCSI_SPC_ADR_SCTL)
+	{
+		if (data & 0x80)
+			SCSI_SpcSstsSetBit7Reason(0, "SCTLリセット");	/* リセット(bit7=$80)でbit7を落とす */
+	}
+	else if (adr == SCSI_SPC_ADR_PCTL)
+	{
+		/* 実験的な規則(このファイル冒頭のSCSI_SPC_ADR_PCTLコメント参照):
+		 * 再試行のたびに測定を1つ進めるため、PCTLへの書き込みを
+		 * 「接続の終わり」とみなしてSSTSのbit7を落とす。実機で確認した
+		 * 仕様ではない。webx68k_scsi_spc_clear_on_pctl() で無効化できる
+		 * (既定1=落とす、0=従来どおりSCMD/SCTLのみで落とす)。 */
+		if (webx68k_scsi_spc_clear_on_pctl())
+			SCSI_SpcSstsSetBit7Reason(0, "PCTL書き込み(実験的規則)");
+	}
+}
+
+/* PSNS/SSTSの「掃引」モード。webx68k_scsi_spc_psns/ssts() が -2 を返すとき、
+ * その仮想レジスタは実際の読み出し(SCSI_Read)のたびに 0x00〜0xff を1ずつ
+ * 増やして返す(レジスタごとに別カウンタ、uint8_t の折り返しでそのまま
+ * 0→255→0 と循環する)。
+ *
+ * 背景: 本物ROMはセレクト成功後もPSNSの読み出し→同じループ先頭へ戻る、を
+ * 高速に繰り返すだけで、1値を固定して1回起動しても256通り試すには
+ * 現実的でない時間がかかる。読み出すたびに値を変えれば、ROMが同じ
+ * ループを回っている間に1回の実行で全値を試せる。
+ *
+ * ログは「同一PCから32件で以後抑制」する既存の圧縮(SCSI_BusPcAllow)の
+ * 対象外にする(掃引の並びそのものが見たいものなので、圧縮されると
+ * 肝心の情報が消える)。ただし暴走防止のため全体の4000件上限
+ * (SCSI_BusLogGate)は他のログと共通で掛ける。 */
+static uint8_t SCSISpcPsnsSweepNext = 0;
+static uint8_t SCSISpcSstsSweepNext = 0;
+
+static uint8_t SCSI_SpcSweepRead(uint32_t adr, uint8_t stored)
+{
+	int is_psns = (adr == SCSI_SPC_ADR_PSNS);
+	int is_ssts = (adr == SCSI_SPC_ADR_SSTS);
+	int cfg;
+	uint8_t v;
+	const char *name;
+
+	if (!is_psns && !is_ssts)
+		return stored;
+
+	cfg = is_psns ? webx68k_scsi_spc_psns() : webx68k_scsi_spc_ssts();
+	if (cfg != -2)
+		return stored;
+
+	if (is_psns)
+	{
+		v = SCSISpcPsnsSweepNext;
+		SCSISpcPsnsSweepNext = (uint8_t)(SCSISpcPsnsSweepNext + 1);
+		name = "PSNS";
+	}
+	else
+	{
+		v = SCSISpcSstsSweepNext;
+		SCSISpcSstsSweepNext = (uint8_t)(SCSISpcSstsSweepNext + 1);
+		name = "SSTS";
+	}
+
+	if (log_cb && SCSI_BusLogGate())
+		log_cb(RETRO_LOG_INFO, "[SCSI-SPC] %s掃引: 値=$%02x を返した (pc=$%08x)\n",
+			name, (unsigned)v, (unsigned)m68000_get_reg(M68K_PC));
+
+	return v;
+}
+
 void FASTCALL SCSI_Write(uint32_t adr, uint8_t data)
 {
 	int in_window = (adr >= SCSI_WINDOW_LO && adr < SCSI_WINDOW_HI);
+	int in_spc = (adr >= SCSI_SPC_PORT_LO && adr < SCSI_SPC_PORT_HI);
 
 	if (adr >= 0x00ea0000 && adr < 0x00ea2000)
 		SCSI_BusLog(adr, 1, data, m68000_get_reg(M68K_PC));
+
+	if (SCSIUsingRealRom && in_spc)
+	{
+		SCSI_SpcWrite(adr, data);
+		return;
+	}
 
 	if (in_window && !SCSIUsingRealRom)
 		SCSIIPL[(adr^1)&0x1fff] = data;
@@ -925,7 +1275,21 @@ void FASTCALL SCSI_Write(uint32_t adr, uint8_t data)
 
 uint8_t FASTCALL SCSI_Read(uint32_t adr)
 {
+	uint8_t data;
+	int in_spc = (adr >= SCSI_SPC_PORT_LO && adr < SCSI_SPC_PORT_HI);
+
+	if (SCSIUsingRealRom && in_spc)
+	{
+		int idx = SCSI_SpcRegIndex(adr);
+		data = (idx >= 0) ? SCSISpcReg[idx] : 0;
+		data = SCSI_SpcSweepRead(adr, data);
+	}
+	else
+	{
+		data = SCSIIPL[(adr^1)&0x1fff];
+	}
+
 	if (adr >= 0x00ea0000 && adr < 0x00ea2000)
-		SCSI_BusLog(adr, 0, SCSIIPL[(adr^1)&0x1fff], m68000_get_reg(M68K_PC));
-	return SCSIIPL[(adr^1)&0x1fff];
+		SCSI_BusLog(adr, 0, data, m68000_get_reg(M68K_PC));
+	return data;
 }

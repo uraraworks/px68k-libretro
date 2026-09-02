@@ -14,4 +14,8 @@ void FASTCALL SCSI_Write(uint32_t adr, uint8_t data);
 /* SCSI IOCS ($F5) の呼び出し口 $e9f800 への書き込み */
 void FASTCALL SCSI_IOCSPort_Write(uint32_t adr, uint8_t data);
 
+/* 本物SCSI ROM使用時のみ、ゲストPCを60フレームに1回・上限40行で
+ * [SCSI-PC] としてログへ出す。retro_run から毎フレーム呼ぶ想定。 */
+void SCSI_LogPcIfRealRom(void);
+
 #endif /* _WINX68K_SCSI_H */
