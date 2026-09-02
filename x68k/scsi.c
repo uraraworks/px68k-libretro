@@ -14,6 +14,7 @@
 /* SCSI のセクタI/O(ホスト側)。実体は WebX68k の src/core-shim.c。
  * 決定2 により emscripten のファイルシステムは経由しない。 */
 extern int webx68k_scsi_get_size(void);
+extern int webx68k_scsi_init_d2(void);
 extern int webx68k_scsi_read_sector(unsigned int lba, unsigned char *buf);
 
 uint8_t	SCSIIPL[0x2000];
@@ -34,6 +35,15 @@ static int SCSIIOCSLogCount = 0;
 
 /* 自己検査の状態: 0=通常, 1=検査中(まだ届いていない), 2=検査中(届いた) */
 static int SCSIIOCSSelfTest = 0;
+
+/* ROM ヘッダ($ea0020〜)が読まれた瞬間の PC を記録する観測用。
+ * IPL のどのコードがボードを見に来ているかを特定するために使う。
+ * 命令フェッチは OP_ROM 経由で SCSI_Read を通らないので、ここに来るのは
+ * データ読み出しだけである。 */
+#define SCSI_ROMLOG_MAX     64
+static int SCSIRomLogCount = 0;
+static int SCSIRomReadTotal = 0;
+static int SCSIEntryCallCount = 0;
 
 void SCSI_Init(void)
 {
@@ -76,14 +86,66 @@ void SCSI_Init(void)
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		/* $ea0080 ベクタ設定エントリの続き(陽性対照つき) */
 		0x13, 0xfc, 0x00, 0x03, 0x00, 0xe9, 0xf8, 0x02,	/* "move.b #$03, $e9f802" ベクタ設定エントリが呼ばれた */
-		0x74, 0xff,							/* "moveq #-1, d2" (元の処理) */
+		/* d2 は「Human68k が後で呼ぶルーチンのアドレス」である(実測)。
+		 * 元の px68k スタブは #-1(＝無し)を返していた。#0 を返したところ
+		 * Human68k が $00000000 へ飛び「おかしな命令を実行しました
+		 * (SR=$2009:PC=$00000000)」になったことで確定した。
+		 * ここでは自前ルーチン($ea00a0)を渡し、呼ばれ方を観測する。 */
+		0x24, 0x3c, 0xff, 0xff, 0xff, 0xff,	/* "move.l #-1, d2" 即値は SCSI_Init で差し替える */
 		0x4e, 0x75,							/* "rts" */
+		/* $ea0090-$ea009f 詰め物 */
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		/* $ea00a0 Human68k から呼ばれるルーチン(観測のみ) */
+		0x13, 0xfc, 0x00, 0x05, 0x00, 0xe9, 0xf8, 0x02,	/* "move.b #$05, $e9f802" */
+		0x4e, 0x75,							/* "rts" */
+		/* $ea00aa-$ea00bf 詰め物 */
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		/* $ea00c0 d2 で渡す構造体(仮)。どのオフセットが使われるか分からないので
+		 * 16個ぶん全てを観測ルーチン($ea00a0)へ向けておく。 */
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
+		0x00, 0xea, 0x00, 0xa0,
 	};
 	int i;
 	uint8_t tmp;
 	SCSIIOCSLogCount = 0;
+	SCSIRomLogCount = 0;
+	SCSIRomReadTotal = 0;
+	SCSIEntryCallCount = 0;
 	memset(SCSIIPL, 0, 0x2000);
 	memcpy(&SCSIIPL[0x20], SCSIIMG, sizeof(SCSIIMG));
+	/* ベクタ設定エントリが返す d2 の即値を差し替える。
+	 * 意味が未確定のため、再ビルドせずに値を振れるようにしてある。
+	 * 位置は決め打ちなので、命令語($243c = move.l #imm,d2)を照合してから書く。 */
+	if (SCSIIPL[0x88] == 0x24 && SCSIIPL[0x89] == 0x3c)
+	{
+		int d2 = webx68k_scsi_init_d2();
+		SCSIIPL[0x8a] = (uint8_t)((d2 >> 24) & 0xff);
+		SCSIIPL[0x8b] = (uint8_t)((d2 >> 16) & 0xff);
+		SCSIIPL[0x8c] = (uint8_t)((d2 >> 8) & 0xff);
+		SCSIIPL[0x8d] = (uint8_t)(d2 & 0xff);
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "[SCSI] ベクタ設定エントリが返す d2 = $%08x\n", (unsigned)d2);
+	}
+	else if (log_cb)
+		log_cb(RETRO_LOG_ERROR, "[SCSI] d2 即値の位置がずれている (SCSIIPL[0x88,0x89]=$%02x$%02x)\n",
+			SCSIIPL[0x88], SCSIIPL[0x89]);
+
 	for (i=0; i<0x2000; i+=2)
 	{
 		tmp = SCSIIPL[i];
@@ -140,6 +202,25 @@ static void SCSI_HostCommand(uint8_t cmd)
 	static uint8_t sec0[512];
 	uint32_t i;
 
+	if (cmd == 0x05)
+	{
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI] d2で渡したルーチンが呼ばれた #%d pc=$%08x sr=$%04x\n"
+				"        d0=$%08x d1=$%08x d2=$%08x d3=$%08x d4=$%08x d5=$%08x d6=$%08x d7=$%08x\n"
+				"        a0=$%08x a1=$%08x a2=$%08x a3=$%08x a4=$%08x a5=$%08x a6=$%08x a7=$%08x\n",
+				++SCSIEntryCallCount,
+				(unsigned)m68000_get_reg(M68K_PC), (unsigned)m68000_get_reg(M68K_SR),
+				(unsigned)m68000_get_reg(M68K_D0), (unsigned)m68000_get_reg(M68K_D1),
+				(unsigned)m68000_get_reg(M68K_D2), (unsigned)m68000_get_reg(M68K_D3),
+				(unsigned)m68000_get_reg(M68K_D4), (unsigned)m68000_get_reg(M68K_D5),
+				(unsigned)m68000_get_reg(M68K_D6), (unsigned)m68000_get_reg(M68K_D7),
+				(unsigned)m68000_get_reg(M68K_A0), (unsigned)m68000_get_reg(M68K_A1),
+				(unsigned)m68000_get_reg(M68K_A2), (unsigned)m68000_get_reg(M68K_A3),
+				(unsigned)m68000_get_reg(M68K_A4), (unsigned)m68000_get_reg(M68K_A5),
+				(unsigned)m68000_get_reg(M68K_A6), (unsigned)m68000_get_reg(M68K_A7));
+		return;
+	}
 	if (cmd == 0x03)
 	{
 		if (log_cb)
@@ -219,5 +300,18 @@ void FASTCALL SCSI_Write(uint32_t adr, uint8_t data) { }
 
 uint8_t FASTCALL SCSI_Read(uint32_t adr)
 {
+	/* ヘッダ領域($ea0020-$ea0053)への読み出しだけを記録する。
+	 * それ以外は今のところ全てゼロで、読まれても情報にならない。 */
+	if (adr >= 0x00ea0020 && adr < 0x00ea0054)
+	{
+		SCSIRomReadTotal++;
+		if (SCSIRomLogCount < SCSI_ROMLOG_MAX)
+		{
+			SCSIRomLogCount++;
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO, "[SCSI-ROM] #%d adr=$%06x pc=$%08x\n",
+					SCSIRomLogCount, (unsigned)adr, (unsigned)m68000_get_reg(M68K_PC));
+		}
+	}
 	return SCSIIPL[(adr^1)&0x1fff];
 }
