@@ -24,6 +24,14 @@ static int SCSIIOCSLogCount = 0;
 /* SCSI IOCS ($F5) の呼び出し口。ROMスタブの "move.b d1, $e9f800" の宛先 */
 #define SCSI_IOCS_PORT      0x00e9f800
 
+/* 自前ROMコードからホスト(C側)を呼ぶための私設ポート。
+ * IOCS の呼び出し口($e9f800)とは別にして、ログが混ざらないようにする。 */
+#define SCSI_HOST_PORT      0x00e9f802
+
+/* セクタ0の暫定ロード先。実機がどこへ載せるかは未確認であり、
+ * この値は「ゲストRAMへ書けるか」を測るための仮置きである。 */
+#define SCSI_BOOT_LOAD_ADDR 0x00002000
+
 /* 自己検査の状態: 0=通常, 1=検査中(まだ届いていない), 2=検査中(届いた) */
 static int SCSIIOCSSelfTest = 0;
 
@@ -39,14 +47,37 @@ void SCSI_Init(void)
 		0x00, 0xea, 0x00, 0x4a,				/* $ea0028 SCSI IOCS entry address */
 		0x48, 0x75, 0x6d, 0x61,				/* $ea002c ↓ */
 		0x6e, 0x36, 0x38, 0x6b,				/* $ea0030 ID "Human68k" (always right before the startup entry point) */
-		0x4e, 0x75,							/* $ea0034 "rts" (startup entry point, does nothing) */
+		0x60, 0x2a,							/* $ea0034 "bra.s $ea0060" 起動エントリ。ROMの構造は動かさず
+											 * ここを2バイトの分岐に置き換えて自前ルーチンへ飛ばす。
+											 * (実測: $ea0020 のポインタを書き換えると IPL がボードごと
+											 *  受け付けなくなり、$07d4 が既定値に戻った) */
 		0x23, 0xfc, 0x00, 0xea, 0x00, 0x4a,	/* $ea0036 ↓ (IOCS vector setting entry point) */
 		0x00, 0x00, 0x07, 0xd4,				/* $ea003c "move.l #$ea004a, $7d4.l" (IOCS $F5 vector setting) */
-		0x74, 0xff,							/* $ea0040 "moveq #-1, d2" */
+		0x60, 0x3e,							/* $ea0040 "bra.s $ea0080" 陽性対照。ベクタ設定エントリは
+											 * 実測で必ず呼ばれている($07d4 が書き換わる)ので、
+											 * こちらの印が出れば「呼ばれれば印が出る」ことの証明になる。
+											 * 元の moveq は飛び先で実行する。 */
 		0x4e, 0x75,							/* $ea0042 "rts" */
 		0x53, 0x43, 0x53, 0x49, 0x45, 0x58,	/* $ea0044 ID "SCSIEX" (SCSI card ID) */
 		0x13, 0xc1, 0x00, 0xe9, 0xf8, 0x00,	/* $ea004a "move.b d1, $e9f800" (SCSI IOCS call entry point) */
 		0x4e, 0x75,							/* $ea0050 "rts" */
+
+		/* $ea0052-$ea005f 予備 (自前ルーチンを $ea0060 に置くための詰め物) */
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		/* $ea0060 起動エントリ本体。
+		 * 実機の CZ-6BS1 ではここがSCSIバスを走査してデバイスを登録する。
+		 * この段階では「呼ばれたか」を測るための印を出すだけで、まだ何も登録しない。 */
+		0x13, 0xfc, 0x00, 0x01, 0x00, 0xe9, 0xf8, 0x02,	/* $ea0060 "move.b #$01, $e9f802" 起動エントリに入った */
+		0x13, 0xfc, 0x00, 0x02, 0x00, 0xe9, 0xf8, 0x02,	/* $ea0068 "move.b #$02, $e9f802" セクタ0をゲストRAMへ載せろ */
+		0x4e, 0x75,							/* $ea0070 "rts" */
+		/* $ea0072-$ea007f 詰め物 */
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		/* $ea0080 ベクタ設定エントリの続き(陽性対照つき) */
+		0x13, 0xfc, 0x00, 0x03, 0x00, 0xe9, 0xf8, 0x02,	/* "move.b #$03, $e9f802" ベクタ設定エントリが呼ばれた */
+		0x74, 0xff,							/* "moveq #-1, d2" (元の処理) */
+		0x4e, 0x75,							/* "rts" */
 	};
 	int i;
 	uint8_t tmp;
@@ -103,6 +134,52 @@ void SCSI_Init(void)
 	}
 }
 
+/* 自前ROMコードからの依頼を処理する。まだ何も登録せず、観測に必要なことだけ行う。 */
+static void SCSI_HostCommand(uint8_t cmd)
+{
+	static uint8_t sec0[512];
+	uint32_t i;
+
+	if (cmd == 0x03)
+	{
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "[SCSI] ベクタ設定エントリが呼ばれた(陽性対照) (pc=$%08x)\n",
+				(unsigned)m68000_get_reg(M68K_PC));
+		return;
+	}
+	if (cmd == 0x01)
+	{
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "[SCSI] 起動エントリが呼ばれた (pc=$%08x)\n",
+				(unsigned)m68000_get_reg(M68K_PC));
+		return;
+	}
+	if (cmd == 0x02)
+	{
+		if (webx68k_scsi_read_sector(0, sec0) != 0)
+		{
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO, "[SCSI] セクタ0を読めない (デバイス無し)\n");
+			return;
+		}
+		for (i = 0; i < 512; i++)
+			cpu_writemem24(SCSI_BOOT_LOAD_ADDR + i, sec0[i]);
+		/* 書いた先を CPU と同じ読み出し経路で読み返す。
+		 * バイト順の取り違えはここでしか捕まらない。 */
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI] セクタ0を $%06x へ載せた 読み返し=\"%c%c%c%c%c%c%c%c\"\n",
+				(unsigned)SCSI_BOOT_LOAD_ADDR,
+				cpu_readmem24(SCSI_BOOT_LOAD_ADDR + 0), cpu_readmem24(SCSI_BOOT_LOAD_ADDR + 1),
+				cpu_readmem24(SCSI_BOOT_LOAD_ADDR + 2), cpu_readmem24(SCSI_BOOT_LOAD_ADDR + 3),
+				cpu_readmem24(SCSI_BOOT_LOAD_ADDR + 4), cpu_readmem24(SCSI_BOOT_LOAD_ADDR + 5),
+				cpu_readmem24(SCSI_BOOT_LOAD_ADDR + 6), cpu_readmem24(SCSI_BOOT_LOAD_ADDR + 7));
+		return;
+	}
+	if (log_cb)
+		log_cb(RETRO_LOG_ERROR, "[SCSI] 未知のホストコマンド $%02x\n", (unsigned)cmd);
+}
+
 /* --- SCSI IOCS ($F5) の観測フック ---------------------------------------
  * 上の SCSIIMG は SCSI IOCS 呼び出しを "move.b d1, $e9f800" として外へ出す。
  * $e9f800 は mem_wrap の書き込み表で wm_nop に落ちており、呼び出しは
@@ -112,6 +189,11 @@ void SCSI_Init(void)
 
 void FASTCALL SCSI_IOCSPort_Write(uint32_t adr, uint8_t data)
 {
+	if (adr == SCSI_HOST_PORT)
+	{
+		SCSI_HostCommand(data);
+		return;
+	}
 	if ((adr & ~1) != (SCSI_IOCS_PORT & ~1))
 		return;
 	if (SCSIIOCSSelfTest)
