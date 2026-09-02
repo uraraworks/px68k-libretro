@@ -17,6 +17,7 @@
 extern int webx68k_scsi_get_size(void);
 extern int webx68k_scsi_init_d2(void);
 extern int webx68k_scsi_init_a4(void);
+extern int webx68k_scsi_drv_attr(void);
 extern int webx68k_scsi_sram_init(void);
 extern int webx68k_scsi_read_sector(unsigned int lba, unsigned char *buf);
 
@@ -155,49 +156,106 @@ void SCSI_Init(void)
 	memset(SCSIIPL, 0, 0x2000);
 	memcpy(&SCSIIPL[0x20], SCSIIMG, sizeof(SCSIIMG));
 
-	/* d2 で渡す観測用の表を作る。$ea0000〜のバイト入れ替えループより前に、
-	 * SCSIIMG と同じ自然なバイト順で書く。
-	 * - $ea0100 から 4バイト×64要素: 要素kの値 = $00ea0200 + k*10
-	 * - $ea0200 から 10バイト×64個のスタブ: move.b #(0x40+k),$e9f802 / rts */
+	/* d2/a4 で渡す窓 $ea0100 を、Human68k デバイスドライバヘッダの一般形
+	 * (+0 次のヘッダ4 / +4 属性ワード2 / +6 ストラテジ4 / +10 インタラプト4 /
+	 *  +14 名前8、以降未実測)で埋める。$ea0000〜のバイト入れ替えループより
+	 * 前に、SCSIIMG と同じ自然なバイト順で書く。
+	 * スタブは従来どおり $ea0200 から10バイト×64個: move.b #(0x40+k),$e9f802 / rts
+	 * - stub[0] = ストラテジ、stub[1] = インタラプト
+	 * - $ea0116〜$ea01ff は従来どおり4バイトのポインタ表とし、
+	 *   要素は stub[2 + (オフセット-0x116)/4] を指す(未知のオフセットが
+	 *   使われたら k で捕まえるため)。 */
 	{
 		int k;
-		uint32_t off_table = 0x100;	/* SCSIIPL内オフセット ($ea0100) */
+		uint32_t off_hdr   = 0x100;	/* SCSIIPL内オフセット ($ea0100) */
 		uint32_t off_stub  = 0x200;	/* SCSIIPL内オフセット ($ea0200) */
+		uint32_t off_table = 0x116;	/* SCSIIPL内オフセット ($ea0116) */
+		uint32_t off;
+
 		for (k = 0; k < SCSI_TABLE_ENTRIES; k++)
 		{
-			uint32_t val = 0x00ea0200 + (uint32_t)k * 10;
-			uint32_t p = off_table + (uint32_t)k * 4;
-			SCSIIPL[p + 0] = (uint8_t)((val >> 24) & 0xff);
-			SCSIIPL[p + 1] = (uint8_t)((val >> 16) & 0xff);
-			SCSIIPL[p + 2] = (uint8_t)((val >> 8) & 0xff);
-			SCSIIPL[p + 3] = (uint8_t)(val & 0xff);
-
-			{
-				uint32_t sp = off_stub + (uint32_t)k * 10;
-				SCSIIPL[sp + 0] = 0x13;
-				SCSIIPL[sp + 1] = 0xfc;
-				SCSIIPL[sp + 2] = 0x00;
-				SCSIIPL[sp + 3] = (uint8_t)(0x40 + k);
-				SCSIIPL[sp + 4] = 0x00;
-				SCSIIPL[sp + 5] = 0xe9;
-				SCSIIPL[sp + 6] = 0xf8;
-				SCSIIPL[sp + 7] = 0x02;
-				SCSIIPL[sp + 8] = 0x4e;
-				SCSIIPL[sp + 9] = 0x75;
-			}
+			uint32_t sp = off_stub + (uint32_t)k * 10;
+			SCSIIPL[sp + 0] = 0x13;
+			SCSIIPL[sp + 1] = 0xfc;
+			SCSIIPL[sp + 2] = 0x00;
+			SCSIIPL[sp + 3] = (uint8_t)(0x40 + k);
+			SCSIIPL[sp + 4] = 0x00;
+			SCSIIPL[sp + 5] = 0xe9;
+			SCSIIPL[sp + 6] = 0xf8;
+			SCSIIPL[sp + 7] = 0x02;
+			SCSIIPL[sp + 8] = 0x4e;
+			SCSIIPL[sp + 9] = 0x75;
 		}
+
+		/* +$00 次のヘッダ = $ffffffff (このドライバで最後) */
+		SCSIIPL[off_hdr + 0x00] = 0xff;
+		SCSIIPL[off_hdr + 0x01] = 0xff;
+		SCSIIPL[off_hdr + 0x02] = 0xff;
+		SCSIIPL[off_hdr + 0x03] = 0xff;
+
+		/* +$04 属性ワード。値の意味が未確定のため、再ビルドせずに
+		 * ホスト(JS)側から振れるようにしてある。既定 $0000。 */
+		{
+			int attr = webx68k_scsi_drv_attr();
+			SCSIIPL[off_hdr + 0x04] = (uint8_t)((attr >> 8) & 0xff);
+			SCSIIPL[off_hdr + 0x05] = (uint8_t)(attr & 0xff);
+		}
+
+		/* +$06 ストラテジ = stub[0] */
+		{
+			uint32_t v = 0x00ea0200 + 0u * 10u;
+			SCSIIPL[off_hdr + 0x06] = (uint8_t)((v >> 24) & 0xff);
+			SCSIIPL[off_hdr + 0x07] = (uint8_t)((v >> 16) & 0xff);
+			SCSIIPL[off_hdr + 0x08] = (uint8_t)((v >> 8) & 0xff);
+			SCSIIPL[off_hdr + 0x09] = (uint8_t)(v & 0xff);
+		}
+		/* +$0a インタラプト = stub[1] */
+		{
+			uint32_t v = 0x00ea0200 + 1u * 10u;
+			SCSIIPL[off_hdr + 0x0a] = (uint8_t)((v >> 24) & 0xff);
+			SCSIIPL[off_hdr + 0x0b] = (uint8_t)((v >> 16) & 0xff);
+			SCSIIPL[off_hdr + 0x0c] = (uint8_t)((v >> 8) & 0xff);
+			SCSIIPL[off_hdr + 0x0d] = (uint8_t)(v & 0xff);
+		}
+		/* +$0e ユニット数1のつもり + 名前"SCSI   " */
+		SCSIIPL[off_hdr + 0x0e] = 0x01;
+		SCSIIPL[off_hdr + 0x0f] = 'S';
+		SCSIIPL[off_hdr + 0x10] = 'C';
+		SCSIIPL[off_hdr + 0x11] = 'S';
+		SCSIIPL[off_hdr + 0x12] = 'I';
+		SCSIIPL[off_hdr + 0x13] = ' ';
+		SCSIIPL[off_hdr + 0x14] = ' ';
+		SCSIIPL[off_hdr + 0x15] = ' ';
+
+		/* $ea0116〜$ea01ff: 4バイトのポインタ表。stub[2]以降を指す。 */
+		for (off = off_table; off + 4 <= off_stub; off += 4)
+		{
+			int idx = 2 + (int)((off - off_table) / 4);
+			uint32_t v = 0x00ea0200 + (uint32_t)idx * 10;
+			SCSIIPL[off + 0] = (uint8_t)((v >> 24) & 0xff);
+			SCSIIPL[off + 1] = (uint8_t)((v >> 16) & 0xff);
+			SCSIIPL[off + 2] = (uint8_t)((v >> 8) & 0xff);
+			SCSIIPL[off + 3] = (uint8_t)(v & 0xff);
+		}
+
 		if (log_cb)
 		{
-			uint32_t v0 = ((uint32_t)SCSIIPL[off_table + 0] << 24) | ((uint32_t)SCSIIPL[off_table + 1] << 16) |
+			uint32_t hdr_next = ((uint32_t)SCSIIPL[off_hdr + 0] << 24) | ((uint32_t)SCSIIPL[off_hdr + 1] << 16) |
+				((uint32_t)SCSIIPL[off_hdr + 2] << 8) | SCSIIPL[off_hdr + 3];
+			uint32_t hdr_attr = ((uint32_t)SCSIIPL[off_hdr + 4] << 8) | SCSIIPL[off_hdr + 5];
+			uint32_t hdr_strategy = ((uint32_t)SCSIIPL[off_hdr + 6] << 24) | ((uint32_t)SCSIIPL[off_hdr + 7] << 16) |
+				((uint32_t)SCSIIPL[off_hdr + 8] << 8) | SCSIIPL[off_hdr + 9];
+			uint32_t hdr_interrupt = ((uint32_t)SCSIIPL[off_hdr + 10] << 24) | ((uint32_t)SCSIIPL[off_hdr + 11] << 16) |
+				((uint32_t)SCSIIPL[off_hdr + 12] << 8) | SCSIIPL[off_hdr + 13];
+			uint32_t tbl0 = ((uint32_t)SCSIIPL[off_table + 0] << 24) | ((uint32_t)SCSIIPL[off_table + 1] << 16) |
 				((uint32_t)SCSIIPL[off_table + 2] << 8) | SCSIIPL[off_table + 3];
-			uint32_t vmid = ((uint32_t)SCSIIPL[off_table + 32*4 + 0] << 24) | ((uint32_t)SCSIIPL[off_table + 32*4 + 1] << 16) |
-				((uint32_t)SCSIIPL[off_table + 32*4 + 2] << 8) | SCSIIPL[off_table + 32*4 + 3];
-			uint32_t v63 = ((uint32_t)SCSIIPL[off_table + 63*4 + 0] << 24) | ((uint32_t)SCSIIPL[off_table + 63*4 + 1] << 16) |
-				((uint32_t)SCSIIPL[off_table + 63*4 + 2] << 8) | SCSIIPL[off_table + 63*4 + 3];
 			log_cb(RETRO_LOG_INFO,
-				"[SCSI] 観測用テーブル書き込み確認: [0]=$%08x(期待$%08x) [32]=$%08x(期待$%08x) [63]=$%08x(期待$%08x) スタブ[0] cmd=$%02x スタブ[63] cmd=$%02x\n",
-				v0, 0x00ea0200u, vmid, 0x00ea0200u + 32u*10u, v63, 0x00ea0200u + 63u*10u,
-				SCSIIPL[off_stub + 3], SCSIIPL[off_stub + 63*10 + 3]);
+				"[SCSI] デバイスドライバヘッダ書き込み確認: next=$%08x(期待$ffffffff) attr=$%04x strategy=$%08x(期待$%08x) interrupt=$%08x(期待$%08x) unit=$%02x name=\"%c%c%c%c%c%c%c\" table[0]=$%08x(期待$%08x)\n",
+				hdr_next, hdr_attr, hdr_strategy, 0x00ea0200u, hdr_interrupt, 0x00ea0200u + 10u,
+				SCSIIPL[off_hdr + 0x0e],
+				SCSIIPL[off_hdr + 0x0f], SCSIIPL[off_hdr + 0x10], SCSIIPL[off_hdr + 0x11],
+				SCSIIPL[off_hdr + 0x12], SCSIIPL[off_hdr + 0x13], SCSIIPL[off_hdr + 0x14], SCSIIPL[off_hdr + 0x15],
+				tbl0, 0x00ea0200u + 2u*10u);
 		}
 	}
 	/* ベクタ設定エントリが返す d2 の即値を差し替える。
@@ -427,13 +485,15 @@ static void SCSI_HostCommand(uint8_t cmd)
 	{
 		int k = cmd - 0x40;
 		uint32_t sp = m68000_get_reg(M68K_A7);
+		const char *kname = (k == 0) ? "ストラテジ" : (k == 1) ? "インタラプト" : "表";
 		if (log_cb)
+		{
 			log_cb(RETRO_LOG_INFO,
-				"[SCSI] d2で渡した表の +$%02x(要素 %d)が呼ばれた #%d pc=$%08x sr=$%04x sp=$%08x\n"
+				"[SCSI] d2で渡した%s +$%02x(要素 %d)が呼ばれた #%d pc=$%08x sr=$%04x sp=$%08x\n"
 				"        d0=$%08x d1=$%08x d2=$%08x d3=$%08x d4=$%08x d5=$%08x d6=$%08x d7=$%08x\n"
 				"        a0=$%08x a1=$%08x a2=$%08x a3=$%08x a4=$%08x a5=$%08x a6=$%08x\n"
 				"        stack: [0]=$%08x [1]=$%08x [2]=$%08x [3]=$%08x\n",
-				(unsigned)(k * 10), k, ++SCSITableCallCount[k],
+				kname, (unsigned)(k * 10), k, ++SCSITableCallCount[k],
 				(unsigned)m68000_get_reg(M68K_PC), (unsigned)m68000_get_reg(M68K_SR), (unsigned)sp,
 				(unsigned)m68000_get_reg(M68K_D0), (unsigned)m68000_get_reg(M68K_D1),
 				(unsigned)m68000_get_reg(M68K_D2), (unsigned)m68000_get_reg(M68K_D3),
@@ -445,6 +505,30 @@ static void SCSI_HostCommand(uint8_t cmd)
 				(unsigned)m68000_get_reg(M68K_A6),
 				(unsigned)cpu_readmem24_dword(sp), (unsigned)cpu_readmem24_dword(sp + 4),
 				(unsigned)cpu_readmem24_dword(sp + 8), (unsigned)cpu_readmem24_dword(sp + 12));
+
+			/* 要求ヘッダがどのレジスタで渡るかを特定するため、a0〜a6 のうち
+			 * 0でなく $00ffffff 以下(ゲストRAM/ROM空間)のものは、指す先16バイトを
+			 * 実際にダンプする。 */
+			{
+				static const int a_regs[7] = { M68K_A0, M68K_A1, M68K_A2, M68K_A3, M68K_A4, M68K_A5, M68K_A6 };
+				static const char *a_names[7] = { "a0", "a1", "a2", "a3", "a4", "a5", "a6" };
+				int ai;
+				for (ai = 0; ai < 7; ai++)
+				{
+					uint32_t av = m68000_get_reg(a_regs[ai]);
+					if (av != 0 && av <= 0x00ffffff)
+					{
+						log_cb(RETRO_LOG_INFO,
+							"[SCSI] %s=$%08x: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+							a_names[ai], (unsigned)av,
+							cpu_readmem24(av + 0), cpu_readmem24(av + 1), cpu_readmem24(av + 2), cpu_readmem24(av + 3),
+							cpu_readmem24(av + 4), cpu_readmem24(av + 5), cpu_readmem24(av + 6), cpu_readmem24(av + 7),
+							cpu_readmem24(av + 8), cpu_readmem24(av + 9), cpu_readmem24(av + 10), cpu_readmem24(av + 11),
+							cpu_readmem24(av + 12), cpu_readmem24(av + 13), cpu_readmem24(av + 14), cpu_readmem24(av + 15));
+					}
+				}
+			}
+		}
 		return;
 	}
 	if (log_cb)
