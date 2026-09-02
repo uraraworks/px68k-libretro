@@ -19,7 +19,20 @@ extern int webx68k_scsi_init_d2(void);
 extern int webx68k_scsi_init_a4(void);
 extern int webx68k_scsi_drv_attr(void);
 extern int webx68k_scsi_sram_init(void);
+/* 初期化コマンド($00)への返答値。再ビルドせずに振れるよう JS 側から読む。
+ * 意味の確定していない欄の切り分け用。既定値は元のハードコード値と同じ。 */
+extern int webx68k_scsi_reply_err(void);
+extern int webx68k_scsi_reply_units(void);
+extern int webx68k_scsi_reply_end(void);
+extern int webx68k_scsi_reply_bpb(void);
+extern int webx68k_scsi_reply_status(void);
 extern int webx68k_scsi_read_sector(unsigned int lba, unsigned char *buf);
+/* ホストコマンド処理(ストラテジ$40/インタラプト$41)の最後に設定する d0。
+ * 既定 -1(何もしない)。呼び出し時の値のまま戻す従来の挙動と同じ。 */
+extern int webx68k_scsi_reply_d0(void);
+/* デバイスドライバヘッダ +$00(次のヘッダ)に書く値。既定 $ffffffff
+ * (このドライバで最後、従来と同じ)。 */
+extern unsigned int webx68k_scsi_drv_next(void);
 
 uint8_t	SCSIIPL[0x2000];
 
@@ -50,14 +63,22 @@ static int SCSIRomReadTotal = 0;
 static int SCSIEntryCallCount = 0;
 static int SCSIZeroCallCount = 0;
 
-/* $ea0100〜$ea04ff への書き込みログ(先頭64件)。範囲内/範囲外を問わず
+/* $ea0100〜$ea07ff への書き込みログ(先頭64件)。範囲内/範囲外を問わず
  * $ea0000〜$ea1fff 全域を対象にする。 */
 #define SCSI_WRITELOG_MAX   64
 static int SCSIWriteLogCount = 0;
 
-/* $ea0100〜$ea04ff への読み出しログ(上限128件、ヘッダ域とは別カウンタ) */
-#define SCSI_WINREAD_LOG_MAX 128
+/* $ea0100〜$ea07ff への読み出しログ(上限512件、ヘッダ域とは別カウンタ)。
+ * BPB域($ea0610〜)の読み出しを取りこぼさないよう128から引き上げた。 */
+#define SCSI_WINREAD_LOG_MAX 512
 static int SCSIWinReadLogCount = 0;
+
+/* ストラテジ(ホストコマンド $40)呼び出し時に a5 で渡された要求ヘッダの
+ * アドレスを控えておく。0 = 未取得。インタラプト($41)側で使う。 */
+static uint32_t SCSIReqHeaderAddr = 0;
+
+/* 要求ヘッダのコマンド$00(初期化)を処理した回数。 */
+static int SCSIReqInitCount = 0;
 
 /* d2 で渡す観測用テーブル/スタブの呼び出し回数 ($40〜$7f, 64要素) */
 #define SCSI_TABLE_ENTRIES 64
@@ -152,6 +173,8 @@ void SCSI_Init(void)
 	SCSIZeroCallCount = 0;
 	SCSIWriteLogCount = 0;
 	SCSIWinReadLogCount = 0;
+	SCSIReqHeaderAddr = 0;
+	SCSIReqInitCount = 0;
 	memset(SCSITableCallCount, 0, sizeof(SCSITableCallCount));
 	memset(SCSIIPL, 0, 0x2000);
 	memcpy(&SCSIIPL[0x20], SCSIIMG, sizeof(SCSIIMG));
@@ -187,11 +210,15 @@ void SCSI_Init(void)
 			SCSIIPL[sp + 9] = 0x75;
 		}
 
-		/* +$00 次のヘッダ = $ffffffff (このドライバで最後) */
-		SCSIIPL[off_hdr + 0x00] = 0xff;
-		SCSIIPL[off_hdr + 0x01] = 0xff;
-		SCSIIPL[off_hdr + 0x02] = 0xff;
-		SCSIIPL[off_hdr + 0x03] = 0xff;
+		/* +$00 次のヘッダ。既定 $ffffffff(このドライバで最後、従来と同じ)。
+		 * 意味が未確定のため、再ビルドせずに JS 側から振れるようにしてある。 */
+		{
+			uint32_t v = webx68k_scsi_drv_next();
+			SCSIIPL[off_hdr + 0x00] = (uint8_t)((v >> 24) & 0xff);
+			SCSIIPL[off_hdr + 0x01] = (uint8_t)((v >> 16) & 0xff);
+			SCSIIPL[off_hdr + 0x02] = (uint8_t)((v >> 8) & 0xff);
+			SCSIIPL[off_hdr + 0x03] = (uint8_t)(v & 0xff);
+		}
 
 		/* +$04 属性ワード。値の意味が未確定のため、再ビルドせずに
 		 * ホスト(JS)側から振れるようにしてある。既定 $0000。 */
@@ -250,7 +277,7 @@ void SCSI_Init(void)
 			uint32_t tbl0 = ((uint32_t)SCSIIPL[off_table + 0] << 24) | ((uint32_t)SCSIIPL[off_table + 1] << 16) |
 				((uint32_t)SCSIIPL[off_table + 2] << 8) | SCSIIPL[off_table + 3];
 			log_cb(RETRO_LOG_INFO,
-				"[SCSI] デバイスドライバヘッダ書き込み確認: next=$%08x(期待$ffffffff) attr=$%04x strategy=$%08x(期待$%08x) interrupt=$%08x(期待$%08x) unit=$%02x name=\"%c%c%c%c%c%c%c\" table[0]=$%08x(期待$%08x)\n",
+				"[SCSI] デバイスドライバヘッダ書き込み確認: next=$%08x(設定値) attr=$%04x strategy=$%08x(期待$%08x) interrupt=$%08x(期待$%08x) unit=$%02x name=\"%c%c%c%c%c%c%c\" table[0]=$%08x(期待$%08x)\n",
 				hdr_next, hdr_attr, hdr_strategy, 0x00ea0200u, hdr_interrupt, 0x00ea0200u + 10u,
 				SCSIIPL[off_hdr + 0x0e],
 				SCSIIPL[off_hdr + 0x0f], SCSIIPL[off_hdr + 0x10], SCSIIPL[off_hdr + 0x11],
@@ -258,6 +285,25 @@ void SCSI_Init(void)
 				tbl0, 0x00ea0200u + 2u*10u);
 		}
 	}
+	/* $ea0600: ユニット0のBPB(ドライブパラメータブロック)へのポインタ
+	 * ($00ea0610)を置く。$ea0610 以降はゼロのままにし、Human68k が
+	 * BPBのどのバイトを読みに来るかを窓読み出しログで実測する。
+	 * バイト入れ替えループより前に、自然なバイト順で書く。 */
+	{
+		uint32_t off_bpbptr = 0x600;
+		uint32_t v = 0x00ea0610;
+		SCSIIPL[off_bpbptr + 0] = (uint8_t)((v >> 24) & 0xff);
+		SCSIIPL[off_bpbptr + 1] = (uint8_t)((v >> 16) & 0xff);
+		SCSIIPL[off_bpbptr + 2] = (uint8_t)((v >> 8) & 0xff);
+		SCSIIPL[off_bpbptr + 3] = (uint8_t)(v & 0xff);
+		if (log_cb)
+		{
+			uint32_t rb = ((uint32_t)SCSIIPL[off_bpbptr + 0] << 24) | ((uint32_t)SCSIIPL[off_bpbptr + 1] << 16) |
+				((uint32_t)SCSIIPL[off_bpbptr + 2] << 8) | SCSIIPL[off_bpbptr + 3];
+			log_cb(RETRO_LOG_INFO, "[SCSI] BPB表ポインタ書き込み確認: $ea0600=$%08x(期待$%08x)\n", rb, v);
+		}
+	}
+
 	/* ベクタ設定エントリが返す d2 の即値を差し替える。
 	 * 意味が未確定のため、再ビルドせずに値を振れるようにしてある。
 	 * 位置は決め打ちなので、命令語($243c = move.l #imm,d2)を照合してから書く。 */
@@ -323,7 +369,7 @@ void SCSI_Init(void)
 	}
 	SCSIIOCSSelfTest = 0;
 
-	/* 陽性対照: $ea0100〜$ea04ff の「書ける窓」への書き込みが
+	/* 陽性対照: $ea0100〜$ea07ff の「書ける窓」への書き込みが
 	 * SCSI_Write を経由して実際に SCSIIPL へ反映されるかを、
 	 * CPU と同じ書き込み経路(cpu_writemem24)で確かめる。
 	 * 書き込み経路がそもそも SCSI_Write に来ていない可能性があるため必須。
@@ -370,6 +416,98 @@ void SCSI_Init(void)
 				sec0[8], sec0[9], sec0[10], sec0[11]);
 		}
 	}
+}
+
+/* インタラプト(ホストコマンド $41)から呼ばれる、要求ヘッダのHLE処理。
+ * ストラテジ($40)で控えた SCSIReqHeaderAddr が指す先を実際のCPU読み書き
+ * 経路(cpu_readmem24/cpu_writemem24)で処理する。
+ *
+ * 要求ヘッダの一般的な形(知識であって未実測。実測できたのは長さ22で
+ * +0=長さ, +1=ユニット, +2=コマンドの3バイトのみ):
+ *   +0 長さ / +1 ユニット番号 / +2 コマンド / +3 エラーコード /
+ *   +4..12 予約 / +13 ユニット数 / +14 処理終了アドレス(4) /
+ *   +18 パラメータ(4) */
+static void SCSI_HandleRequestHeader(void)
+{
+	uint8_t buf[26];
+	uint32_t addr = SCSIReqHeaderAddr;
+	uint32_t i;
+	uint8_t cmdnum;
+
+	if (addr == 0)
+	{
+		if (log_cb)
+			log_cb(RETRO_LOG_ERROR,
+				"[SCSI-REQ] インタラプトが呼ばれたが要求ヘッダのアドレスを控えていない(ストラテジ未呼び出し)\n");
+		return;
+	}
+
+	for (i = 0; i < sizeof(buf); i++)
+		buf[i] = cpu_readmem24(addr + i);
+	if (log_cb)
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-REQ] 処理前 addr=$%08x:"
+			" %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x"
+			" %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			(unsigned)addr,
+			buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+			buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+			buf[20], buf[21], buf[22], buf[23], buf[24], buf[25]);
+
+	cmdnum = buf[2];
+
+	if (cmdnum == 0x00)
+	{
+		int reply_err = webx68k_scsi_reply_err();
+		int reply_units = webx68k_scsi_reply_units();
+		uint32_t reply_end = (uint32_t)webx68k_scsi_reply_end();
+		uint32_t reply_bpb = (uint32_t)webx68k_scsi_reply_bpb();
+		int reply_status = webx68k_scsi_reply_status();
+
+		SCSIReqInitCount++;
+		cpu_writemem24(addr + 3, (uint8_t)(reply_err & 0xff));			/* +3 エラーコード */
+		cpu_writemem24(addr + 13, (uint8_t)(reply_units & 0xff));		/* +13 ユニット数 */
+		cpu_writemem24(addr + 14, (uint8_t)((reply_end >> 24) & 0xff));	/* +14..17 処理終了アドレス */
+		cpu_writemem24(addr + 15, (uint8_t)((reply_end >> 16) & 0xff));
+		cpu_writemem24(addr + 16, (uint8_t)((reply_end >> 8) & 0xff));
+		cpu_writemem24(addr + 17, (uint8_t)(reply_end & 0xff));
+		cpu_writemem24(addr + 18, (uint8_t)((reply_bpb >> 24) & 0xff));	/* +18..21 パラメータ(BPB表ポインタ) */
+		cpu_writemem24(addr + 19, (uint8_t)((reply_bpb >> 16) & 0xff));
+		cpu_writemem24(addr + 20, (uint8_t)((reply_bpb >> 8) & 0xff));
+		cpu_writemem24(addr + 21, (uint8_t)(reply_bpb & 0xff));
+		if (reply_status >= 0)
+		{
+			/* +4 にワードとして書く。-1(既定)のときは何もしない(元の状態と同じ)。 */
+			cpu_writemem24(addr + 4, (uint8_t)((reply_status >> 8) & 0xff));
+			cpu_writemem24(addr + 5, (uint8_t)(reply_status & 0xff));
+		}
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-REQ] 初期化コマンド($00) 処理 #%d: err=$%02x unit数=%d 終了addr=$%08x BPB表ptr=$%08x status=%d%s\n",
+				SCSIReqInitCount, (unsigned)(reply_err & 0xff), reply_units,
+				(unsigned)reply_end, (unsigned)reply_bpb, reply_status,
+				(reply_status >= 0) ? "(+4に書いた)" : "(未指定・+4は変更なし)");
+	}
+	else
+	{
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-REQ] 未対応コマンド $%02x: 内容を観測するため err=$00 だけ書く\n",
+				(unsigned)cmdnum);
+		cpu_writemem24(addr + 3, 0x00);
+	}
+
+	for (i = 0; i < sizeof(buf); i++)
+		buf[i] = cpu_readmem24(addr + i);
+	if (log_cb)
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-REQ] 処理後 addr=$%08x:"
+			" %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x"
+			" %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			(unsigned)addr,
+			buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+			buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+			buf[20], buf[21], buf[22], buf[23], buf[24], buf[25]);
 }
 
 /* 自前ROMコードからの依頼を処理する。まだ何も登録せず、観測に必要なことだけ行う。 */
@@ -529,6 +667,39 @@ static void SCSI_HostCommand(uint8_t cmd)
 				}
 			}
 		}
+
+		/* k==0(ストラテジ): 要求ヘッダのアドレスを a5 から控える。
+		 * k==1(インタラプト): 控えたアドレスをもとに要求ヘッダを処理する(HLE)。
+		 * $41..$7f の他要素の観測経路(上のダンプ)はそのまま残す。 */
+		if (k == 0)
+		{
+			SCSIReqHeaderAddr = m68000_get_reg(M68K_A5);
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI] ストラテジ: 要求ヘッダのアドレスを a5=$%08x として控えた\n",
+					(unsigned)SCSIReqHeaderAddr);
+		}
+		else if (k == 1)
+		{
+			SCSI_HandleRequestHeader();
+		}
+
+		/* ストラテジ/インタラプトから戻る d0。既定 -1(何もしない・呼び出し時の
+		 * 値のまま)。0以上のときだけ再ビルドせずに振れるようにしてある。
+		 * 返答の中身をどう振っても起動が止まる件の残る候補のひとつ。 */
+		if (k == 0 || k == 1)
+		{
+			int reply_d0 = webx68k_scsi_reply_d0();
+			if (reply_d0 >= 0)
+			{
+				uint32_t before = m68000_get_reg(M68K_D0);
+				m68000_set_reg(M68K_D0, (uint32_t)reply_d0);
+				if (log_cb)
+					log_cb(RETRO_LOG_INFO,
+						"[SCSI] %s: d0 を $%08x -> $%08x に設定した\n",
+						kname, (unsigned)before, (unsigned)reply_d0);
+			}
+		}
 		return;
 	}
 	if (log_cb)
@@ -573,11 +744,11 @@ void SCSI_Cleanup(void) { }
 
 /* d2 が指すヘッダ構造体で、我々が用意した窓(64バイト)より先の
  * オフセットが読み書きされているのではないか、という仮説(a)(b)を
- * 一度に測るための「書ける窓」。$ea0100〜$ea04ff への書き込みを
+ * 一度に測るための「書ける窓」。$ea0100〜$ea07ff への書き込みを
  * 実際に SCSIIPL へ反映し、範囲外は従来どおり捨てる。
  * ログは $ea0000〜$ea1fff の全域を対象に先頭64件まで取る。 */
 #define SCSI_WINDOW_LO 0x00ea0100
-#define SCSI_WINDOW_HI 0x00ea0500	/* 排他的上限 ($ea04ff まで) */
+#define SCSI_WINDOW_HI 0x00ea0800	/* 排他的上限 ($ea07ff まで) */
 
 void FASTCALL SCSI_Write(uint32_t adr, uint8_t data)
 {
@@ -612,7 +783,7 @@ uint8_t FASTCALL SCSI_Read(uint32_t adr)
 					SCSIRomLogCount, (unsigned)adr, (unsigned)m68000_get_reg(M68K_PC));
 		}
 	}
-	/* d2 で渡した観測用テーブル/スタブ域($ea0100〜$ea04ff)への読み出し。
+	/* d2 で渡した観測用テーブル/スタブ域($ea0100〜$ea07ff)への読み出し。
 	 * ヘッダ域とは別カウンタで、上限128件まで記録する。 */
 	else if (adr >= SCSI_WINDOW_LO && adr < SCSI_WINDOW_HI)
 	{
