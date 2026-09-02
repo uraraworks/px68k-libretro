@@ -33,6 +33,12 @@ extern int webx68k_scsi_reply_d0(void);
 /* デバイスドライバヘッダ +$00(次のヘッダ)に書く値。既定 $ffffffff
  * (このドライバで最後、従来と同じ)。 */
 extern unsigned int webx68k_scsi_drv_next(void);
+/* 本物の外部SCSIボードROMイメージ(8192バイト)の差し替え経路。
+ * webx68k_scsi_rom_len() が $2000 のときだけ本物ROMとして扱う。
+ * 0 のときは従来どおり自前スタブを使う。逆アセンブルはせず、
+ * 本物ROMを走らせて挙動を実測するためのオラクルとして使う。 */
+extern int webx68k_scsi_rom_len(void);
+extern int webx68k_scsi_rom_byte(int i);
 
 uint8_t	SCSIIPL[0x2000];
 
@@ -53,25 +59,45 @@ static int SCSIIOCSLogCount = 0;
 /* 自己検査の状態: 0=通常, 1=検査中(まだ届いていない), 2=検査中(届いた) */
 static int SCSIIOCSSelfTest = 0;
 
-/* ROM ヘッダ($ea0020〜)が読まれた瞬間の PC を記録する観測用。
- * IPL のどのコードがボードを見に来ているかを特定するために使う。
- * 命令フェッチは OP_ROM 経由で SCSI_Read を通らないので、ここに来るのは
- * データ読み出しだけである。 */
-#define SCSI_ROMLOG_MAX     64
-static int SCSIRomLogCount = 0;
-static int SCSIRomReadTotal = 0;
 static int SCSIEntryCallCount = 0;
 static int SCSIZeroCallCount = 0;
 
-/* $ea0100〜$ea07ff への書き込みログ(先頭64件)。範囲内/範囲外を問わず
- * $ea0000〜$ea1fff 全域を対象にする。 */
-#define SCSI_WRITELOG_MAX   64
-static int SCSIWriteLogCount = 0;
+/* 本物ROM使用中フラグ。true のとき、自前スタブ前提の処理
+ * (d2/a4の即値差し替え・観測用テーブル/スタブの書き込み・$ea0110の窓selftest・
+ * BPB表ポインタ)を飛ばし、窓への書き込みも SCSIIPL へ反映しない(ROMのまま)。 */
+static int SCSIUsingRealRom = 0;
 
-/* $ea0100〜$ea07ff への読み出しログ(上限512件、ヘッダ域とは別カウンタ)。
- * BPB域($ea0610〜)の読み出しを取りこぼさないよう128から引き上げた。 */
-#define SCSI_WINREAD_LOG_MAX 512
-static int SCSIWinReadLogCount = 0;
+/* $ea0000〜$ea1fff 全域への読み書きの統合ログ([SCSI-BUS])。
+ * 同じ(番地,種別,PC)が連続するときは数えるだけにし、変化した時点で
+ * まとめて1行出す(「×N回」)。上限4000件で、達したらその旨を1回だけ出す。 */
+#define SCSI_BUS_LOG_MAX    4000
+static int SCSIBusLogCount = 0;
+static int SCSIBusLogCapped = 0;
+static uint32_t SCSIBusLastAddr = 0;
+static int SCSIBusLastIsWrite = -1;	/* -1 = 保留中の記録なし */
+static uint32_t SCSIBusLastPC = 0;
+static uint8_t SCSIBusLastValue = 0;
+static int SCSIBusRunCount = 0;
+
+/* SPC(SCSIコントローラ)のポート領域。ROMがSPCをどう叩くかを見るのが
+ * 今回の観測目的そのものなので、下の命令フェッチ除外heuristicに関わらず
+ * この範囲への読み書きは必ずログへ出す。 */
+#define SCSI_SPC_PORT_LO    0x00ea0000
+#define SCSI_SPC_PORT_HI    0x00ea0020	/* 排他的上限 ($ea001f まで) */
+
+/* 命令フェッチとみなして除外した件数、および除外報告を済ませたかどうか。 */
+static int SCSIBusFetchExcluded = 0;
+static int SCSIBusFetchExcludedReported = 0;
+
+/* 除外件数の報告(最後、またはログ上限到達時に1回だけ)。 */
+static void SCSI_BusReportExcluded(void)
+{
+	if (SCSIBusFetchExcludedReported)
+		return;
+	SCSIBusFetchExcludedReported = 1;
+	if (SCSIBusFetchExcluded > 0 && log_cb)
+		log_cb(RETRO_LOG_INFO, "[SCSI-BUS] 命令フェッチとみなして除外: %d件\n", SCSIBusFetchExcluded);
+}
 
 /* ストラテジ(ホストコマンド $40)呼び出し時に a5 で渡された要求ヘッダの
  * アドレスを控えておく。0 = 未取得。インタラプト($41)側で使う。 */
@@ -83,6 +109,74 @@ static int SCSIReqInitCount = 0;
 /* d2 で渡す観測用テーブル/スタブの呼び出し回数 ($40〜$7f, 64要素) */
 #define SCSI_TABLE_ENTRIES 64
 static int SCSITableCallCount[SCSI_TABLE_ENTRIES];
+
+/* 保留中の連続アクセス記録を1行にまとめて出す。 */
+static void SCSI_BusLogFlush(void)
+{
+	if (SCSIBusLastIsWrite < 0)
+		return;
+	if (SCSIBusLogCount < SCSI_BUS_LOG_MAX)
+	{
+		SCSIBusLogCount++;
+		if (log_cb)
+		{
+			if (SCSIBusRunCount <= 1)
+				log_cb(RETRO_LOG_INFO, "[SCSI-BUS] #%d %s adr=$%06x data=$%02x pc=$%08x\n",
+					SCSIBusLogCount, SCSIBusLastIsWrite ? "W" : "R",
+					(unsigned)SCSIBusLastAddr, SCSIBusLastValue, (unsigned)SCSIBusLastPC);
+			else
+				log_cb(RETRO_LOG_INFO, "[SCSI-BUS] #%d %s adr=$%06x data=$%02x pc=$%08x ×%d回\n",
+					SCSIBusLogCount, SCSIBusLastIsWrite ? "W" : "R",
+					(unsigned)SCSIBusLastAddr, SCSIBusLastValue, (unsigned)SCSIBusLastPC, SCSIBusRunCount);
+		}
+	}
+	else if (!SCSIBusLogCapped)
+	{
+		SCSIBusLogCapped = 1;
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "[SCSI-BUS] ログ上限(%d件)に達したため以降は出力を止める\n", SCSI_BUS_LOG_MAX);
+		SCSI_BusReportExcluded();
+	}
+	SCSIBusLastIsWrite = -1;
+	SCSIBusRunCount = 0;
+}
+
+/* $ea0000〜$ea1fff 全域への読み書きを記録する。同じ(番地,種別,PC)が
+ * 連続するときは数えるだけにし、変化した時点で直前の記録をまとめて出す。
+ *
+ * heuristic: 読み出し(is_write==0)で、SPCポート($ea0000〜$ea001f)以外かつ
+ * 現在のPCから±8バイト以内の番地であれば「命令フェッチ」とみなして
+ * カウントのみ行いログには出さない。px68k ではこの領域の命令フェッチも
+ * SCSI_Read を通るため、フェッチが大半を占めてしまい観測目的(ROMが
+ * SPCのポートをどう叩くか)がログに埋もれてしまうことへの対策。
+ * あくまでアドレスとPCの近さだけで判定する経験則であり、実際に
+ * その番地が命令として読まれたことを厳密に確認しているわけではない。
+ * 書き込みは命令フェッチでは起こらないため対象外(常時ログに出す)。 */
+static void SCSI_BusLog(uint32_t adr, int is_write, uint8_t data, uint32_t pc)
+{
+	if (!is_write && !(adr >= SCSI_SPC_PORT_LO && adr < SCSI_SPC_PORT_HI))
+	{
+		uint32_t diff = (adr > pc) ? (adr - pc) : (pc - adr);
+		if (diff <= 8)
+		{
+			SCSIBusFetchExcluded++;
+			return;
+		}
+	}
+
+	if (SCSIBusLastIsWrite == is_write && SCSIBusLastAddr == adr && SCSIBusLastPC == pc)
+	{
+		SCSIBusRunCount++;
+		SCSIBusLastValue = data;
+		return;
+	}
+	SCSI_BusLogFlush();
+	SCSIBusLastAddr = adr;
+	SCSIBusLastIsWrite = is_write;
+	SCSIBusLastPC = pc;
+	SCSIBusLastValue = data;
+	SCSIBusRunCount = 1;
+}
 
 void SCSI_Init(void)
 {
@@ -166,18 +260,45 @@ void SCSI_Init(void)
 	};
 	int i;
 	uint8_t tmp;
+	int rom_len;
 	SCSIIOCSLogCount = 0;
-	SCSIRomLogCount = 0;
-	SCSIRomReadTotal = 0;
 	SCSIEntryCallCount = 0;
 	SCSIZeroCallCount = 0;
-	SCSIWriteLogCount = 0;
-	SCSIWinReadLogCount = 0;
+	SCSIBusLogCount = 0;
+	SCSIBusLogCapped = 0;
+	SCSIBusLastIsWrite = -1;
+	SCSIBusRunCount = 0;
+	SCSIUsingRealRom = 0;
 	SCSIReqHeaderAddr = 0;
 	SCSIReqInitCount = 0;
 	memset(SCSITableCallCount, 0, sizeof(SCSITableCallCount));
 	memset(SCSIIPL, 0, 0x2000);
-	memcpy(&SCSIIPL[0x20], SCSIIMG, sizeof(SCSIIMG));
+
+	/* 本物の外部SCSIボードROMイメージ(8192バイト)が流し込まれていれば、
+	 * 自前スタブの代わりにそれを使う。逆アセンブルはせず、本物を走らせて
+	 * 挙動を実測するためのオラクルとして扱う。 */
+	rom_len = webx68k_scsi_rom_len();
+	if (rom_len == 0x2000)
+	{
+		int k;
+		for (k = 0; k < 0x2000; k++)
+		{
+			int b = webx68k_scsi_rom_byte(k);
+			SCSIIPL[k] = (b >= 0) ? (uint8_t)(b & 0xff) : 0x00;
+		}
+		SCSIUsingRealRom = 1;
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI] 本物のSCSI ROMイメージ(%d バイト)を読み込んだ。自前スタブの処理(d2/a4差し替え・観測用テーブル/スタブ・$ea0110窓selftest・BPB表ポインタ)を飛ばす\n",
+				rom_len);
+	}
+	else
+	{
+		if (rom_len != 0 && log_cb)
+			log_cb(RETRO_LOG_ERROR,
+				"[SCSI] ROMサイズが不正 ($%04x, 期待 $2000)。自前スタブを使う\n", rom_len);
+		memcpy(&SCSIIPL[0x20], SCSIIMG, sizeof(SCSIIMG));
+	}
 
 	/* d2/a4 で渡す窓 $ea0100 を、Human68k デバイスドライバヘッダの一般形
 	 * (+0 次のヘッダ4 / +4 属性ワード2 / +6 ストラテジ4 / +10 インタラプト4 /
@@ -187,7 +308,9 @@ void SCSI_Init(void)
 	 * - stub[0] = ストラテジ、stub[1] = インタラプト
 	 * - $ea0116〜$ea01ff は従来どおり4バイトのポインタ表とし、
 	 *   要素は stub[2 + (オフセット-0x116)/4] を指す(未知のオフセットが
-	 *   使われたら k で捕まえるため)。 */
+	 *   使われたら k で捕まえるため)。
+	 * 本物ROM使用中はこの書き込み(自前スタブ前提)を丸ごと飛ばす。 */
+	if (!SCSIUsingRealRom)
 	{
 		int k;
 		uint32_t off_hdr   = 0x100;	/* SCSIIPL内オフセット ($ea0100) */
@@ -288,7 +411,9 @@ void SCSI_Init(void)
 	/* $ea0600: ユニット0のBPB(ドライブパラメータブロック)へのポインタ
 	 * ($00ea0610)を置く。$ea0610 以降はゼロのままにし、Human68k が
 	 * BPBのどのバイトを読みに来るかを窓読み出しログで実測する。
-	 * バイト入れ替えループより前に、自然なバイト順で書く。 */
+	 * バイト入れ替えループより前に、自然なバイト順で書く。
+	 * 本物ROM使用中は飛ばす(自前スタブ前提のBPB表ポインタのため)。 */
+	if (!SCSIUsingRealRom)
 	{
 		uint32_t off_bpbptr = 0x600;
 		uint32_t v = 0x00ea0610;
@@ -326,26 +451,30 @@ void SCSI_Init(void)
 				SRAM_Read(0x00ed006f), SRAM_Read(0x00ed0070), SRAM_Read(0x00ed0071));
 	}
 
-	if (SCSIIPL[0x88] == 0x28 && SCSIIPL[0x89] == 0x7c &&
-		SCSIIPL[0x8e] == 0x24 && SCSIIPL[0x8f] == 0x3c)
+	/* d2/a4 の即値差し替えは自前スタブ前提の処理。本物ROM使用中は飛ばす。 */
+	if (!SCSIUsingRealRom)
 	{
-		int a4 = webx68k_scsi_init_a4();
-		int d2 = webx68k_scsi_init_d2();
-		SCSIIPL[0x8a] = (uint8_t)((a4 >> 24) & 0xff);
-		SCSIIPL[0x8b] = (uint8_t)((a4 >> 16) & 0xff);
-		SCSIIPL[0x8c] = (uint8_t)((a4 >> 8) & 0xff);
-		SCSIIPL[0x8d] = (uint8_t)(a4 & 0xff);
-		SCSIIPL[0x90] = (uint8_t)((d2 >> 24) & 0xff);
-		SCSIIPL[0x91] = (uint8_t)((d2 >> 16) & 0xff);
-		SCSIIPL[0x92] = (uint8_t)((d2 >> 8) & 0xff);
-		SCSIIPL[0x93] = (uint8_t)(d2 & 0xff);
-		if (log_cb)
-			log_cb(RETRO_LOG_INFO, "[SCSI] ベクタ設定エントリが返す a4 = $%08x, d2 = $%08x\n",
-				(unsigned)a4, (unsigned)d2);
+		if (SCSIIPL[0x88] == 0x28 && SCSIIPL[0x89] == 0x7c &&
+			SCSIIPL[0x8e] == 0x24 && SCSIIPL[0x8f] == 0x3c)
+		{
+			int a4 = webx68k_scsi_init_a4();
+			int d2 = webx68k_scsi_init_d2();
+			SCSIIPL[0x8a] = (uint8_t)((a4 >> 24) & 0xff);
+			SCSIIPL[0x8b] = (uint8_t)((a4 >> 16) & 0xff);
+			SCSIIPL[0x8c] = (uint8_t)((a4 >> 8) & 0xff);
+			SCSIIPL[0x8d] = (uint8_t)(a4 & 0xff);
+			SCSIIPL[0x90] = (uint8_t)((d2 >> 24) & 0xff);
+			SCSIIPL[0x91] = (uint8_t)((d2 >> 16) & 0xff);
+			SCSIIPL[0x92] = (uint8_t)((d2 >> 8) & 0xff);
+			SCSIIPL[0x93] = (uint8_t)(d2 & 0xff);
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO, "[SCSI] ベクタ設定エントリが返す a4 = $%08x, d2 = $%08x\n",
+					(unsigned)a4, (unsigned)d2);
+		}
+		else if (log_cb)
+			log_cb(RETRO_LOG_ERROR, "[SCSI] 即値の位置がずれている ($%02x$%02x / $%02x$%02x)\n",
+				SCSIIPL[0x88], SCSIIPL[0x89], SCSIIPL[0x8e], SCSIIPL[0x8f]);
 	}
-	else if (log_cb)
-		log_cb(RETRO_LOG_ERROR, "[SCSI] 即値の位置がずれている ($%02x$%02x / $%02x$%02x)\n",
-			SCSIIPL[0x88], SCSIIPL[0x89], SCSIIPL[0x8e], SCSIIPL[0x8f]);
 
 	for (i=0; i<0x2000; i+=2)
 	{
@@ -373,7 +502,9 @@ void SCSI_Init(void)
 	 * SCSI_Write を経由して実際に SCSIIPL へ反映されるかを、
 	 * CPU と同じ書き込み経路(cpu_writemem24)で確かめる。
 	 * 書き込み経路がそもそも SCSI_Write に来ていない可能性があるため必須。
-	 * 検査後は元の値(表の要素0の該当バイト)へ戻す。 */
+	 * 検査後は元の値(表の要素0の該当バイト)へ戻す。
+	 * 本物ROM使用中はこの窓自体を使わない(自前スタブ前提)ので飛ばす。 */
+	if (!SCSIUsingRealRom)
 	{
 		uint8_t orig = cpu_readmem24(0x00ea0110);
 		cpu_writemem24(0x00ea0110, 0x5a);
@@ -388,6 +519,31 @@ void SCSI_Init(void)
 			}
 		}
 		cpu_writemem24(0x00ea0110, orig);
+	}
+
+	/* 読み込んだ内容の確認: $ea0044〜6バイトが "SCSIEX" であること。
+	 * 本物ROM/自前スタブのどちらでも、読み込めたかどうかを毎回確かめる。
+	 * SCSI_Read と同じ読み出し経路(バイト入れ替え後の (adr^1)&0x1fff)で見る。 */
+	{
+		static const char expect[6] = "SCSIEX";
+		uint8_t got[6];
+		int ok = 1;
+		int j;
+		for (j = 0; j < 6; j++)
+		{
+			got[j] = SCSIIPL[((0xea0044 + j) ^ 1) & 0x1fff];
+			if (got[j] != (uint8_t)expect[j])
+				ok = 0;
+		}
+		if (log_cb)
+		{
+			if (ok)
+				log_cb(RETRO_LOG_INFO, "[SCSI] $ea0044 の確認 ok: \"SCSIEX\"\n");
+			else
+				log_cb(RETRO_LOG_ERROR,
+					"[SCSI] $ea0044 の確認 FAILED: \"%c%c%c%c%c%c\" (期待 \"SCSIEX\")\n",
+					got[0], got[1], got[2], got[3], got[4], got[5]);
+		}
 	}
 
 	/* ホスト側セクタI/Oの疎通確認。イメージが繋がっていれば、
@@ -740,13 +896,19 @@ void FASTCALL SCSI_IOCSPort_Write(uint32_t adr, uint8_t data)
 			(unsigned)m68000_get_reg(M68K_PC));
 }
 
-void SCSI_Cleanup(void) { }
+void SCSI_Cleanup(void)
+{
+	SCSI_BusLogFlush();
+	SCSI_BusReportExcluded();
+}
 
 /* d2 が指すヘッダ構造体で、我々が用意した窓(64バイト)より先の
  * オフセットが読み書きされているのではないか、という仮説(a)(b)を
  * 一度に測るための「書ける窓」。$ea0100〜$ea07ff への書き込みを
  * 実際に SCSIIPL へ反映し、範囲外は従来どおり捨てる。
- * ログは $ea0000〜$ea1fff の全域を対象に先頭64件まで取る。 */
+ * 本物ROM使用中はこの窓への書き込みも反映しない(ROMのまま)。
+ * ログは $ea0000〜$ea1fff の全域を対象に [SCSI-BUS] へ一本化して取る
+ * (詳細は SCSI_BusLog を参照)。 */
 #define SCSI_WINDOW_LO 0x00ea0100
 #define SCSI_WINDOW_HI 0x00ea0800	/* 排他的上限 ($ea07ff まで) */
 
@@ -754,46 +916,16 @@ void FASTCALL SCSI_Write(uint32_t adr, uint8_t data)
 {
 	int in_window = (adr >= SCSI_WINDOW_LO && adr < SCSI_WINDOW_HI);
 
-	if (SCSIWriteLogCount < SCSI_WRITELOG_MAX && adr >= 0x00ea0000 && adr < 0x00ea2000)
-	{
-		SCSIWriteLogCount++;
-		if (log_cb)
-			log_cb(RETRO_LOG_INFO, "[SCSI-WRITE] #%d adr=$%06x data=$%02x pc=$%08x %s\n",
-				SCSIWriteLogCount, (unsigned)adr, (unsigned)data,
-				(unsigned)m68000_get_reg(M68K_PC),
-				in_window ? "(窓内)" : "(窓外・捨てる)");
-	}
+	if (adr >= 0x00ea0000 && adr < 0x00ea2000)
+		SCSI_BusLog(adr, 1, data, m68000_get_reg(M68K_PC));
 
-	if (in_window)
+	if (in_window && !SCSIUsingRealRom)
 		SCSIIPL[(adr^1)&0x1fff] = data;
 }
 
 uint8_t FASTCALL SCSI_Read(uint32_t adr)
 {
-	/* ヘッダ領域($ea0020-$ea0053)への読み出しだけを記録する。
-	 * それ以外は今のところ全てゼロで、読まれても情報にならない。 */
-	if (adr >= 0x00ea0020 && adr < 0x00ea0054)
-	{
-		SCSIRomReadTotal++;
-		if (SCSIRomLogCount < SCSI_ROMLOG_MAX)
-		{
-			SCSIRomLogCount++;
-			if (log_cb)
-				log_cb(RETRO_LOG_INFO, "[SCSI-ROM] #%d adr=$%06x pc=$%08x\n",
-					SCSIRomLogCount, (unsigned)adr, (unsigned)m68000_get_reg(M68K_PC));
-		}
-	}
-	/* d2 で渡した観測用テーブル/スタブ域($ea0100〜$ea07ff)への読み出し。
-	 * ヘッダ域とは別カウンタで、上限128件まで記録する。 */
-	else if (adr >= SCSI_WINDOW_LO && adr < SCSI_WINDOW_HI)
-	{
-		if (SCSIWinReadLogCount < SCSI_WINREAD_LOG_MAX)
-		{
-			SCSIWinReadLogCount++;
-			if (log_cb)
-				log_cb(RETRO_LOG_INFO, "[SCSI-WINREAD] #%d adr=$%06x pc=$%08x\n",
-					SCSIWinReadLogCount, (unsigned)adr, (unsigned)m68000_get_reg(M68K_PC));
-		}
-	}
+	if (adr >= 0x00ea0000 && adr < 0x00ea2000)
+		SCSI_BusLog(adr, 0, SCSIIPL[(adr^1)&0x1fff], m68000_get_reg(M68K_PC));
 	return SCSIIPL[(adr^1)&0x1fff];
 }
