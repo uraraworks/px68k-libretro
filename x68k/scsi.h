@@ -11,5 +11,7 @@ void SCSI_Cleanup(void);
 
 uint8_t FASTCALL SCSI_Read(uint32_t adr);
 void FASTCALL SCSI_Write(uint32_t adr, uint8_t data);
+/* SCSI IOCS ($F5) の呼び出し口 $e9f800 への書き込み */
+void FASTCALL SCSI_IOCSPort_Write(uint32_t adr, uint8_t data);
 
 #endif /* _WINX68K_SCSI_H */

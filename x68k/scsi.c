@@ -9,8 +9,18 @@
 #include "winx68k.h"
 #include "m68000.h"
 #include "scsi.h"
+#include "x68kmemory.h"
 
 uint8_t	SCSIIPL[0x2000];
+
+/* SCSI IOCS 観測フックのログ件数 (詳細は SCSI_IOCSPort_Write を参照) */
+static int SCSIIOCSLogCount = 0;
+
+/* SCSI IOCS ($F5) の呼び出し口。ROMスタブの "move.b d1, $e9f800" の宛先 */
+#define SCSI_IOCS_PORT      0x00e9f800
+
+/* 自己検査の状態: 0=通常, 1=検査中(まだ届いていない), 2=検査中(届いた) */
+static int SCSIIOCSSelfTest = 0;
 
 void SCSI_Init(void)
 {
@@ -35,6 +45,7 @@ void SCSI_Init(void)
 	};
 	int i;
 	uint8_t tmp;
+	SCSIIOCSLogCount = 0;
 	memset(SCSIIPL, 0, 0x2000);
 	memcpy(&SCSIIPL[0x20], SCSIIMG, sizeof(SCSIIMG));
 	for (i=0; i<0x2000; i+=2)
@@ -43,6 +54,50 @@ void SCSI_Init(void)
 		SCSIIPL[i] = SCSIIPL[i+1];
 		SCSIIPL[i+1] = tmp;
 	}
+
+	/* 陽性対照: SCSI IOCS の呼び出し口 $e9f800 への書き込みが本当に
+	 * SCSI_IOCSPort_Write へ届くかを、CPU と同じ書き込み経路で毎回確かめる。
+	 * ここが黙って死ぬと「IOCS 呼び出しが0件」という観測が
+	 * 「呼ばれていない」と「フックが繋がっていない」の区別を失う。 */
+	SCSIIOCSSelfTest = 1;
+	cpu_writemem24(SCSI_IOCS_PORT, 0xab);
+	if (log_cb)
+	{
+		if (SCSIIOCSSelfTest == 2)
+			log_cb(RETRO_LOG_INFO, "[SCSI-IOCS] selftest ok: $e9f800 への書き込みがフックへ届いた\n");
+		else
+			log_cb(RETRO_LOG_ERROR, "[SCSI-IOCS] selftest FAILED: $e9f800 への書き込みがフックへ届かない\n");
+	}
+	SCSIIOCSSelfTest = 0;
+}
+
+/* --- SCSI IOCS ($F5) の観測フック ---------------------------------------
+ * 上の SCSIIMG は SCSI IOCS 呼び出しを "move.b d1, $e9f800" として外へ出す。
+ * $e9f800 は mem_wrap の書き込み表で wm_nop に落ちており、呼び出しは
+ * 黙って捨てられていた。まず「誰が・どのコマンドで・どんな引数で呼ぶか」を
+ * 実測するため、この段階では動作を変えずログだけ取る。 */
+#define SCSI_IOCS_LOG_MAX   64
+
+void FASTCALL SCSI_IOCSPort_Write(uint32_t adr, uint8_t data)
+{
+	if ((adr & ~1) != (SCSI_IOCS_PORT & ~1))
+		return;
+	if (SCSIIOCSSelfTest)
+	{
+		SCSIIOCSSelfTest = 2;   /* 自己検査の書き込みはログに数えない */
+		return;
+	}
+	if (SCSIIOCSLogCount >= SCSI_IOCS_LOG_MAX)
+		return;
+	SCSIIOCSLogCount++;
+	if (log_cb)
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-IOCS] #%d adr=$%06x cmd=$%02x d1=$%08x d2=$%08x d3=$%08x d4=$%08x d5=$%08x a1=$%08x pc=$%08x\n",
+			SCSIIOCSLogCount, (unsigned)adr, (unsigned)data,
+			(unsigned)m68000_get_reg(M68K_D1), (unsigned)m68000_get_reg(M68K_D2),
+			(unsigned)m68000_get_reg(M68K_D3), (unsigned)m68000_get_reg(M68K_D4),
+			(unsigned)m68000_get_reg(M68K_D5), (unsigned)m68000_get_reg(M68K_A1),
+			(unsigned)m68000_get_reg(M68K_PC));
 }
 
 void SCSI_Cleanup(void) { }
