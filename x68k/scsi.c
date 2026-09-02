@@ -118,19 +118,40 @@ static int SCSIUsingRealRom = 0;
 static int SCSIPcLogFrameCount = 0;
 static int SCSIPcLogCount = 0;
 
+/* 前方宣言: [SCSI-BUS] の保留中エントリを増分だけ「(継続中)」付きで
+ * 吐き出す(詳細は定義箇所のコメント参照)。SCSI_LogPcIfRealRom() から
+ * 呼ぶためここで宣言する(定義は本ファイル後方の SCSI_BusLog 関連の
+ * すぐ後ろ)。 */
+static void SCSI_BusLogFlushPeriodic(void);
+
+/*
+ * 保留中の圧縮ログ(「変化したときにまとめて出す」方式)は、ゲストが
+ * 同じ値を延々ポーリングしたまま実行が終わると1行も出ない。そのせいで
+ * 「アクセスが止まった」「一度も読まれていない」と誤読する事故が
+ * 2026-09-02に計4回発生した([SCSI-BUS]/[SCSI-MEMR]/[SCSI-RAM]を跨いで)。
+ * 対策として、保留中エントリを定期的に(このSCSI_LogPcIfRealRom経由、
+ * 60フレームに1回)「(継続中)」付きで吐き出す。件数は累積でなく前回
+ * 出力からの増分。[SCSI-RAM]の書き込みログは元々1件ごとに即時出力で
+ * 保留を持たないため、この定期フラッシュの対象外(沈黙の心配がない)。
+ */
 void SCSI_LogPcIfRealRom(void)
 {
 	if (!SCSIUsingRealRom)
 		return;
-	if (SCSIPcLogCount >= 40)
-		return;
 	SCSIPcLogFrameCount++;
 	if (SCSIPcLogFrameCount % 60 != 0)
 		return;
-	if (log_cb)
-		log_cb(RETRO_LOG_INFO, "[SCSI-PC] frame=%d pc=$%08x\n",
-			SCSIPcLogFrameCount, (unsigned)m68000_get_reg(M68K_PC));
-	SCSIPcLogCount++;
+	if (SCSIPcLogCount < 40)
+	{
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "[SCSI-PC] frame=%d pc=$%08x\n",
+				SCSIPcLogFrameCount, (unsigned)m68000_get_reg(M68K_PC));
+		SCSIPcLogCount++;
+	}
+	/* [SCSI-PC]の40行上限とは無関係に、保留中の圧縮ログは60フレーム
+	 * ごとに毎回吐き出す(沈黙のほうが遥かに問題であるため)。 */
+	SCSI_BusLogFlushPeriodic();
+	webx68k_mem_read_watch_flush_periodic();
 }
 
 /* SPC(MB89352)レジスタの簡易状態(本物ROM使用時のみ有効)。
@@ -155,6 +176,10 @@ static int SCSIBusLastIsWrite = -1;	/* -1 = 保留中の記録なし */
 static uint32_t SCSIBusLastPC = 0;
 static uint8_t SCSIBusLastValue = 0;
 static int SCSIBusRunCount = 0;
+/* 保留中エントリのうち、既に(確定出力または定期フラッシュで)出力済みの件数。
+ * 「件数は累積でなく前回出力からの増分」にするための基準線。
+ * 新しい保留エントリを開始するたび(SCSI_BusLogFlushの末尾)に0へ戻す。 */
+static int SCSIBusRunReported = 0;
 
 /* SPC(SCSIコントローラ)のポート領域。ROMがSPCをどう叩くかを見るのが
  * 今回の観測目的そのものなので、下の命令フェッチ除外heuristicに関わらず
@@ -337,27 +362,66 @@ static int SCSIReqInitCount = 0;
 #define SCSI_TABLE_ENTRIES 64
 static int SCSITableCallCount[SCSI_TABLE_ENTRIES];
 
-/* 保留中の連続アクセス記録を1行にまとめて出す。 */
-static void SCSI_BusLogFlush(void)
+/* 保留中の連続アクセス記録を、前回出力からの増分だけ1行にまとめて確定
+ * 出力する(番地/PC/種別が変わった時、またはSCSI_Cleanup時)。保留は空にする。
+ * periodic!=0 のときは確定させず(保留を残したまま)「(継続中)」付きで
+ * 増分だけ出す定期フラッシュとして働く(SCSI_BusLogFlushPeriodo参照)。 */
+static void SCSI_BusLogFlushCommon(int periodic)
 {
+	int inc;
+
 	if (SCSIBusLastIsWrite < 0)
 		return;
-	if (SCSI_BusPcAllow(SCSIBusLastPC) && SCSI_BusLogGate())
+
+	inc = SCSIBusRunCount - SCSIBusRunReported;
+	if (inc > 0 && SCSI_BusPcAllow(SCSIBusLastPC) && SCSI_BusLogGate())
 	{
 		if (log_cb)
 		{
-			if (SCSIBusRunCount <= 1)
-				log_cb(RETRO_LOG_INFO, "[SCSI-BUS] #%d %s adr=$%06x data=$%02x pc=$%08x\n",
+			if (inc <= 1)
+				log_cb(RETRO_LOG_INFO,
+					periodic ? "[SCSI-BUS] #%d %s adr=$%06x data=$%02x pc=$%08x (継続中)\n"
+					         : "[SCSI-BUS] #%d %s adr=$%06x data=$%02x pc=$%08x\n",
 					SCSIBusLogCount, SCSIBusLastIsWrite ? "W" : "R",
 					(unsigned)SCSIBusLastAddr, SCSIBusLastValue, (unsigned)SCSIBusLastPC);
 			else
-				log_cb(RETRO_LOG_INFO, "[SCSI-BUS] #%d %s adr=$%06x data=$%02x pc=$%08x ×%d回\n",
+				log_cb(RETRO_LOG_INFO,
+					periodic ? "[SCSI-BUS] #%d %s adr=$%06x data=$%02x pc=$%08x ×%d回(継続中)\n"
+					         : "[SCSI-BUS] #%d %s adr=$%06x data=$%02x pc=$%08x ×%d回\n",
 					SCSIBusLogCount, SCSIBusLastIsWrite ? "W" : "R",
-					(unsigned)SCSIBusLastAddr, SCSIBusLastValue, (unsigned)SCSIBusLastPC, SCSIBusRunCount);
+					(unsigned)SCSIBusLastAddr, SCSIBusLastValue, (unsigned)SCSIBusLastPC, inc);
 		}
 	}
-	SCSIBusLastIsWrite = -1;
-	SCSIBusRunCount = 0;
+
+	if (periodic)
+		SCSIBusRunReported = SCSIBusRunCount;
+	else
+	{
+		SCSIBusLastIsWrite = -1;
+		SCSIBusRunCount = 0;
+		SCSIBusRunReported = 0;
+	}
+}
+
+static void SCSI_BusLogFlush(void)
+{
+	SCSI_BusLogFlushCommon(0);
+}
+
+/*
+ * 保留中の[SCSI-BUS]エントリを、前回出力からの増分だけ「(継続中)」付きで
+ * 吐き出す(保留自体はクリアしない=監視を継続する)。
+ *
+ * 目的: 「変化したときにまとめて出す」圧縮方式では、ゲストが同じ
+ * (番地,種別,PC,値)を延々ポーリングしたまま実行が終わると1行も出ない。
+ * そのせいで「アクセスが止まった」「一度も読まれていない」と誤読する
+ * 事故が2026-09-02に計4回発生した。SCSI_LogPcIfRealRom()(60フレームに
+ * 1回)・SCSI_Cleanup()(実行終了時)から呼び、沈黙を防ぐ。
+ * 増分が0(前回から変化なし)なら何も出さない。
+ */
+static void SCSI_BusLogFlushPeriodic(void)
+{
+	SCSI_BusLogFlushCommon(1);
 }
 
 /* $ea0000〜$ea1fff 全域への読み書きを記録する。同じ(番地,種別,PC)が
@@ -1122,6 +1186,13 @@ void FASTCALL SCSI_IOCSPort_Write(uint32_t adr, uint8_t data)
 
 void SCSI_Cleanup(void)
 {
+	/* 実行終了時、保留中のまま埋もれていた圧縮エントリを最後にもう一度
+	 * 「(継続中)」付きで吐き出しておく(ゲストが同じ値を延々ポーリング
+	 * したまま終了した場合、直後のSCSI_BusLogFlush()による確定出力だけ
+	 * では増分計算上は0件になり得るため、実際に読み書きが最後まで
+	 * 続いていたことをこちらの行で示す)。 */
+	SCSI_BusLogFlushPeriodic();
+	webx68k_mem_read_watch_flush_periodic();
 	SCSI_BusLogFlush();
 	SCSI_BusReportExcluded();
 	SCSI_BusReportPcDropped();

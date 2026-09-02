@@ -62,5 +62,9 @@ extern int      webx68k_mem_read_watch_count;
 
 void webx68k_mem_read_watch_selftest(void);
 void webx68k_mem_read_watch_refresh(void); /* WebX68k-storage/src/core-shim.c 側で定義 */
+/* 保留中の圧縮エントリを増分だけ「(継続中)」付きで吐き出す(保留は継続)。
+ * SCSI_LogPcIfRealRom()/SCSI_Cleanup() から定期的/終了時に呼ぶ。
+ * 詳細は x68k/mem_wrap.c の webx68k_mem_read_watch_flush_periodic() 参照。 */
+void webx68k_mem_read_watch_flush_periodic(void);
 
 #endif

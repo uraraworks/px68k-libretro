@@ -168,27 +168,75 @@ static uint32_t webx68k_mem_read_watch_last_addr = 0;
 static uint32_t webx68k_mem_read_watch_last_pc = 0;
 static uint8_t  webx68k_mem_read_watch_last_data = 0;
 static long     webx68k_mem_read_watch_repeat = 0;
+/* 保留中エントリのうち、既に(確定出力または定期フラッシュで)出力済みの件数。
+ * 「件数は累積でなく前回出力からの増分」にするための基準線。
+ * 新しい保留エントリを開始するたびに0へ戻す。 */
+static long     webx68k_mem_read_watch_reported = 0;
 
-/* 溜めていた繰り返し行を確定して出力する(次のアドレスに移る/監視終了時) */
+/* 溜めていた繰り返し行を、前回出力からの増分だけ確定出力する
+ * (次のアドレスに移る/監視終了時)。保留は空にする。 */
 static void webx68k_mem_read_watch_flush(void)
 {
+	long inc;
+
 	if (!webx68k_mem_read_watch_has_last)
 		return;
 
-	if (webx68k_mem_read_watch_repeat > 1)
+	inc = webx68k_mem_read_watch_repeat - webx68k_mem_read_watch_reported;
+	if (inc > 1)
 		printf("[SCSI-MEMR] R adr=$%06x data=$%02x pc=$%08x (x%ld\xe5\x9b\x9e)\n",
 		       (unsigned)webx68k_mem_read_watch_last_addr,
 		       (unsigned)webx68k_mem_read_watch_last_data,
 		       (unsigned)webx68k_mem_read_watch_last_pc,
-		       webx68k_mem_read_watch_repeat);
-	else
+		       inc);
+	else if (inc == 1)
 		printf("[SCSI-MEMR] R adr=$%06x data=$%02x pc=$%08x\n",
 		       (unsigned)webx68k_mem_read_watch_last_addr,
 		       (unsigned)webx68k_mem_read_watch_last_data,
 		       (unsigned)webx68k_mem_read_watch_last_pc);
+	/* inc <= 0: 既に定期フラッシュで全件出力済みなので何も出さない */
 
 	webx68k_mem_read_watch_has_last = 0;
 	webx68k_mem_read_watch_repeat = 0;
+	webx68k_mem_read_watch_reported = 0;
+}
+
+/*
+ * 保留中の圧縮エントリを、前回出力(確定出力または前回の定期フラッシュ)
+ * からの増分件数だけ「(継続中)」付きで出力する。保留自体はクリアしない
+ * (監視は継続する)。
+ *
+ * 目的: ゲストが同じ値を読み続けるポーリングのまま実行が終わると、
+ * webx68k_mem_read_watch_flush() は「変化したとき」にしか呼ばれないため
+ * ログに1行も残らず「一度も読まれていない」と誤読する事故があった
+ * (2026-09-02、[SCSI-BUS]/[SCSI-MEMR]/[SCSI-RAM]のログ全体で計4回発生)。
+ * SCSI_LogPcIfRealRom()(60フレームに1回)から呼び、沈黙を防ぐ。
+ * 増分が0(前回から変化なし)なら何も出さない。
+ */
+void webx68k_mem_read_watch_flush_periodic(void)
+{
+	long inc;
+
+	if (!webx68k_mem_read_watch_has_last)
+		return;
+
+	inc = webx68k_mem_read_watch_repeat - webx68k_mem_read_watch_reported;
+	if (inc <= 0)
+		return;
+
+	if (inc > 1)
+		printf("[SCSI-MEMR] R adr=$%06x data=$%02x pc=$%08x (x%ld\xe5\x9b\x9e、継続中)\n",
+		       (unsigned)webx68k_mem_read_watch_last_addr,
+		       (unsigned)webx68k_mem_read_watch_last_data,
+		       (unsigned)webx68k_mem_read_watch_last_pc,
+		       inc);
+	else
+		printf("[SCSI-MEMR] R adr=$%06x data=$%02x pc=$%08x (継続中)\n",
+		       (unsigned)webx68k_mem_read_watch_last_addr,
+		       (unsigned)webx68k_mem_read_watch_last_data,
+		       (unsigned)webx68k_mem_read_watch_last_pc);
+
+	webx68k_mem_read_watch_reported = webx68k_mem_read_watch_repeat;
 }
 
 static void webx68k_mem_read_watch_check(uint32_t addr, uint8_t val)
@@ -228,6 +276,7 @@ static void webx68k_mem_read_watch_check(uint32_t addr, uint8_t val)
 	webx68k_mem_read_watch_last_pc = pc;
 	webx68k_mem_read_watch_last_data = val;
 	webx68k_mem_read_watch_repeat = 1;
+	webx68k_mem_read_watch_reported = 0;
 }
 
 /*
