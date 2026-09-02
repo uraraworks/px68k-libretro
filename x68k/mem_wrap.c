@@ -96,6 +96,7 @@ static inline void ram_poke_raw(uint32_t addr, uint8_t val)
 }
 
 static void wm_cnt(uint32_t addr, uint8_t val); /* 自己検査から使うための前方宣言 */
+static uint8_t rm_main(uint32_t addr); /* 読み出し監視の自己検査から使うための前方宣言 */
 
 /*
  * 陽性対照: 監視範囲が有効なときだけ、範囲内の先頭番地へ1バイト書いて
@@ -137,6 +138,131 @@ void webx68k_ram_watch_selftest(void)
 	else
 	{
 		webx68k_ram_watch_count = before; /* 自己検査ぶんは件数に数えない */
+	}
+}
+
+/*
+ * ゲストRAM「読み出し」監視用フック(WebX68k-storage側)。
+ * 書き込み監視(webx68k_ram_watch_*)と同じ流儀。番地範囲は
+ * __webx68kMemReadWatchLo/Hi、読んだ側のPC範囲は
+ * __webx68kMemReadWatchPcLo/Hi (既定は両方無効=-1、PCは絞らず=lo>hi)。
+ * ホットパス(rm_main、全メモリ読み出しが必ず通る)からは
+ * static変数の比較1回だけで早期脱出できるようにする。
+ *
+ * ポーリングで同じ番地を延々読み続けるケース(SCSI ROMの待ちループ等)で
+ * ログ上限2000件をあっという間に食い潰してしまうため、直前と
+ * (番地, PC)が同一の連続アクセスは1行に圧縮し「×N回」でまとめる。
+ */
+int32_t webx68k_mem_read_watch_lo = -1;
+int32_t webx68k_mem_read_watch_hi = -1;
+int32_t webx68k_mem_read_watch_pc_lo = -1;
+int32_t webx68k_mem_read_watch_pc_hi = -1;
+int webx68k_mem_read_watch_count = 0;
+
+/* 自己検査実行中はPCでの絞り込みを適用しない(理由はwebx68k_ram_watch_selftest_active参照) */
+static int webx68k_mem_read_watch_selftest_active = 0;
+
+/* 直前に出力したログの圧縮用状態 */
+static int      webx68k_mem_read_watch_has_last = 0;
+static uint32_t webx68k_mem_read_watch_last_addr = 0;
+static uint32_t webx68k_mem_read_watch_last_pc = 0;
+static uint8_t  webx68k_mem_read_watch_last_data = 0;
+static long     webx68k_mem_read_watch_repeat = 0;
+
+/* 溜めていた繰り返し行を確定して出力する(次のアドレスに移る/監視終了時) */
+static void webx68k_mem_read_watch_flush(void)
+{
+	if (!webx68k_mem_read_watch_has_last)
+		return;
+
+	if (webx68k_mem_read_watch_repeat > 1)
+		printf("[SCSI-MEMR] R adr=$%06x data=$%02x pc=$%08x (x%ld\xe5\x9b\x9e)\n",
+		       (unsigned)webx68k_mem_read_watch_last_addr,
+		       (unsigned)webx68k_mem_read_watch_last_data,
+		       (unsigned)webx68k_mem_read_watch_last_pc,
+		       webx68k_mem_read_watch_repeat);
+	else
+		printf("[SCSI-MEMR] R adr=$%06x data=$%02x pc=$%08x\n",
+		       (unsigned)webx68k_mem_read_watch_last_addr,
+		       (unsigned)webx68k_mem_read_watch_last_data,
+		       (unsigned)webx68k_mem_read_watch_last_pc);
+
+	webx68k_mem_read_watch_has_last = 0;
+	webx68k_mem_read_watch_repeat = 0;
+}
+
+static void webx68k_mem_read_watch_check(uint32_t addr, uint8_t val)
+{
+	uint32_t pc;
+
+	if (webx68k_mem_read_watch_lo > webx68k_mem_read_watch_hi)
+		return;
+	if ((int32_t)addr < webx68k_mem_read_watch_lo || (int32_t)addr > webx68k_mem_read_watch_hi)
+		return;
+
+	pc = m68000_get_reg(M68K_PC);
+	if (!webx68k_mem_read_watch_selftest_active && webx68k_mem_read_watch_pc_lo <= webx68k_mem_read_watch_pc_hi)
+	{
+		if ((int32_t)pc < webx68k_mem_read_watch_pc_lo || (int32_t)pc > webx68k_mem_read_watch_pc_hi)
+			return;
+	}
+
+	if (webx68k_mem_read_watch_has_last &&
+	    addr == webx68k_mem_read_watch_last_addr &&
+	    pc == webx68k_mem_read_watch_last_pc &&
+	    val == webx68k_mem_read_watch_last_data)
+	{
+		webx68k_mem_read_watch_repeat++;
+		return; /* 圧縮中。件数はflush時に1件として数える */
+	}
+
+	/* アドレス/PC/値が変わったので、直前の繰り返しを確定させる */
+	webx68k_mem_read_watch_flush();
+
+	if (webx68k_mem_read_watch_count >= 2000)
+		return;
+
+	webx68k_mem_read_watch_count++;
+	webx68k_mem_read_watch_has_last = 1;
+	webx68k_mem_read_watch_last_addr = addr;
+	webx68k_mem_read_watch_last_pc = pc;
+	webx68k_mem_read_watch_last_data = val;
+	webx68k_mem_read_watch_repeat = 1;
+}
+
+/*
+ * 陽性対照: 監視範囲が有効なときだけ、範囲内の先頭番地を1回読み、
+ * webx68k_mem_read_watch_check() 経由でログに出たかどうかを自己検査する。
+ * このぶんのログ件数はカウントから除外する。
+ */
+void webx68k_mem_read_watch_selftest(void)
+{
+	uint32_t addr;
+	int before;
+
+	if (webx68k_mem_read_watch_lo > webx68k_mem_read_watch_hi)
+		return; /* 監視無効なら自己検査もしない */
+	if (webx68k_mem_read_watch_lo < 0)
+		return;
+
+	addr = (uint32_t)webx68k_mem_read_watch_lo;
+	before = webx68k_mem_read_watch_count;
+
+	webx68k_mem_read_watch_selftest_active = 1;
+	(void)rm_main(addr); /* フック経由の読み出し(本番と同じ経路) */
+	webx68k_mem_read_watch_selftest_active = 0;
+
+	/* 自己検査は圧縮バッファに乗るのでflushして確定させてから判定する */
+	webx68k_mem_read_watch_flush();
+
+	if (webx68k_mem_read_watch_count == before)
+	{
+		printf("[SCSI-MEMR] ERROR: self-test read from $%06x was not observed "
+		       "(hook not wired?)\n", (unsigned)addr);
+	}
+	else
+	{
+		webx68k_mem_read_watch_count = before; /* 自己検査ぶんは件数に数えない */
 	}
 }
 
@@ -269,12 +395,20 @@ static void wm_opm(uint32_t addr, uint8_t val)
 
 static uint8_t rm_main(uint32_t addr)
 {
+	uint8_t v;
+
 	addr &= 0x00ffffff;
 	if (addr < 0x00c00000) /* Use RAM upto 12MB */
-		return MEM[addr ^ 1];
+		v = MEM[addr ^ 1];
 	else if (addr < 0x00e00000)
-		return GVRAM_Read(addr);
-	return MemReadTable[(addr >> 13) & 0xff](addr);
+		v = GVRAM_Read(addr);
+	else
+		v = MemReadTable[(addr >> 13) & 0xff](addr);
+
+	if (webx68k_mem_read_watch_lo <= webx68k_mem_read_watch_hi)
+		webx68k_mem_read_watch_check(addr, v);
+
+	return v;
 }
 
 static uint8_t rm_font(uint32_t addr)

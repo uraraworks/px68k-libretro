@@ -47,6 +47,16 @@ extern int webx68k_scsi_spc_ints_sel(void);
 extern int webx68k_scsi_spc_ints_timeout(void);
 extern int webx68k_scsi_spc_ssts(void);
 extern int webx68k_scsi_spc_psns(void);
+/* 掃引モード(-2)での開始値。本物ROMは1回の起動でPSNS/SSTSを16回程度しか
+ * 読まない(1ターゲットにつき2回試して諦める)ため、1回の実行では
+ * 0〜15付近しか試せない。開始値をずらして複数回実行すれば全256値を
+ * 試せる。既定0(従来どおり0から)。詳細は SCSI_SpcSweepRead 参照。 */
+extern int webx68k_scsi_spc_psns_base(void);
+extern int webx68k_scsi_spc_ssts_base(void);
+/* PSNSの「交互」モード(-3)でのA/B値。既定 $8a / $0a。
+ * SCSI_SpcSweepRead 冒頭のコメント参照。 */
+extern int webx68k_scsi_spc_psns_a(void);
+extern int webx68k_scsi_spc_psns_b(void);
 /* PCTL($ea0011)書き込みでSSTSのbit7を落とすかどうか(既定1=落とす)。
  * 実測に基づく仕様ではなく実験的な規則。詳細は SCSI_SpcWrite コメント参照。 */
 extern int webx68k_scsi_spc_clear_on_pctl(void);
@@ -109,8 +119,11 @@ static uint8_t SCSISpcReg[SCSI_SPC_REG_COUNT];
  * まとめて1行出す(「×N回」)。上限4000件で、達したらその旨を1回だけ出す。
  * この上限(SCSI_BusLogGate)は [SCSI-SPC] の追加診断ログとも共通で、
  * SPC域も例外なくここでカウントされる(詳細は SCSI_BusLogGate の
- * コメントを参照)。 */
-#define SCSI_BUS_LOG_MAX    4000
+ * コメントを参照)。
+ * 既定値はホストから webx68k_scsi_bus_log_max() で上書きできる
+ * (既定 4000、詳細は core-shim.c の globalThis.__webx68kBusLogMax)。 */
+#define SCSI_BUS_LOG_MAX_DEFAULT    4000
+extern int webx68k_scsi_bus_log_max(void);
 static int SCSIBusLogCount = 0;
 static int SCSIBusLogCapped = 0;
 static uint32_t SCSIBusLastAddr = 0;
@@ -147,16 +160,23 @@ static void SCSI_BusReportExcluded(void)
  * 共有する(そうしないと本物ROMのセレクトやり直しループでSPCの
  * 追加診断行だけが無制限に出て34MB級のログになる、という実測不具合
  * があった)。ログを出す全箇所はこの関数を通すこと。 */
+static void SCSI_BusReportPcDropped(void);
+
 static int SCSI_BusLogGate(void)
 {
+	int log_max;
 	if (SCSIBusLogCapped)
 		return 0;
-	if (SCSIBusLogCount >= SCSI_BUS_LOG_MAX)
+	/* JS側(core-shim.c js_scsi_bus_log_max)が未設定時に既定
+	 * SCSI_BUS_LOG_MAX_DEFAULT を返すので、ここでは素直に使う。 */
+	log_max = webx68k_scsi_bus_log_max();
+	if (SCSIBusLogCount >= log_max)
 	{
 		SCSIBusLogCapped = 1;
 		if (log_cb)
-			log_cb(RETRO_LOG_INFO, "[SCSI-BUS] ログ上限(%d件)に達したため以降は出力を止める\n", SCSI_BUS_LOG_MAX);
+			log_cb(RETRO_LOG_INFO, "[SCSI-BUS] ログ上限(%d件)に達したため以降は出力を止める\n", log_max);
 		SCSI_BusReportExcluded();
+		SCSI_BusReportPcDropped();
 		return 0;
 	}
 	SCSIBusLogCount++;
@@ -170,13 +190,22 @@ static int SCSI_BusLogGate(void)
  * 数命令おきに複数レジスタを巡回するため、直前1件だけを見る既存の
  * run-length圧縮(SCSIBusRunCount)では捕まらない(「直近16件の並び一致」
  * を検出する案も検討したが、リングバッファと部分列比較が要り実装が
- * 複雑になるため見送った)。代わりに「同じPCからの通算件数が32件を
+ * 複雑になるため見送った)。代わりに「同じPCからの通算件数が閾値を
  * 超えたらそのPC以降は出さない」という単純な方式を採用する。
  * PCはハッシュ表を使わず線形探索(想定エントリ数は数個程度)。
  * テーブルが埋まった場合(想定外に多種のPCが来た場合)は制限せず
- * 常に許可する(安全側に倒す)。 */
-#define SCSI_BUS_PC_TRACK      64
-#define SCSI_BUS_PC_THRESHOLD  32
+ * 常に許可する(安全側に倒す)。
+ *
+ * この閾値(既定32)はホストから webx68k_scsi_bus_pc_limit() で
+ * 上書きできる(globalThis.__webx68kBusPcLimit)。0 を渡すと
+ * 「抑制しない=全件出す」になる(セレクト成功後にROMが何をしているかを
+ * 正確に追いたい場面向け)。抑制で落とした件数はPCごとに数え続けており、
+ * SCSI_BusReportPcDropped() でログ上限到達時・SCSI_Cleanup時に
+ * 上位10件だけまとめて出す(「0件」と「抑制されて0行」を区別するため、
+ * 抑制が一度も発動していなければこのログ自体を出さない)。 */
+#define SCSI_BUS_PC_TRACK          64
+#define SCSI_BUS_PC_THRESHOLD_DEFAULT  32
+extern int webx68k_scsi_bus_pc_limit(void);
 static uint32_t SCSIBusPcTrackPc[SCSI_BUS_PC_TRACK];
 static int SCSIBusPcTrackCount[SCSI_BUS_PC_TRACK];
 static int SCSIBusPcTrackUsed = 0;
@@ -184,20 +213,23 @@ static int SCSIBusPcTrackUsed = 0;
 static int SCSI_BusPcAllow(uint32_t pc)
 {
 	int i;
+	int limit = webx68k_scsi_bus_pc_limit();
+	if (limit <= 0)
+		return 1;	/* 0以下(既定は32) = 抑制しない */
 	for (i = 0; i < SCSIBusPcTrackUsed; i++)
 	{
 		if (SCSIBusPcTrackPc[i] == pc)
 		{
 			SCSIBusPcTrackCount[i]++;
-			if (SCSIBusPcTrackCount[i] == SCSI_BUS_PC_THRESHOLD + 1)
+			if (SCSIBusPcTrackCount[i] == limit + 1)
 			{
 				if (log_cb)
 					log_cb(RETRO_LOG_INFO,
 						"[SCSI-BUS] pc=$%08x からのログ対象アクセスが通算%d件を超えたため、"
 						"以後このPCからのログを止める(件数のみ数え続ける)\n",
-						(unsigned)pc, SCSI_BUS_PC_THRESHOLD);
+						(unsigned)pc, limit);
 			}
-			return SCSIBusPcTrackCount[i] <= SCSI_BUS_PC_THRESHOLD;
+			return SCSIBusPcTrackCount[i] <= limit;
 		}
 	}
 	if (SCSIBusPcTrackUsed < SCSI_BUS_PC_TRACK)
@@ -207,6 +239,67 @@ static int SCSI_BusPcAllow(uint32_t pc)
 		SCSIBusPcTrackUsed++;
 	}
 	return 1;
+}
+
+/* SCSI_BusPcAllow の抑制で落とした件数を、PCごとに上位10件だけ
+ * まとめて出す(SCSI_Cleanup、またはログ上限到達時に1回だけ)。
+ * 「抑制が一度も発動していない」場合はこのログ自体を出さないことで、
+ * 0件だったのか抑制されて何も見えていないのかを区別できるようにする。 */
+static int SCSIBusPcDroppedReported = 0;
+
+static void SCSI_BusReportPcDropped(void)
+{
+	int limit;
+	int i, j, n;
+	uint32_t top_pc[10];
+	int top_dropped[10];
+
+	if (SCSIBusPcDroppedReported)
+		return;
+	SCSIBusPcDroppedReported = 1;
+
+	if (!log_cb)
+		return;
+	limit = webx68k_scsi_bus_pc_limit();
+	if (limit <= 0)
+	{
+		log_cb(RETRO_LOG_INFO, "[SCSI-BUS] PC別抑制: 無効(webx68kBusPcLimit=0につき全件出力)\n");
+		return;
+	}
+
+	n = 0;
+	for (i = 0; i < SCSIBusPcTrackUsed; i++)
+	{
+		int dropped = SCSIBusPcTrackCount[i] - limit;
+		int pos;
+		if (dropped <= 0)
+			continue;
+		pos = n < 10 ? n : 9;
+		if (n < 10)
+			n++;
+		else if (dropped <= top_dropped[9])
+			continue;
+		for (j = pos; j > 0 && top_dropped[j - 1] < dropped; j--)
+		{
+			top_dropped[j] = top_dropped[j - 1];
+			top_pc[j] = top_pc[j - 1];
+		}
+		top_dropped[j] = dropped;
+		top_pc[j] = SCSIBusPcTrackPc[i];
+	}
+
+	if (n == 0)
+	{
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-BUS] PC別抑制件数: 0件(閾値%d件を超えたPCなし。抑制は一度も発動していない)\n",
+			limit);
+		return;
+	}
+
+	log_cb(RETRO_LOG_INFO, "[SCSI-BUS] PC別抑制件数(上位%d件、閾値%d件):\n", n, limit);
+	for (i = 0; i < n; i++)
+		log_cb(RETRO_LOG_INFO, "[SCSI-BUS]   pc=$%08x dropped=%d件\n",
+			(unsigned)top_pc[i], top_dropped[i]);
 }
 
 /* ストラテジ(ホストコマンド $40)呼び出し時に a5 で渡された要求ヘッダの
@@ -371,6 +464,9 @@ void SCSI_Init(void)
 	SCSIBusLastIsWrite = -1;
 	SCSIBusRunCount = 0;
 	SCSIBusPcTrackUsed = 0;
+	SCSIBusFetchExcludedReported = 0;
+	SCSIBusFetchExcluded = 0;
+	SCSIBusPcDroppedReported = 0;
 	SCSIUsingRealRom = 0;
 	SCSIReqHeaderAddr = 0;
 	SCSIReqInitCount = 0;
@@ -1004,6 +1100,7 @@ void SCSI_Cleanup(void)
 {
 	SCSI_BusLogFlush();
 	SCSI_BusReportExcluded();
+	SCSI_BusReportPcDropped();
 }
 
 /* d2 が指すヘッダ構造体で、我々が用意した窓(64バイト)より先の
@@ -1216,9 +1313,23 @@ static void SCSI_SpcWrite(uint32_t adr, uint8_t data)
  * ログは「同一PCから32件で以後抑制」する既存の圧縮(SCSI_BusPcAllow)の
  * 対象外にする(掃引の並びそのものが見たいものなので、圧縮されると
  * 肝心の情報が消える)。ただし暴走防止のため全体の4000件上限
- * (SCSI_BusLogGate)は他のログと共通で掛ける。 */
+ * (SCSI_BusLogGate)は他のログと共通で掛ける。
+ *
+ * PSNSにはさらに「交互」モード(-3)がある。掃引は「読むたびに+1」なので
+ * 連続する2回の読み出しは必ず(v, v+1)の組にしかならず、「ある値の次に
+ * 別の特定の値」という決まったハンドシェイクを待っているケースは掃引では
+ * 原理的に満たせない。交互モードは __webx68kSpcPsnsA/B(既定 $8a/$0a)を
+ * 読み出しのたびに入れ替えて返す。ログは交互なので連続一致にはならず、
+ * 既存の32件抑制と別に専用の上限(先頭200行、SCSI_SPC_PSNS_ALT_LOG_MAX)を
+ * 持たせて溢れを防ぐ。 */
 static uint8_t SCSISpcPsnsSweepNext = 0;
 static uint8_t SCSISpcSstsSweepNext = 0;
+/* PSNS「交互」モード(-3)用。次に返す側(0=A, 1=B)と、専用ログ上限のための件数。
+ * 掃引と違って連続一致にはならない(A,B,A,B,...)ため、既存の「同一PCから32件で
+ * 抑制」等とは別に、この行だけ先頭200行で打ち切る専用の上限を持たせる。 */
+static uint8_t SCSISpcPsnsAltNextIsB = 0;
+static int SCSISpcPsnsAltLogCount = 0;
+#define SCSI_SPC_PSNS_ALT_LOG_MAX 200
 
 static uint8_t SCSI_SpcSweepRead(uint32_t adr, uint8_t stored)
 {
@@ -1232,25 +1343,55 @@ static uint8_t SCSI_SpcSweepRead(uint32_t adr, uint8_t stored)
 		return stored;
 
 	cfg = is_psns ? webx68k_scsi_spc_psns() : webx68k_scsi_spc_ssts();
+
+	if (is_psns && cfg == -3)
+	{
+		/* 交互モード: 読み出しのたびにA/Bを入れ替えて返す。掃引(-2)は
+		 * 「読むたびに+1」なので連続2回は必ず(v, v+1)にしかならず、
+		 * 「ある値の次に別の特定の値」という決まったハンドシェイクを
+		 * 待っているケースは掃引では原理的に満たせない。それを試す。 */
+		int a = webx68k_scsi_spc_psns_a();
+		int b = webx68k_scsi_spc_psns_b();
+		v = (uint8_t)(SCSISpcPsnsAltNextIsB ? (b & 0xff) : (a & 0xff));
+
+		if (log_cb && SCSI_BusLogGate() && SCSISpcPsnsAltLogCount < SCSI_SPC_PSNS_ALT_LOG_MAX)
+		{
+			SCSISpcPsnsAltLogCount++;
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] PSNS交互: %s($%02x)を返した (pc=$%08x)%s\n",
+				SCSISpcPsnsAltNextIsB ? "B" : "A", (unsigned)v,
+				(unsigned)m68000_get_reg(M68K_PC),
+				(SCSISpcPsnsAltLogCount == SCSI_SPC_PSNS_ALT_LOG_MAX) ? " (以後この行は抑制)" : "");
+		}
+
+		SCSISpcPsnsAltNextIsB = (uint8_t)(SCSISpcPsnsAltNextIsB ^ 1);
+		return v;
+	}
+
 	if (cfg != -2)
 		return stored;
 
 	if (is_psns)
 	{
-		v = SCSISpcPsnsSweepNext;
+		int base = webx68k_scsi_spc_psns_base();
+		v = (uint8_t)((base + SCSISpcPsnsSweepNext) & 0xff);
 		SCSISpcPsnsSweepNext = (uint8_t)(SCSISpcPsnsSweepNext + 1);
 		name = "PSNS";
+
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] %s掃引: base=$%02x 値=$%02x を返した (pc=$%08x)\n",
+				name, (unsigned)(base & 0xff), (unsigned)v, (unsigned)m68000_get_reg(M68K_PC));
 	}
 	else
 	{
-		v = SCSISpcSstsSweepNext;
+		int base = webx68k_scsi_spc_ssts_base();
+		v = (uint8_t)((base + SCSISpcSstsSweepNext) & 0xff);
 		SCSISpcSstsSweepNext = (uint8_t)(SCSISpcSstsSweepNext + 1);
 		name = "SSTS";
-	}
 
-	if (log_cb && SCSI_BusLogGate())
-		log_cb(RETRO_LOG_INFO, "[SCSI-SPC] %s掃引: 値=$%02x を返した (pc=$%08x)\n",
-			name, (unsigned)v, (unsigned)m68000_get_reg(M68K_PC));
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] %s掃引: base=$%02x 値=$%02x を返した (pc=$%08x)\n",
+				name, (unsigned)(base & 0xff), (unsigned)v, (unsigned)m68000_get_reg(M68K_PC));
+	}
 
 	return v;
 }
