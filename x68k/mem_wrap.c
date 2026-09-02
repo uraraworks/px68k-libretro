@@ -35,6 +35,111 @@ uint32_t BusErrFlag       = 0;
 uint32_t BusErrHandling   = 0;
 static uint32_t BusErrAdr = 0;
 
+/*
+ * ゲストRAM書き込みの実測用フック(WebX68k-storage側)。
+ * JS側 (globalThis.__webx68kRamWatchLo / __webx68kRamWatchHi) が
+ * core-shim.c の webx68k_ram_watch_refresh() を通じて毎フレーム先頭で
+ * これらの static 変数に書き戻す。既定は無効(lo > hi)。
+ * ホットパス(wm_cnt、全RAMバイト書き込みが必ず通る)からは
+ * static変数の比較1回だけで早期脱出できるようにする。
+ *
+ * 書いた側のPCで絞る条件(webx68k_ram_watch_pc_lo/hi、既定は無効=-1)を追加。
+ * IPLのメモリクリア等、アドレス範囲だけでは絞り切れずログ上限を埋めて
+ * しまうケースに対応するため。既定(lo>hi)ならPCでは絞らず従来どおり。
+ */
+int32_t webx68k_ram_watch_lo = -1;
+int32_t webx68k_ram_watch_hi = -1;
+int32_t webx68k_ram_watch_pc_lo = -1;
+int32_t webx68k_ram_watch_pc_hi = -1;
+int webx68k_ram_watch_count = 0;
+
+/* 自己検査(webx68k_ram_watch_selftest)実行中はPCでの絞り込みを適用しない。
+ * 自己検査はretro_run先頭(CPU実行前後の合間)から呼ばれるため、その時点の
+ * m68000_get_reg(M68K_PC)はSCSI ROM等の監視対象PC範囲に入っているとは限らず、
+ * PC絞り込みを適用すると陽性対照そのものが「観測されなかった」扱いになって
+ * しまう。アドレス範囲・件数上限による絞り込みは自己検査にも従来どおり適用する。 */
+static int webx68k_ram_watch_selftest_active = 0;
+
+static void webx68k_ram_watch_check(uint32_t addr, uint8_t val)
+{
+	uint32_t pc;
+
+	if (webx68k_ram_watch_lo > webx68k_ram_watch_hi)
+		return;
+	if ((int32_t)addr < webx68k_ram_watch_lo || (int32_t)addr > webx68k_ram_watch_hi)
+		return;
+	if (webx68k_ram_watch_count >= 2000)
+		return;
+
+	pc = m68000_get_reg(M68K_PC);
+	if (!webx68k_ram_watch_selftest_active && webx68k_ram_watch_pc_lo <= webx68k_ram_watch_pc_hi)
+	{
+		if ((int32_t)pc < webx68k_ram_watch_pc_lo || (int32_t)pc > webx68k_ram_watch_pc_hi)
+			return;
+	}
+
+	webx68k_ram_watch_count++;
+	printf("[SCSI-RAM] W adr=$%06x data=$%02x pc=$%08x\n",
+	       (unsigned)addr, (unsigned)val, (unsigned)pc);
+}
+
+/* RAM(addrは0x00c00000未満であること)への実バイト書き込み。
+ * wm_cnt と自己検査の両方から使う共通実体(MSB_FIRST規則を1箇所に集約)。
+ * フックを経由させたくない場合(自己検査の復元)はこちらを直接呼ぶ。 */
+static inline void ram_poke_raw(uint32_t addr, uint8_t val)
+{
+#ifdef MSB_FIRST
+	MEM[addr    ] = val;
+#else
+	MEM[addr ^ 1] = val;
+#endif
+}
+
+static void wm_cnt(uint32_t addr, uint8_t val); /* 自己検査から使うための前方宣言 */
+
+/*
+ * 陽性対照: 監視範囲が有効なときだけ、範囲内の先頭番地へ1バイト書いて
+ * webx68k_ram_watch_check() 経由でログに出たかどうかを自己検査する。
+ * フックが繋がっていないのに「書き込みが無かった」と読む事故を防ぐため。
+ * このぶんのログ件数はカウントから除外する(復元処理はフックを経由しない)。
+ */
+void webx68k_ram_watch_selftest(void)
+{
+	uint32_t addr;
+	uint8_t saved, test_val;
+	int before;
+
+	if (webx68k_ram_watch_lo > webx68k_ram_watch_hi)
+		return; /* 監視無効なら自己検査もしない */
+	if (webx68k_ram_watch_lo < 0 || (uint32_t)webx68k_ram_watch_lo >= 0x00c00000)
+		return; /* RAM範囲外は自己検査の対象外 */
+
+	addr  = (uint32_t)webx68k_ram_watch_lo;
+	before = webx68k_ram_watch_count;
+
+#ifdef MSB_FIRST
+	saved = MEM[addr];
+#else
+	saved = MEM[addr ^ 1];
+#endif
+	test_val = saved ^ 0xff; /* 必ず値が変わるようにする */
+
+	webx68k_ram_watch_selftest_active = 1;
+	wm_cnt(addr, test_val); /* フック経由の書き込み(本番と同じ経路) */
+	webx68k_ram_watch_selftest_active = 0;
+	ram_poke_raw(addr, saved); /* 元の値へ復元。フックは経由させない */
+
+	if (webx68k_ram_watch_count == before)
+	{
+		printf("[SCSI-RAM] ERROR: self-test write to $%06x was not observed "
+		       "(hook not wired?)\n", (unsigned)addr);
+	}
+	else
+	{
+		webx68k_ram_watch_count = before; /* 自己検査ぶんは件数に数えない */
+	}
+}
+
 /* forward declarations */
 static void wm_opm(uint32_t addr, uint8_t val);
 static void wm_buserr(uint32_t addr, uint8_t val);
@@ -137,11 +242,8 @@ static void wm_cnt(uint32_t addr, uint8_t val)
 	addr &= 0x00ffffff;
 	if (addr < 0x00c00000) /* Use RAM upto 12MB */
 	{
-#ifdef MSB_FIRST
-		MEM[addr    ] = val;
-#else
-		MEM[addr ^ 1] = val;
-#endif
+		webx68k_ram_watch_check(addr, val);
+		ram_poke_raw(addr, val);
 	}
 	else if (addr < 0x00e00000)
 		GVRAM_Write(addr, val);

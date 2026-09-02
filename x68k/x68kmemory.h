@@ -34,4 +34,17 @@ void dma_writemem24_dword(uint32_t adr, uint32_t data);
 
 void Memory_SetSCSIMode(void);
 
+/*
+ * ゲストRAM書き込みの実測用フック(WebX68k-storage側)。
+ * 監視範囲は core-shim.c の webx68k_ram_watch_refresh() が
+ * globalThis.__webx68kRamWatchLo / __webx68kRamWatchHi から毎フレーム反映する。
+ * 既定は無効(lo > hi)。詳細は x68k/mem_wrap.c 冒頭のコメント参照。
+ */
+extern int32_t webx68k_ram_watch_lo;
+extern int32_t webx68k_ram_watch_hi;
+extern int      webx68k_ram_watch_count;
+
+void webx68k_ram_watch_selftest(void);
+void webx68k_ram_watch_refresh(void); /* WebX68k-storage/src/core-shim.c 側で定義 */
+
 #endif
