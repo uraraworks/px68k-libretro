@@ -153,6 +153,14 @@ static uint32_t SCSIHostReplyBpb;
 static int SCSIHostReplyStatus;
 static int SCSIHostReplyD0;
 
+/* drv_attr/drv_next はキャッシュ対象外(SCSI_Init内でしか読まない一回きりの
+ * 値)だが、起動時の陽性対照ログ(SCSI_RefreshHostConfig内)に含めるために
+ * SCSI_Init が読んだ値をここへ控えておく。本物ROM使用中はその区画の書き込み
+ * 自体を飛ばすため、区別できるよう既定値をあり得ない印(drv_attrは書かれない
+ * ことを示す負数、drv_nextは0)にしておく。 */
+static int SCSIInitDrvAttrForLog = -1;
+static int SCSIInitDrvNextForLog = 0;
+
 /* このフレームで一度も取り込んでいない(=SCSI_Init直後にまだ
  * SCSI_RefreshHostConfigを呼んでいない)ことの検出用。 */
 static int SCSIHostConfigLoaded = 0;
@@ -367,14 +375,29 @@ static int SCSI_BusPcAllow(uint32_t pc)
 
 /* 上のキャッシュ static 群を webx68k_scsi_*() から一括で読み直す。
  * SCSI_Init() で最低1回、以降は retro_run から毎フレーム
- * (SCSI_LogPcIfRealRom() の隣で)呼ぶ想定。本物ROM未使用時は
- * これらの値を一切参照しないため、SCSIUsingRealRom が真のときだけ
- * 実際に読み直す(自前スタブ経路の挙動・呼び出し回数は変えない)。 */
+ * (SCSI_LogPcIfRealRom() の隣で)呼ぶ想定。
+ *
+ * 【2026-09-02 実測で判明した事故】かつては「本物ROM未使用時はこれらの
+ * 値を一切参照しないはず」という思い込みで、この関数の先頭に
+ * `if (!SCSIUsingRealRom) return;` を置いていた。ところが reply_* 群
+ * (SCSI_HandleRequestHeader、自前スタブの d2 テーブル経由でも使う)は
+ * SCSIUsingRealRom の真偽に関わらず参照されており、自前スタブ経路では
+ * このガードのせいで一度もキャッシュへ取り込まれず、C の static 既定値
+ * (=0)のまま固定されていた(JS側のEM_JS既定値 units=1/end=$00ea0500/
+ * bpb=$00ea0600/status=-1/d0=-1 は一切効かない)。呼び出し側に
+ * --reply-units 等を渡しても「unit数=0 終了addr=$00000000
+ * BPB表ptr=$00000000」のまま変化しないという分かりにくい不具合になった。
+ * この関数はもともと1/60秒に1回しか呼ばれない(高頻度なのはSPCレジスタへの
+ * 個々のアクセスであって、この関数自体の呼び出し回数ではない)ため、
+ * 自前スタブ経路でも毎フレーム全項目読み直すコストは無視できる。
+ * よって早期returnはやめ、SCSIUsingRealRomの真偽に関わらず常に全項目を
+ * 読み直す。
+ *
+ * 【重要】設定を1つ足すたびに、このキャッシュへの読み込みと、下の
+ * 陽性対照ログの両方に足すこと。片方を忘れると「設定したのに効かない」
+ * が無言で起きる(2026-09-02に発生)。 */
 void SCSI_RefreshHostConfig(void)
 {
-	if (!SCSIUsingRealRom)
-		return;
-
 	SCSIHostSpcIntsSel = webx68k_scsi_spc_ints_sel();
 	SCSIHostSpcIntsTimeout = webx68k_scsi_spc_ints_timeout();
 	SCSIHostSpcTarget = webx68k_scsi_spc_target();
@@ -402,21 +425,28 @@ void SCSI_RefreshHostConfig(void)
 
 	/* 陽性対照: キャッシュ後も設定が本当に効いているかを1行で確認できる
 	 * ようにする。既定値のままならホストからの指定が届いていない
-	 * (取り込みそのものが壊れている、または呼び忘れ)と分かる。 */
+	 * (取り込みそのものが壊れている、または呼び忘れ)と分かる。
+	 * 返答系(reply_*)とdrv_attr/drv_nextも必ずここに含める。
+	 * 本物ROM使用中・未使用中(自前スタブ)のどちらでも必ず出す
+	 * (SCSIUsingRealRomによる出し分けはしない。2026-09-02、自前スタブ
+	 * 経路だけこの行自体が出ない状態になっていたことがある)。 */
 	if (!SCSIHostConfigLoaded && log_cb)
 	{
 		/* target は負値(既定-1=「どのTEMPでも成功」)を取りうるので $%02x で
-		 * マスクすると $ff 等に化けて見えなくなる。10進のまま出す。 */
-		if (SCSIHostSpcTarget < 0)
-			log_cb(RETRO_LOG_INFO,
-				"[SCSI] ホスト設定キャッシュ読み込み: ints_sel=$%02x ssts_data_bit=%d target=%d(どれでも) clear_on_pctl=%d\n",
-				(unsigned)(SCSIHostSpcIntsSel & 0xff), SCSIHostSpcSstsDataBit,
-				SCSIHostSpcTarget, SCSIHostSpcClearOnPctl);
-		else
-			log_cb(RETRO_LOG_INFO,
-				"[SCSI] ホスト設定キャッシュ読み込み: ints_sel=$%02x ssts_data_bit=%d target=%d($%02x) clear_on_pctl=%d\n",
-				(unsigned)(SCSIHostSpcIntsSel & 0xff), SCSIHostSpcSstsDataBit,
-				SCSIHostSpcTarget, (unsigned)(SCSIHostSpcTarget & 0xff), SCSIHostSpcClearOnPctl);
+		 * マスクすると $ff 等に化けて見えなくなる。10進のまま出す。
+		 * drv_attr/drv_next は本物ROM使用中は SCSI_Init がその区画自体を
+		 * 書かないため、既定の印(attr=-1, next=0)がそのまま出る。 */
+		int spc_target = SCSIHostSpcTarget;
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI] ホスト設定キャッシュ読み込み: ints_sel=$%02x ssts_data_bit=%d target=%d clear_on_pctl=%d"
+			" | reply_err=$%02x reply_units=%d reply_end=$%08x reply_bpb=$%08x reply_status=%d reply_d0=%d"
+			" drv_attr=$%04x drv_next=$%08x (本物ROM使用中=%d)\n",
+			(unsigned)(SCSIHostSpcIntsSel & 0xff), SCSIHostSpcSstsDataBit, spc_target, SCSIHostSpcClearOnPctl,
+			(unsigned)(SCSIHostReplyErr & 0xff), SCSIHostReplyUnits,
+			(unsigned)SCSIHostReplyEnd, (unsigned)SCSIHostReplyBpb,
+			SCSIHostReplyStatus, SCSIHostReplyD0,
+			(unsigned)(SCSIInitDrvAttrForLog & 0xffff), (unsigned)SCSIInitDrvNextForLog,
+			SCSIUsingRealRom);
 	}
 	SCSIHostConfigLoaded = 1;
 }
@@ -689,6 +719,8 @@ void SCSI_Init(void)
 	SCSIBusPcDroppedReported = 0;
 	SCSIUsingRealRom = 0;
 	SCSIHostConfigLoaded = 0;	/* 起動のたびに陽性対照ログを出し直す */
+	SCSIInitDrvAttrForLog = -1;	/* 本物ROM使用中はこの区画を書かないため既定の印に戻す */
+	SCSIInitDrvNextForLog = 0;
 	SCSIReqHeaderAddr = 0;
 	SCSIReqInitCount = 0;
 	memset(SCSITableCallCount, 0, sizeof(SCSITableCallCount));
@@ -712,9 +744,9 @@ void SCSI_Init(void)
 			log_cb(RETRO_LOG_INFO,
 				"[SCSI] 本物のSCSI ROMイメージ(%d バイト)を読み込んだ。自前スタブの処理(d2/a4差し替え・観測用テーブル/スタブ・$ea0110窓selftest・BPB表ポインタ)を飛ばす\n",
 				rom_len);
-		/* 初期化時点でも一度読み込む(SCSI_Init内で使う返答値のため)。
-		 * 以降は retro_run から毎フレーム呼ばれるものと同じ関数。 */
-		SCSI_RefreshHostConfig();
+		/* SCSI_RefreshHostConfig() は本物ROM使用の有無に関わらず必要な
+		 * ため(reply_*は自前スタブ経路でも参照する)、SCSI_Init末尾で
+		 * SCSIUsingRealRom確定後にまとめて1回呼ぶ。ここでは呼ばない。 */
 	}
 	else
 	{
@@ -765,6 +797,8 @@ void SCSI_Init(void)
 			SCSIIPL[off_hdr + 0x01] = (uint8_t)((v >> 16) & 0xff);
 			SCSIIPL[off_hdr + 0x02] = (uint8_t)((v >> 8) & 0xff);
 			SCSIIPL[off_hdr + 0x03] = (uint8_t)(v & 0xff);
+			/* 起動時の陽性対照ログ(SCSI_RefreshHostConfig)向けに控える。 */
+			SCSIInitDrvNextForLog = (int)v;
 		}
 
 		/* +$04 属性ワード。値の意味が未確定のため、再ビルドせずに
@@ -773,6 +807,8 @@ void SCSI_Init(void)
 			int attr = webx68k_scsi_drv_attr();
 			SCSIIPL[off_hdr + 0x04] = (uint8_t)((attr >> 8) & 0xff);
 			SCSIIPL[off_hdr + 0x05] = (uint8_t)(attr & 0xff);
+			/* 起動時の陽性対照ログ(SCSI_RefreshHostConfig)向けに控える。 */
+			SCSIInitDrvAttrForLog = attr;
 		}
 
 		/* +$06 ストラテジ = stub[0] */
@@ -996,6 +1032,14 @@ void SCSI_Init(void)
 				sec0[8], sec0[9], sec0[10], sec0[11]);
 		}
 	}
+
+	/* SCSIUsingRealRom・drv_attr/drv_next(SCSIInitDrvAttrForLog/
+	 * SCSIInitDrvNextForLog)が確定した後にキャッシュを読み直す。
+	 * 本物ROM使用・自前スタブのどちらでも必ず1回呼ぶ(reply_*は
+	 * 自前スタブ経路でも参照するため、SCSIUsingRealRomで出し分けない。
+	 * 2026-09-02、ここが本物ROM使用中だけの呼び出しになっていて
+	 * 自前スタブ経路のreply_*が既定値ゼロのまま固定される事故があった)。 */
+	SCSI_RefreshHostConfig();
 }
 
 /* インタラプト(ホストコマンド $41)から呼ばれる、要求ヘッダのHLE処理。
