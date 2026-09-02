@@ -11,6 +11,11 @@
 #include "scsi.h"
 #include "x68kmemory.h"
 
+/* SCSI のセクタI/O(ホスト側)。実体は WebX68k の src/core-shim.c。
+ * 決定2 により emscripten のファイルシステムは経由しない。 */
+extern int webx68k_scsi_get_size(void);
+extern int webx68k_scsi_read_sector(unsigned int lba, unsigned char *buf);
+
 uint8_t	SCSIIPL[0x2000];
 
 /* SCSI IOCS 観測フックのログ件数 (詳細は SCSI_IOCSPort_Write を参照) */
@@ -69,6 +74,33 @@ void SCSI_Init(void)
 			log_cb(RETRO_LOG_ERROR, "[SCSI-IOCS] selftest FAILED: $e9f800 への書き込みがフックへ届かない\n");
 	}
 	SCSIIOCSSelfTest = 0;
+
+	/* ホスト側セクタI/Oの疎通確認。イメージが繋がっていれば、
+	 * FORMAT.X が書く SCSI ディスクIDがセクタ0の先頭に見えるはずである
+	 * (期待値は既知の基準器から取っている。docs/STORAGE-SCSI.md
+	 * 「移行後イメージの構造」参照)。 */
+	{
+		static uint8_t sec0[512];
+		int size = webx68k_scsi_get_size();
+		if (size <= 0)
+		{
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO, "[SCSI] イメージ未設定 (デバイス無しとして扱う)\n");
+		}
+		else if (webx68k_scsi_read_sector(0, sec0) != 0)
+		{
+			if (log_cb)
+				log_cb(RETRO_LOG_ERROR, "[SCSI] セクタ0の読み出しに失敗した (size=%d)\n", size);
+		}
+		else if (log_cb)
+		{
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI] image size=%d bytes (%d sectors) sector0=\"%c%c%c%c%c%c%c%c\" sector0[8..11]=$%02x%02x%02x%02x\n",
+				size, size / 512,
+				sec0[0], sec0[1], sec0[2], sec0[3], sec0[4], sec0[5], sec0[6], sec0[7],
+				sec0[8], sec0[9], sec0[10], sec0[11]);
+		}
+	}
 }
 
 /* --- SCSI IOCS ($F5) の観測フック ---------------------------------------
