@@ -10,11 +10,14 @@
 #include "m68000.h"
 #include "scsi.h"
 #include "x68kmemory.h"
+#include "sram.h"
 
 /* SCSI のセクタI/O(ホスト側)。実体は WebX68k の src/core-shim.c。
  * 決定2 により emscripten のファイルシステムは経由しない。 */
 extern int webx68k_scsi_get_size(void);
 extern int webx68k_scsi_init_d2(void);
+extern int webx68k_scsi_init_a4(void);
+extern int webx68k_scsi_sram_init(void);
 extern int webx68k_scsi_read_sector(unsigned int lba, unsigned char *buf);
 
 uint8_t	SCSIIPL[0x2000];
@@ -44,6 +47,7 @@ static int SCSIIOCSSelfTest = 0;
 static int SCSIRomLogCount = 0;
 static int SCSIRomReadTotal = 0;
 static int SCSIEntryCallCount = 0;
+static int SCSIZeroCallCount = 0;
 
 void SCSI_Init(void)
 {
@@ -91,11 +95,15 @@ void SCSI_Init(void)
 		 * Human68k が $00000000 へ飛び「おかしな命令を実行しました
 		 * (SR=$2009:PC=$00000000)」になったことで確定した。
 		 * ここでは自前ルーチン($ea00a0)を渡し、呼ばれ方を観測する。 */
+		0x28, 0x7c, 0x00, 0x00, 0x00, 0x00,	/* "movea.l #0, a4" 即値は SCSI_Init で差し替える。
+											 * $00000000 へ飛んだ瞬間のレジスタダンプで a4 だけが
+											 * 空だったため、a4 も初期化ルーチンの戻り値では
+											 * ないかを試すための枠。既定 0 は元の状態と同じ。 */
 		0x24, 0x3c, 0xff, 0xff, 0xff, 0xff,	/* "move.l #-1, d2" 即値は SCSI_Init で差し替える */
 		0x4e, 0x75,							/* "rts" */
-		/* $ea0090-$ea009f 詰め物 */
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		/* $ea0096-$ea009f 詰め物 */
+		0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00,
 		/* $ea00a0 Human68k から呼ばれるルーチン(観測のみ) */
 		0x13, 0xfc, 0x00, 0x05, 0x00, 0xe9, 0xf8, 0x02,	/* "move.b #$05, $e9f802" */
 		0x4e, 0x75,							/* "rts" */
@@ -127,24 +135,51 @@ void SCSI_Init(void)
 	SCSIRomLogCount = 0;
 	SCSIRomReadTotal = 0;
 	SCSIEntryCallCount = 0;
+	SCSIZeroCallCount = 0;
 	memset(SCSIIPL, 0, 0x2000);
 	memcpy(&SCSIIPL[0x20], SCSIIMG, sizeof(SCSIIMG));
 	/* ベクタ設定エントリが返す d2 の即値を差し替える。
 	 * 意味が未確定のため、再ビルドせずに値を振れるようにしてある。
 	 * 位置は決め打ちなので、命令語($243c = move.l #imm,d2)を照合してから書く。 */
-	if (SCSIIPL[0x88] == 0x24 && SCSIIPL[0x89] == 0x3c)
+	/* 実験: SCSI ローダが書くはずの SRAM 既定値を、こちらで書いてしまう。
+	 * 資料『Inside X68000』図8 によれば、$ed006f に 'V'($56) が無いとき
+	 * SCSI ローダが 'V' と $ed0070=$07 / $ed0071=$00 を書く。
+	 * 手元の環境は3番地とも $ff(＝ローダが走っていない)であったため、
+	 * この状態が Human68k の判断を変えるのかを確かめる。既定では書かない。 */
+	if (webx68k_scsi_sram_init())
 	{
-		int d2 = webx68k_scsi_init_d2();
-		SCSIIPL[0x8a] = (uint8_t)((d2 >> 24) & 0xff);
-		SCSIIPL[0x8b] = (uint8_t)((d2 >> 16) & 0xff);
-		SCSIIPL[0x8c] = (uint8_t)((d2 >> 8) & 0xff);
-		SCSIIPL[0x8d] = (uint8_t)(d2 & 0xff);
+		/* SRAM は書き込み許可を開けないと無言で捨てられる(実測: 開けずに
+		 * 書いたら読み返しが $ff のままだった)。開けたら必ず閉じる。 */
+		SRAM_WriteEnable(1);
+		SRAM_Write(0x00ed006f, 0x56);
+		SRAM_Write(0x00ed0070, 0x07);
+		SRAM_Write(0x00ed0071, 0x00);
+		SRAM_WriteEnable(0);
 		if (log_cb)
-			log_cb(RETRO_LOG_INFO, "[SCSI] ベクタ設定エントリが返す d2 = $%08x\n", (unsigned)d2);
+			log_cb(RETRO_LOG_INFO, "[SCSI] SRAM に SCSI ローダ相当の既定値を書いた (読み返し $%02x $%02x $%02x)\n",
+				SRAM_Read(0x00ed006f), SRAM_Read(0x00ed0070), SRAM_Read(0x00ed0071));
+	}
+
+	if (SCSIIPL[0x88] == 0x28 && SCSIIPL[0x89] == 0x7c &&
+		SCSIIPL[0x8e] == 0x24 && SCSIIPL[0x8f] == 0x3c)
+	{
+		int a4 = webx68k_scsi_init_a4();
+		int d2 = webx68k_scsi_init_d2();
+		SCSIIPL[0x8a] = (uint8_t)((a4 >> 24) & 0xff);
+		SCSIIPL[0x8b] = (uint8_t)((a4 >> 16) & 0xff);
+		SCSIIPL[0x8c] = (uint8_t)((a4 >> 8) & 0xff);
+		SCSIIPL[0x8d] = (uint8_t)(a4 & 0xff);
+		SCSIIPL[0x90] = (uint8_t)((d2 >> 24) & 0xff);
+		SCSIIPL[0x91] = (uint8_t)((d2 >> 16) & 0xff);
+		SCSIIPL[0x92] = (uint8_t)((d2 >> 8) & 0xff);
+		SCSIIPL[0x93] = (uint8_t)(d2 & 0xff);
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "[SCSI] ベクタ設定エントリが返す a4 = $%08x, d2 = $%08x\n",
+				(unsigned)a4, (unsigned)d2);
 	}
 	else if (log_cb)
-		log_cb(RETRO_LOG_ERROR, "[SCSI] d2 即値の位置がずれている (SCSIIPL[0x88,0x89]=$%02x$%02x)\n",
-			SCSIIPL[0x88], SCSIIPL[0x89]);
+		log_cb(RETRO_LOG_ERROR, "[SCSI] 即値の位置がずれている ($%02x$%02x / $%02x$%02x)\n",
+			SCSIIPL[0x88], SCSIIPL[0x89], SCSIIPL[0x8e], SCSIIPL[0x8f]);
 
 	for (i=0; i<0x2000; i+=2)
 	{
@@ -202,6 +237,29 @@ static void SCSI_HostCommand(uint8_t cmd)
 	static uint8_t sec0[512];
 	uint32_t i;
 
+	if (cmd == 0x06)
+	{
+		uint32_t sp = m68000_get_reg(M68K_A7);
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI] $00000000 に飛んできた #%d sr=$%04x sp=$%08x\n"
+				"        d0=$%08x d1=$%08x d2=$%08x d3=$%08x d4=$%08x d5=$%08x d6=$%08x d7=$%08x\n"
+				"        a0=$%08x a1=$%08x a2=$%08x a3=$%08x a4=$%08x a5=$%08x a6=$%08x\n"
+				"        stack: [0]=$%08x [1]=$%08x [2]=$%08x [3]=$%08x\n",
+				++SCSIZeroCallCount,
+				(unsigned)m68000_get_reg(M68K_SR), (unsigned)sp,
+				(unsigned)m68000_get_reg(M68K_D0), (unsigned)m68000_get_reg(M68K_D1),
+				(unsigned)m68000_get_reg(M68K_D2), (unsigned)m68000_get_reg(M68K_D3),
+				(unsigned)m68000_get_reg(M68K_D4), (unsigned)m68000_get_reg(M68K_D5),
+				(unsigned)m68000_get_reg(M68K_D6), (unsigned)m68000_get_reg(M68K_D7),
+				(unsigned)m68000_get_reg(M68K_A0), (unsigned)m68000_get_reg(M68K_A1),
+				(unsigned)m68000_get_reg(M68K_A2), (unsigned)m68000_get_reg(M68K_A3),
+				(unsigned)m68000_get_reg(M68K_A4), (unsigned)m68000_get_reg(M68K_A5),
+				(unsigned)m68000_get_reg(M68K_A6),
+				(unsigned)cpu_readmem24_dword(sp), (unsigned)cpu_readmem24_dword(sp + 4),
+				(unsigned)cpu_readmem24_dword(sp + 8), (unsigned)cpu_readmem24_dword(sp + 12));
+		return;
+	}
 	if (cmd == 0x05)
 	{
 		if (log_cb)
@@ -226,6 +284,31 @@ static void SCSI_HostCommand(uint8_t cmd)
 		if (log_cb)
 			log_cb(RETRO_LOG_INFO, "[SCSI] ベクタ設定エントリが呼ばれた(陽性対照) (pc=$%08x)\n",
 				(unsigned)m68000_get_reg(M68K_PC));
+		/* SCSI 用に追加された SRAM の3番地を記録する(資料『Inside X68000』図8)。
+		 * $ED006F が 'V'($56) のとき $ED0070/$ED0071 が有効。
+		 * $ED0070: bit3 = 0:内蔵 / 1:オプションボード、下位3bit = 本体のSCSI ID。
+		 * $ED0071: SASIフラグ。
+		 * 資料の記述が手元の環境で成り立っているかを実測で確かめるために出す。
+		 * peek8 は SRAM を経由しないため、必ず SRAM_Read() で読む。 */
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "[SCSI] SRAM $ed006f=$%02x('%c') $ed0070=$%02x $ed0071=$%02x\n",
+				SRAM_Read(0x00ed006f),
+				(SRAM_Read(0x00ed006f) >= 0x20 && SRAM_Read(0x00ed006f) < 0x7f) ? SRAM_Read(0x00ed006f) : '.',
+				SRAM_Read(0x00ed0070), SRAM_Read(0x00ed0071));
+
+		/* d2 に -1 以外を返すと Human68k は $00000000 を実行して落ちる。
+		 * そこは RAM なので、印を出して戻るだけのコードを置いておけば
+		 * 「飛んできた瞬間」のレジスタとスタックが取れる。
+		 * $0-$7 はリセットベクタだが、リセットまで読まれないので上書きしてよい。 */
+		{
+			static const uint8_t stub[] = {
+				0x13, 0xfc, 0x00, 0x06, 0x00, 0xe9, 0xf8, 0x02,	/* move.b #$06, $e9f802 */
+				0x4e, 0x75										/* rts */
+			};
+			uint32_t k;
+			for (k = 0; k < sizeof(stub); k++)
+				cpu_writemem24(k, stub[k]);
+		}
 		return;
 	}
 	if (cmd == 0x01)
