@@ -49,6 +49,19 @@ static int SCSIRomReadTotal = 0;
 static int SCSIEntryCallCount = 0;
 static int SCSIZeroCallCount = 0;
 
+/* $ea0100〜$ea04ff への書き込みログ(先頭64件)。範囲内/範囲外を問わず
+ * $ea0000〜$ea1fff 全域を対象にする。 */
+#define SCSI_WRITELOG_MAX   64
+static int SCSIWriteLogCount = 0;
+
+/* $ea0100〜$ea04ff への読み出しログ(上限128件、ヘッダ域とは別カウンタ) */
+#define SCSI_WINREAD_LOG_MAX 128
+static int SCSIWinReadLogCount = 0;
+
+/* d2 で渡す観測用テーブル/スタブの呼び出し回数 ($40〜$7f, 64要素) */
+#define SCSI_TABLE_ENTRIES 64
+static int SCSITableCallCount[SCSI_TABLE_ENTRIES];
+
 void SCSI_Init(void)
 {
 	/* Original SCSI ROM
@@ -136,8 +149,57 @@ void SCSI_Init(void)
 	SCSIRomReadTotal = 0;
 	SCSIEntryCallCount = 0;
 	SCSIZeroCallCount = 0;
+	SCSIWriteLogCount = 0;
+	SCSIWinReadLogCount = 0;
+	memset(SCSITableCallCount, 0, sizeof(SCSITableCallCount));
 	memset(SCSIIPL, 0, 0x2000);
 	memcpy(&SCSIIPL[0x20], SCSIIMG, sizeof(SCSIIMG));
+
+	/* d2 で渡す観測用の表を作る。$ea0000〜のバイト入れ替えループより前に、
+	 * SCSIIMG と同じ自然なバイト順で書く。
+	 * - $ea0100 から 4バイト×64要素: 要素kの値 = $00ea0200 + k*10
+	 * - $ea0200 から 10バイト×64個のスタブ: move.b #(0x40+k),$e9f802 / rts */
+	{
+		int k;
+		uint32_t off_table = 0x100;	/* SCSIIPL内オフセット ($ea0100) */
+		uint32_t off_stub  = 0x200;	/* SCSIIPL内オフセット ($ea0200) */
+		for (k = 0; k < SCSI_TABLE_ENTRIES; k++)
+		{
+			uint32_t val = 0x00ea0200 + (uint32_t)k * 10;
+			uint32_t p = off_table + (uint32_t)k * 4;
+			SCSIIPL[p + 0] = (uint8_t)((val >> 24) & 0xff);
+			SCSIIPL[p + 1] = (uint8_t)((val >> 16) & 0xff);
+			SCSIIPL[p + 2] = (uint8_t)((val >> 8) & 0xff);
+			SCSIIPL[p + 3] = (uint8_t)(val & 0xff);
+
+			{
+				uint32_t sp = off_stub + (uint32_t)k * 10;
+				SCSIIPL[sp + 0] = 0x13;
+				SCSIIPL[sp + 1] = 0xfc;
+				SCSIIPL[sp + 2] = 0x00;
+				SCSIIPL[sp + 3] = (uint8_t)(0x40 + k);
+				SCSIIPL[sp + 4] = 0x00;
+				SCSIIPL[sp + 5] = 0xe9;
+				SCSIIPL[sp + 6] = 0xf8;
+				SCSIIPL[sp + 7] = 0x02;
+				SCSIIPL[sp + 8] = 0x4e;
+				SCSIIPL[sp + 9] = 0x75;
+			}
+		}
+		if (log_cb)
+		{
+			uint32_t v0 = ((uint32_t)SCSIIPL[off_table + 0] << 24) | ((uint32_t)SCSIIPL[off_table + 1] << 16) |
+				((uint32_t)SCSIIPL[off_table + 2] << 8) | SCSIIPL[off_table + 3];
+			uint32_t vmid = ((uint32_t)SCSIIPL[off_table + 32*4 + 0] << 24) | ((uint32_t)SCSIIPL[off_table + 32*4 + 1] << 16) |
+				((uint32_t)SCSIIPL[off_table + 32*4 + 2] << 8) | SCSIIPL[off_table + 32*4 + 3];
+			uint32_t v63 = ((uint32_t)SCSIIPL[off_table + 63*4 + 0] << 24) | ((uint32_t)SCSIIPL[off_table + 63*4 + 1] << 16) |
+				((uint32_t)SCSIIPL[off_table + 63*4 + 2] << 8) | SCSIIPL[off_table + 63*4 + 3];
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI] 観測用テーブル書き込み確認: [0]=$%08x(期待$%08x) [32]=$%08x(期待$%08x) [63]=$%08x(期待$%08x) スタブ[0] cmd=$%02x スタブ[63] cmd=$%02x\n",
+				v0, 0x00ea0200u, vmid, 0x00ea0200u + 32u*10u, v63, 0x00ea0200u + 63u*10u,
+				SCSIIPL[off_stub + 3], SCSIIPL[off_stub + 63*10 + 3]);
+		}
+	}
 	/* ベクタ設定エントリが返す d2 の即値を差し替える。
 	 * 意味が未確定のため、再ビルドせずに値を振れるようにしてある。
 	 * 位置は決め打ちなので、命令語($243c = move.l #imm,d2)を照合してから書く。 */
@@ -202,6 +264,27 @@ void SCSI_Init(void)
 			log_cb(RETRO_LOG_ERROR, "[SCSI-IOCS] selftest FAILED: $e9f800 への書き込みがフックへ届かない\n");
 	}
 	SCSIIOCSSelfTest = 0;
+
+	/* 陽性対照: $ea0100〜$ea04ff の「書ける窓」への書き込みが
+	 * SCSI_Write を経由して実際に SCSIIPL へ反映されるかを、
+	 * CPU と同じ書き込み経路(cpu_writemem24)で確かめる。
+	 * 書き込み経路がそもそも SCSI_Write に来ていない可能性があるため必須。
+	 * 検査後は元の値(表の要素0の該当バイト)へ戻す。 */
+	{
+		uint8_t orig = cpu_readmem24(0x00ea0110);
+		cpu_writemem24(0x00ea0110, 0x5a);
+		{
+			uint8_t back = cpu_readmem24(0x00ea0110);
+			if (log_cb)
+			{
+				if (back == 0x5a)
+					log_cb(RETRO_LOG_INFO, "[SCSI] selftest ok: $ea0110 への窓書き込みが効いている\n");
+				else
+					log_cb(RETRO_LOG_ERROR, "[SCSI] selftest FAILED: $ea0110 への窓書き込みが反映されない (読み返し=$%02x)\n", back);
+			}
+		}
+		cpu_writemem24(0x00ea0110, orig);
+	}
 
 	/* ホスト側セクタI/Oの疎通確認。イメージが繋がっていれば、
 	 * FORMAT.X が書く SCSI ディスクIDがセクタ0の先頭に見えるはずである
@@ -340,6 +423,30 @@ static void SCSI_HostCommand(uint8_t cmd)
 				cpu_readmem24(SCSI_BOOT_LOAD_ADDR + 6), cpu_readmem24(SCSI_BOOT_LOAD_ADDR + 7));
 		return;
 	}
+	if (cmd >= 0x40 && cmd <= 0x7f)
+	{
+		int k = cmd - 0x40;
+		uint32_t sp = m68000_get_reg(M68K_A7);
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI] d2で渡した表の +$%02x(要素 %d)が呼ばれた #%d pc=$%08x sr=$%04x sp=$%08x\n"
+				"        d0=$%08x d1=$%08x d2=$%08x d3=$%08x d4=$%08x d5=$%08x d6=$%08x d7=$%08x\n"
+				"        a0=$%08x a1=$%08x a2=$%08x a3=$%08x a4=$%08x a5=$%08x a6=$%08x\n"
+				"        stack: [0]=$%08x [1]=$%08x [2]=$%08x [3]=$%08x\n",
+				(unsigned)(k * 10), k, ++SCSITableCallCount[k],
+				(unsigned)m68000_get_reg(M68K_PC), (unsigned)m68000_get_reg(M68K_SR), (unsigned)sp,
+				(unsigned)m68000_get_reg(M68K_D0), (unsigned)m68000_get_reg(M68K_D1),
+				(unsigned)m68000_get_reg(M68K_D2), (unsigned)m68000_get_reg(M68K_D3),
+				(unsigned)m68000_get_reg(M68K_D4), (unsigned)m68000_get_reg(M68K_D5),
+				(unsigned)m68000_get_reg(M68K_D6), (unsigned)m68000_get_reg(M68K_D7),
+				(unsigned)m68000_get_reg(M68K_A0), (unsigned)m68000_get_reg(M68K_A1),
+				(unsigned)m68000_get_reg(M68K_A2), (unsigned)m68000_get_reg(M68K_A3),
+				(unsigned)m68000_get_reg(M68K_A4), (unsigned)m68000_get_reg(M68K_A5),
+				(unsigned)m68000_get_reg(M68K_A6),
+				(unsigned)cpu_readmem24_dword(sp), (unsigned)cpu_readmem24_dword(sp + 4),
+				(unsigned)cpu_readmem24_dword(sp + 8), (unsigned)cpu_readmem24_dword(sp + 12));
+		return;
+	}
 	if (log_cb)
 		log_cb(RETRO_LOG_ERROR, "[SCSI] 未知のホストコマンド $%02x\n", (unsigned)cmd);
 }
@@ -379,7 +486,32 @@ void FASTCALL SCSI_IOCSPort_Write(uint32_t adr, uint8_t data)
 }
 
 void SCSI_Cleanup(void) { }
-void FASTCALL SCSI_Write(uint32_t adr, uint8_t data) { }
+
+/* d2 が指すヘッダ構造体で、我々が用意した窓(64バイト)より先の
+ * オフセットが読み書きされているのではないか、という仮説(a)(b)を
+ * 一度に測るための「書ける窓」。$ea0100〜$ea04ff への書き込みを
+ * 実際に SCSIIPL へ反映し、範囲外は従来どおり捨てる。
+ * ログは $ea0000〜$ea1fff の全域を対象に先頭64件まで取る。 */
+#define SCSI_WINDOW_LO 0x00ea0100
+#define SCSI_WINDOW_HI 0x00ea0500	/* 排他的上限 ($ea04ff まで) */
+
+void FASTCALL SCSI_Write(uint32_t adr, uint8_t data)
+{
+	int in_window = (adr >= SCSI_WINDOW_LO && adr < SCSI_WINDOW_HI);
+
+	if (SCSIWriteLogCount < SCSI_WRITELOG_MAX && adr >= 0x00ea0000 && adr < 0x00ea2000)
+	{
+		SCSIWriteLogCount++;
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "[SCSI-WRITE] #%d adr=$%06x data=$%02x pc=$%08x %s\n",
+				SCSIWriteLogCount, (unsigned)adr, (unsigned)data,
+				(unsigned)m68000_get_reg(M68K_PC),
+				in_window ? "(窓内)" : "(窓外・捨てる)");
+	}
+
+	if (in_window)
+		SCSIIPL[(adr^1)&0x1fff] = data;
+}
 
 uint8_t FASTCALL SCSI_Read(uint32_t adr)
 {
@@ -394,6 +526,18 @@ uint8_t FASTCALL SCSI_Read(uint32_t adr)
 			if (log_cb)
 				log_cb(RETRO_LOG_INFO, "[SCSI-ROM] #%d adr=$%06x pc=$%08x\n",
 					SCSIRomLogCount, (unsigned)adr, (unsigned)m68000_get_reg(M68K_PC));
+		}
+	}
+	/* d2 で渡した観測用テーブル/スタブ域($ea0100〜$ea04ff)への読み出し。
+	 * ヘッダ域とは別カウンタで、上限128件まで記録する。 */
+	else if (adr >= SCSI_WINDOW_LO && adr < SCSI_WINDOW_HI)
+	{
+		if (SCSIWinReadLogCount < SCSI_WINREAD_LOG_MAX)
+		{
+			SCSIWinReadLogCount++;
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO, "[SCSI-WINREAD] #%d adr=$%06x pc=$%08x\n",
+					SCSIWinReadLogCount, (unsigned)adr, (unsigned)m68000_get_reg(M68K_PC));
 		}
 	}
 	return SCSIIPL[(adr^1)&0x1fff];
