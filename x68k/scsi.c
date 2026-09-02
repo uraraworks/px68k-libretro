@@ -60,6 +60,30 @@ extern int webx68k_scsi_spc_psns_b(void);
 /* PCTL($ea0011)書き込みでSSTSのbit7を落とすかどうか(既定1=落とす)。
  * 実測に基づく仕様ではなく実験的な規則。詳細は SCSI_SpcWrite コメント参照。 */
 extern int webx68k_scsi_spc_clear_on_pctl(void);
+/* SPCの転送状態機械(COMMAND/DATAIN/STATUS/MSGIN)用。webx68k_scsi_spc_psns()が
+ * 既定(-1)のときだけ働く。詳細は下の SCSI_SpcSetPhase 等のコメント参照。 */
+extern int webx68k_scsi_spc_phase_bits(void);
+extern int webx68k_scsi_spc_ints_xfer(void);
+extern int webx68k_scsi_spc_ints_disc(void);
+/* CDBをDREGでなくTEMP($ea0017)経由で受け取る仮説の有効/無効。既定1(有効)。
+ * 2026-09-02の実測(ROMがDREGに一切書かずTEMP経由に見える並びを繰り返した)を
+ * 受けた未実測の仮説。詳細は SCSI_SpcXferStart のコメント参照。 */
+extern int webx68k_scsi_spc_cdb_from_temp(void);
+/* DATAIN中に渡すべきバイトが残っている間、SSTSへ立てるビット。既定 $08。
+ * 実測(2026-09-02): READ CAPACITY応答(DATAIN)の直前にROMがTC(TCH=$ea0019/
+ * TCM=$ea001b/TCL=$ea001d)=8を書き、SCMD上位3bit=100($80)を書いたあと
+ * pc=$ea13de でSSTS($ea000d)を95回ポーリングし続けた。ROMが「データが
+ * 来た」を示すビットを待っていると読み、そのビットを立てる/落とす当てはめ。
+ * bit7(接続中、既存のSCSI_SpcSstsSetBit7Reason)とは別にORする。
+ * 値はwebx68k_scsi_spc_ssts_data_bit()で再ビルドせず振れる(正解探索用)。 */
+extern int webx68k_scsi_spc_ssts_data_bit(void);
+/* TCが0(=渡すべきバイトを渡し切った)のとき立てる当てはめのビット。既定$10。
+ * 実測(2026-09-02): データビット単体のパルス化だけでは2コマンド目で止まり、
+ * 掃引(-2)で抜けた瞬間の値が$b0(=$80|$20|$10)だったことから、待ちが2種類
+ * (データ用意済み/TC=0)あり1ビットでは両方を満たせないと判断した。
+ * こちらはパルスではなく、TCが残っている間は落とし0になったら立てたまま
+ * にする。値はwebx68k_scsi_spc_ssts_tc0_bit()で再ビルドせず振れる。 */
+extern int webx68k_scsi_spc_ssts_tc0_bit(void);
 
 uint8_t	SCSIIPL[0x2000];
 
@@ -1133,6 +1157,10 @@ void SCSI_Cleanup(void)
 #define SCSI_SPC_ADR_INTS   0x00ea0009	/* 割り込み要因(当てはめ) */
 #define SCSI_SPC_ADR_SSTS   0x00ea000d	/* SPCステータス(当てはめ)。bit7=セレクト成立中(実測: 後述のSCSI_SpcSstsSetBit7コメント参照) */
 #define SCSI_SPC_ADR_TEMP   0x00ea0017	/* テンポラリレジスタ(当てはめ)。0以外でイメージありとみなす */
+#define SCSI_SPC_ADR_DREG   0x00ea0015	/* データレジスタ(当てはめ)。CDB/データ本体の1バイトずつの受け渡し口 */
+#define SCSI_SPC_ADR_TCH    0x00ea0019	/* 転送カウンタ(当てはめ、上位バイトと仮定) */
+#define SCSI_SPC_ADR_TCM    0x00ea001b	/* 転送カウンタ(当てはめ、中位バイトと仮定) */
+#define SCSI_SPC_ADR_TCL    0x00ea001d	/* 転送カウンタ(当てはめ、下位バイトと仮定) */
 #define SCSI_SPC_ADR_PCTL   0x00ea0011	/* パリティ制御レジスタ(当てはめ)。実測: 本物ROMが再試行の入口
 					 * ($ea1030)でここへ$00を書いたあと $ea1034 でSSTSを読みに
 					 * 来ており、bit7が立ったままだと $ea1038 で無限ループする
@@ -1184,6 +1212,60 @@ static void SCSI_SpcSstsSetBit7Reason(int on, const char *reason)
 			on ? 1 : 0, reason ? reason : "?", (unsigned)m68000_get_reg(M68K_PC));
 }
 
+/* DATAIN中に渡すべきバイトが残っている間、SSTSへ立てる当てはめのビット
+ * (既定 $08、webx68k_scsi_spc_ssts_data_bit()参照)。bit7とは別にOR/AND-NOTする。
+ * bit7の状態機械(SCSI_SpcSstsSetBit7Reason)と同じく、webx68k_scsi_spc_ssts()が
+ * 既定(-1)のときだけ働かせる(固定値/掃引モードでは触らない)。 */
+static void SCSI_SpcSstsSetDataBit(int on, const char *reason)
+{
+	int idx = SCSI_SpcRegIndex(SCSI_SPC_ADR_SSTS);
+	int cfg = webx68k_scsi_spc_ssts_data_bit();
+	uint8_t bit, before, after;
+
+	if (webx68k_scsi_spc_ssts() != -1)
+		return;	/* 固定値/掃引モードでは状態機械を使わない */
+	if (cfg < 0)
+		return;	/* -2(掃引)は読み出し時にSCSI_SpcSstsDataSweepReadが動的計算するため、
+			 * ここでは登録済みレジスタへ固定ビットを立てない */
+
+	bit = (uint8_t)cfg;
+	before = SCSISpcReg[idx];
+	after = on ? (uint8_t)(before | bit) : (uint8_t)(before & (uint8_t)~bit);
+	if (after == before)
+		return;
+	SCSISpcReg[idx] = after;
+
+	if (log_cb && SCSI_BusLogGate())
+		log_cb(RETRO_LOG_INFO, "[SCSI-SPC] SSTS データビット($%02x)=%d (理由=%s, pc=$%08x)\n",
+			bit, on ? 1 : 0, reason ? reason : "?", (unsigned)m68000_get_reg(M68K_PC));
+}
+
+/* TCが0のとき立てる当てはめのビット(既定$10、webx68k_scsi_spc_ssts_tc0_bit()
+ * 参照)。データビットとは独立にOR/AND-NOTする。パルスにはしない(TCが
+ * 残っている間は落としたまま、0になったら立てたままにする、という当てはめ)。 */
+static void SCSI_SpcSstsSetTc0Bit(int on, const char *reason)
+{
+	int idx = SCSI_SpcRegIndex(SCSI_SPC_ADR_SSTS);
+	int cfg = webx68k_scsi_spc_ssts_tc0_bit();
+	uint8_t bit, before, after;
+
+	if (webx68k_scsi_spc_ssts() != -1)
+		return;	/* 固定値/掃引モードでは状態機械を使わない */
+	if (cfg < 0)
+		return;
+
+	bit = (uint8_t)cfg;
+	before = SCSISpcReg[idx];
+	after = on ? (uint8_t)(before | bit) : (uint8_t)(before & (uint8_t)~bit);
+	if (after == before)
+		return;
+	SCSISpcReg[idx] = after;
+
+	if (log_cb && SCSI_BusLogGate())
+		log_cb(RETRO_LOG_INFO, "[SCSI-SPC] SSTS TC0ビット($%02x)=%d (理由=%s, pc=$%08x)\n",
+			bit, on ? 1 : 0, reason ? reason : "?", (unsigned)m68000_get_reg(M68K_PC));
+}
+
 
 /* セレクト(SCMD書き込みで上位3bitが$001)への応答。
  * 「TEMPが0以外、かつホスト側にイメージがある」を成功条件とする
@@ -1193,6 +1275,11 @@ static void SCSI_SpcSstsSetBit7Reason(int on, const char *reason)
  * 成功時は SSTS/PSNS にもホスト指定値を反映する。SSTSは既定(-1)なら
  * SCSI_SpcSstsSetBit7 の状態機械に任せ、それ以外(固定値/掃引)は
  * 従来どおりの扱い。 */
+/* SCSI_SpcSelectCheck の成否を、後段(SCSI_SpcWrite)から見えるようにする置き場。
+ * COMMANDフェーズへ入るのはSetPhase(定義は下の状態機械ブロック)経由なので、
+ * SelectCheck自体はこのフラグを立てるだけにする。 */
+static int SCSISpcSelectOk = 0;
+
 static void SCSI_SpcSelectCheck(uint8_t scmd)
 {
 	int idx_ints = SCSI_SpcRegIndex(SCSI_SPC_ADR_INTS);
@@ -1208,6 +1295,7 @@ static void SCSI_SpcSelectCheck(uint8_t scmd)
 	temp = SCSISpcReg[idx_temp];
 	size = webx68k_scsi_get_size();
 	ok = (temp != 0 && size > 0);
+	SCSISpcSelectOk = ok;
 
 	ints_bit = (uint8_t)(ok ? webx68k_scsi_spc_ints_sel() : webx68k_scsi_spc_ints_timeout());
 	SCSISpcReg[idx_ints] |= ints_bit;
@@ -1236,6 +1324,620 @@ static void SCSI_SpcSelectCheck(uint8_t scmd)
 			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] セレクト成功でssts=$%02x psns=$%02x を設定\n",
 				(unsigned)SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_SSTS)],
 				(unsigned)SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_PSNS)]);
+	}
+}
+
+/* ---- SPCの転送状態機械(COMMAND/DATAIN/STATUS/MSGIN) ----
+ *
+ * 実測(本物SCSI ROMの観測): セレクト成立後、ROMは
+ *   PCTL($ea0011)=$02, TEMP($ea0017)=$00, SCMD($ea0005)=$ec(上位3bit=111)
+ * の順に書いたあと、pc=$ea144a で PSNS($ea000b) をポーリングし続ける。
+ * 固定値では抜けず、2値($8a と $0a)を交互に返すと抜けた
+ * (=ハンドシェイク待ちである、という実測)。
+ *
+ * ここから先の「COMMAND/DATAIN/STATUS/MSGINという名前」「フェーズビットの
+ * 値($02/$01/$03/$07)」「REQ($80)や接続中($08)の解釈」「DREGという名前」
+ * 「CDB長の判定規則(先頭バイトで6/10バイト)」は、いずれもSCSI一般知識
+ * からの当てはめであり実測ではない。実測として言えるのは冒頭の書き込み
+ * 順序とPSNSが2値を交互に返すと抜ける、という2点のみ。
+ *
+ * この状態機械が働くのは webx68k_scsi_spc_psns() が既定値(-1)のときだけ。
+ * -2(掃引)/-3(交互)/0以上(固定)のときは、従来どおりそちらを優先し、
+ * この状態機械は一切関与しない(SCSI_SpcSweepRead 側の分岐、および
+ * SCSI_SpcWrite 内の呼び出し箇所を参照)。
+ *
+ * ログは [SCSI-BUS] と共通の総件数上限(SCSI_BusLogGate)は掛けるが、
+ * 「同一PCから32件で以後抑制」する圧縮(SCSI_BusPcAllow)は掛けない。
+ * COMMAND/DATAINの1バイトずつの書き込み・読み出しはほぼ同一PCから
+ * 連続して起きるため、そちらを掛けると観測したい中身が消えてしまう
+ * (掃引/交互モードのログが同じ理由でSCSI_BusPcAllowを回避しているのと
+ * 同様の判断)。その代わりDREGの1バイトログ自体は先頭300件で打ち切り、
+ * 以後は件数のみ数える。 */
+
+typedef enum {
+	SCSI_SPC_PHASE_BUSFREE = 0,
+	SCSI_SPC_PHASE_COMMAND,
+	SCSI_SPC_PHASE_DATAIN,
+	SCSI_SPC_PHASE_STATUS,
+	SCSI_SPC_PHASE_MSGIN
+} SCSI_SpcPhase_t;
+
+static SCSI_SpcPhase_t SCSISpcPhase = SCSI_SPC_PHASE_BUSFREE;
+
+/* CDB(コマンド記述子)を最大16バイトまで溜める。 */
+static uint8_t SCSISpcCdb[16];
+static int SCSISpcCdbLen = 0;		/* ここまでに受け取った本数 */
+static int SCSISpcCdbExpected = 0;	/* 先頭バイトから決めた予定本数(6 or 10)。0=未確定 */
+
+/* DATAIN応答データのバッファ。64KB(=128セクタ)まで。実測目的の範囲では
+ * 十分大きいはずだが、それを超える要求が来た場合は切り詰めてログに残す。 */
+#define SCSI_SPC_DATA_BUF_MAX (64 * 1024)
+static uint8_t SCSISpcDataBuf[SCSI_SPC_DATA_BUF_MAX];
+static int SCSISpcDataLen = 0;
+static int SCSISpcDataPos = 0;
+
+/* REQのハンドシェイク用: DREGへの1バイトアクセスが起きるたびに1を立て、
+ * 「次のPSNS読み出し」だけREQを落とし、その時点で0に戻す(=その次からは
+ * また立つ)。SCSI_SpcPhasePsns 参照。 */
+static int SCSISpcReqLow = 0;
+
+/* SSTSデータビットの「パルス」化用(2026-09-02の実測: 固定値では通らず、
+ * 掃引(-2)でだけ通った→「値が変わること」自体を見ているハンドシェイクだと
+ * 判明)。REQと同じ作りで、DREGへの1バイト読み出しが起きるたびに1を立て、
+ * 「次のSSTS読み出し」だけデータビットを落とし、その時点で0に戻す
+ * (=その次からはまた立つ)。SCSI_SpcSstsPulseRead 参照。 */
+static int SCSISpcSstsDataBitLow = 0;
+
+/* 転送カウンタ(TC)の実体。SCSI_SpcXferStartData(SCMD上位3bit=100)で
+ * TCH/TCM/TCLから読み取った値を初期値とし、DATAINで1バイト渡すたびに
+ * 1減らす。TCH/TCM/TCLレジスタそのものは書き戻さない(実測されていない
+ * ため当てはめで動かすのはリスクが高い)。0になったらSSTSのTC0ビット
+ * (当てはめ)を立てる。 */
+static int SCSISpcXferTc = 0;
+
+/* DREGのバイトログの打ち切り(先頭300件、以後は件数のみ)。 */
+#define SCSI_SPC_DREG_LOG_MAX 300
+static int SCSISpcDregTotal = 0;
+
+static int SCSI_SpcDregLogGate(void)
+{
+	int allow = (SCSISpcDregTotal < SCSI_SPC_DREG_LOG_MAX);
+	SCSISpcDregTotal++;
+	if (SCSISpcDregTotal == SCSI_SPC_DREG_LOG_MAX && log_cb)
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-SPC] DREGのバイトログは%d件で打ち切り、以後は件数のみ集計する\n",
+			SCSI_SPC_DREG_LOG_MAX);
+	return allow;
+}
+
+static const char *SCSI_SpcPhaseName(SCSI_SpcPhase_t phase)
+{
+	switch (phase)
+	{
+	case SCSI_SPC_PHASE_BUSFREE: return "BUSFREE";
+	case SCSI_SPC_PHASE_COMMAND: return "COMMAND";
+	case SCSI_SPC_PHASE_DATAIN:  return "DATAIN";
+	case SCSI_SPC_PHASE_STATUS:  return "STATUS";
+	case SCSI_SPC_PHASE_MSGIN:   return "MSGIN";
+	default: return "?";
+	}
+}
+
+/* CDB(先頭 SCSISpcCdbLen バイト、最大16)を16進文字列にしてログへ出す。 */
+static void SCSI_SpcLogCdbHex(const char *label)
+{
+	char buf[16 * 3 + 1];
+	int i, n;
+	static const char hex[] = "0123456789abcdef";
+
+	if (!log_cb || !SCSI_BusLogGate())
+		return;
+
+	n = SCSISpcCdbLen;
+	if (n > 16)
+		n = 16;
+	for (i = 0; i < n; i++)
+	{
+		uint8_t b = SCSISpcCdb[i];
+		buf[i * 3 + 0] = hex[(b >> 4) & 0xf];
+		buf[i * 3 + 1] = hex[b & 0xf];
+		buf[i * 3 + 2] = ' ';
+	}
+	buf[(n > 0) ? (n * 3 - 1) : 0] = '\0';
+
+	log_cb(RETRO_LOG_INFO, "[SCSI-SPC] %s (len=%d): %s\n", label, n, buf);
+}
+
+/* COMMANDフェーズのPSNSフェーズビット値。既定(-1)は当てはめの $02。
+ * webx68k_scsi_spc_phase_bits() で再ビルドせず振れる。 */
+static uint8_t SCSI_SpcPhaseBitsFor(SCSI_SpcPhase_t phase)
+{
+	switch (phase)
+	{
+	case SCSI_SPC_PHASE_COMMAND:
+	{
+		int ov = webx68k_scsi_spc_phase_bits();
+		return (uint8_t)((ov >= 0) ? (ov & 0xff) : 0x02);
+	}
+	case SCSI_SPC_PHASE_DATAIN: return 0x01;
+	case SCSI_SPC_PHASE_STATUS: return 0x03;
+	case SCSI_SPC_PHASE_MSGIN:  return 0x07;
+	default: return 0x00;	/* BUSFREE(当てはめ: フェーズビット無し) */
+	}
+}
+
+/* PSNS読み出し値の組み立て(状態機械が有効なときのみ呼ばれる)。
+ * (REQが立っていれば$80) | $08(接続中) | フェーズのビット、という当てはめ。
+ * REQは「DREGアクセス直後の1回だけ落ち、その次からまた立つ」というパルス
+ * として実装する(SCSISpcReqLow参照)。
+ *
+ * 「状態機械のつもりで返していない」事故を切り分けるため、返す直前の値を
+ * phase/REQの状態つきで先頭50件だけログへ出す(以後は出さない)。 */
+#define SCSI_SPC_PSNS_PHASE_LOG_MAX 50
+static int SCSISpcPsnsPhaseLogCount = 0;
+
+static uint8_t SCSI_SpcPhasePsns(void)
+{
+	uint8_t v;
+	int req_low_pending = SCSISpcReqLow;	/* ログ用: このアクセスでREQを落とすかどうか(消費前の値) */
+
+	if (SCSISpcPhase == SCSI_SPC_PHASE_BUSFREE)
+	{
+		v = 0x00;	/* 接続していない(当てはめ) */
+	}
+	else
+	{
+		v = (uint8_t)(0x08 | SCSI_SpcPhaseBitsFor(SCSISpcPhase));
+		if (!SCSISpcReqLow)
+			v |= 0x80;
+		else
+			SCSISpcReqLow = 0;	/* 1回落としたら次からまた立てる */
+	}
+
+	if (log_cb && SCSI_BusLogGate() && SCSISpcPsnsPhaseLogCount < SCSI_SPC_PSNS_PHASE_LOG_MAX)
+	{
+		SCSISpcPsnsPhaseLogCount++;
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-SPC] PSNS読み出し(状態機械) phase=%s reqLow消費=%d -> $%02x (pc=$%08x)%s\n",
+			SCSI_SpcPhaseName(SCSISpcPhase), req_low_pending, (unsigned)v,
+			(unsigned)m68000_get_reg(M68K_PC),
+			(SCSISpcPsnsPhaseLogCount == SCSI_SPC_PSNS_PHASE_LOG_MAX) ? " (以後この行は抑制)" : "");
+	}
+
+	return v;
+}
+
+/* フェーズ遷移。転送完了([SCSI-SPC]の意味でSTATUSに入った時点、当てはめ)で
+ * INTSへwebx68k_scsi_spc_ints_xfer()のビットを立て、切断(BUSFREEへ入った時点)で
+ * SSTSのbit7を落としINTSへwebx68k_scsi_spc_ints_disc()のビットを立てる。
+ * どちらも当てはめであり実測ではない。 */
+static void SCSI_SpcSetPhase(SCSI_SpcPhase_t phase, const char *reason)
+{
+	SCSI_SpcPhase_t old = SCSISpcPhase;
+	SCSISpcPhase = phase;
+
+	if (log_cb && SCSI_BusLogGate())
+		log_cb(RETRO_LOG_INFO, "[SCSI-SPC] フェーズ遷移 %s -> %s (理由=%s)\n",
+			SCSI_SpcPhaseName(old), SCSI_SpcPhaseName(phase), reason ? reason : "?");
+
+	if (phase == SCSI_SPC_PHASE_STATUS && old != SCSI_SPC_PHASE_STATUS)
+	{
+		int idx_ints = SCSI_SpcRegIndex(SCSI_SPC_ADR_INTS);
+		uint8_t bit = (uint8_t)webx68k_scsi_spc_ints_xfer();
+		SCSISpcReg[idx_ints] |= bit;
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] 転送完了(当てはめ) INTS|=$%02x\n", bit);
+	}
+
+	if (phase == SCSI_SPC_PHASE_BUSFREE)
+	{
+		int idx_ssts = SCSI_SpcRegIndex(SCSI_SPC_ADR_SSTS);
+		int idx_ints = SCSI_SpcRegIndex(SCSI_SPC_ADR_INTS);
+		uint8_t bit = (uint8_t)webx68k_scsi_spc_ints_disc();
+		SCSISpcReg[idx_ssts] &= (uint8_t)~0x80;
+		SCSISpcReg[idx_ints] |= bit;
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] 切断(当てはめ) SSTS bit7=0, INTS|=$%02x\n", bit);
+	}
+}
+
+/* CDBが確定したところでコマンドを解釈し、応答を組み立てる。
+ * 対応コマンドはTEST UNIT READY($00)/INQUIRY($12)/READ CAPACITY($25)/
+ * READ(6)($08)/READ(10)($28)のみ。それ以外はデータ無しでSTATUSへ進める。
+ * 応答データがあればDATAINへ、無ければ直接STATUSへ遷移する。 */
+static void SCSI_SpcHandleCommand(void)
+{
+	uint8_t op = SCSISpcCdb[0];
+
+	SCSISpcDataLen = 0;
+	SCSISpcDataPos = 0;
+
+	switch (op)
+	{
+	case 0x00:	/* TEST UNIT READY */
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] コマンド=TEST UNIT READY -> データ無し\n");
+		break;
+
+	case 0x12:	/* INQUIRY: 36バイト固定応答 */
+	{
+		uint8_t *b = SCSISpcDataBuf;
+		memset(b, 0x20, 36);
+		b[0] = 0x00;	/* 直接アクセスデバイス */
+		b[1] = 0x00;
+		b[2] = 0x02;
+		b[3] = 0x02;
+		b[4] = 0x1f;
+		memcpy(b + 8, "WebX68k ", 8);
+		memcpy(b + 16, "SCSI DISK       ", 16);
+		memcpy(b + 32, "1.0 ", 4);
+		SCSISpcDataLen = 36;
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] コマンド=INQUIRY -> 36バイト応答\n");
+		break;
+	}
+
+	case 0x25:	/* READ CAPACITY(10): 8バイト(最終LBA + ブロック長512) */
+	{
+		int size = webx68k_scsi_get_size();
+		unsigned int last_lba = (size > 512) ? ((unsigned int)(size / 512) - 1) : 0;
+		uint8_t *b = SCSISpcDataBuf;
+		b[0] = (uint8_t)((last_lba >> 24) & 0xff);
+		b[1] = (uint8_t)((last_lba >> 16) & 0xff);
+		b[2] = (uint8_t)((last_lba >> 8) & 0xff);
+		b[3] = (uint8_t)(last_lba & 0xff);
+		b[4] = 0x00;
+		b[5] = 0x00;
+		b[6] = 0x02;
+		b[7] = 0x00;
+		SCSISpcDataLen = 8;
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-SPC] コマンド=READ CAPACITY size=%d -> last_lba=%u block=512\n",
+				size, last_lba);
+		break;
+	}
+
+	case 0x08:	/* READ(6) */
+	case 0x28:	/* READ(10) */
+	{
+		unsigned int lba, count, i, bytes;
+		int ok = 1;
+
+		if (op == 0x08)
+		{
+			lba = ((unsigned int)(SCSISpcCdb[1] & 0x1f) << 16)
+				| ((unsigned int)SCSISpcCdb[2] << 8) | SCSISpcCdb[3];
+			count = (SCSISpcCdb[4] == 0) ? 256u : SCSISpcCdb[4];
+		}
+		else
+		{
+			lba = ((unsigned int)SCSISpcCdb[2] << 24) | ((unsigned int)SCSISpcCdb[3] << 16)
+				| ((unsigned int)SCSISpcCdb[4] << 8) | SCSISpcCdb[5];
+			count = ((unsigned int)SCSISpcCdb[7] << 8) | SCSISpcCdb[8];
+		}
+
+		bytes = count * 512u;
+		if (bytes > SCSI_SPC_DATA_BUF_MAX)
+		{
+			if (log_cb && SCSI_BusLogGate())
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-SPC] READ(%d) lba=%u count=%u はバッファ上限(%dバイト)を超えるため切り詰める\n",
+					(op == 0x08) ? 6 : 10, lba, count, SCSI_SPC_DATA_BUF_MAX);
+			count = SCSI_SPC_DATA_BUF_MAX / 512u;
+			bytes = count * 512u;
+		}
+
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] コマンド=READ(%d) lba=%u count=%u\n",
+				(op == 0x08) ? 6 : 10, lba, count);
+
+		for (i = 0; i < count; i++)
+		{
+			if (webx68k_scsi_read_sector(lba + i, SCSISpcDataBuf + i * 512) != 0)
+			{
+				ok = 0;
+				break;
+			}
+		}
+
+		if (!ok)
+		{
+			if (log_cb && SCSI_BusLogGate())
+				log_cb(RETRO_LOG_INFO, "[SCSI-SPC] READ セクタ読み出しに失敗(lba=%u)\n", lba + i);
+			bytes = 0;
+		}
+		SCSISpcDataLen = (int)bytes;
+		break;
+	}
+
+	default:
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] 未対応のコマンド op=$%02x -> データ無し\n", op);
+		break;
+	}
+
+	if (SCSISpcDataLen > 0)
+		SCSI_SpcSetPhase(SCSI_SPC_PHASE_DATAIN, "コマンド応答データあり");
+	else
+		SCSI_SpcSetPhase(SCSI_SPC_PHASE_STATUS, "コマンド応答データ無し");
+}
+
+/* DREG($ea0015)への書き込み。COMMANDフェーズ中のみ意味を持ち、CDBの
+ * 1バイトとして溜める。SCSIのCDB長は先頭バイトで決まる
+ * ($00〜$1fは6バイト、$20〜$5fは10バイト。これは知識であり、
+ * 実測で確かめる対象である)。6バイト受け取った時点で、CDB全体を
+ * (予定が6バイトでも10バイトでも)いったんログへ出す。 */
+/* CDBの1バイトを受け取ったときの共通処理。srcはログ表示用のラベル
+ * ("DREG" または "TEMP,仮説")で、口が2つ(DREG/TEMP)あることをログで
+ * 区別できるようにする(下のコメント、および webx68k_scsi_spc_cdb_from_temp
+ * 参照)。 */
+static void SCSI_SpcCommandByteGeneric(uint8_t data, const char *src)
+{
+	int allow_log = SCSI_SpcDregLogGate();
+
+	if (SCSISpcCdbLen < 16)
+		SCSISpcCdb[SCSISpcCdbLen] = data;
+	SCSISpcCdbLen++;
+
+	if (SCSISpcCdbLen == 1)
+	{
+		if (data <= 0x1f)
+			SCSISpcCdbExpected = 6;
+		else if (data <= 0x5f)
+			SCSISpcCdbExpected = 10;
+		else
+		{
+			SCSISpcCdbExpected = 6;	/* 未知のグループ。とりあえず6バイトと仮定する(当てはめ) */
+			if (log_cb && SCSI_BusLogGate())
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-SPC] 未知のCDBグループ op=$%02x (6バイトと仮定、当てはめ)\n", data);
+		}
+	}
+
+	if (log_cb && allow_log && SCSI_BusLogGate())
+		log_cb(RETRO_LOG_INFO, "[SCSI-SPC] COMMAND書き込み(経路=%s) n=%d/%d data=$%02x\n",
+			src, SCSISpcCdbLen, SCSISpcCdbExpected, data);
+
+	if (SCSISpcCdbLen == 6)
+		SCSI_SpcLogCdbHex("CDB(6バイト時点)");
+
+	SCSISpcReqLow = 1;	/* このアクセス直後の1回だけREQを落とし、その次からまた立てる */
+
+	if (SCSISpcCdbExpected > 0 && SCSISpcCdbLen >= SCSISpcCdbExpected)
+	{
+		if (SCSISpcCdbExpected != 6)
+			SCSI_SpcLogCdbHex("CDB確定");
+		SCSI_SpcHandleCommand();
+	}
+}
+
+/* DREG($ea0015)への書き込み経由でCDBの1バイトを受け取る(当初の当てはめ)。 */
+static void SCSI_SpcCommandByte(uint8_t data)
+{
+	SCSI_SpcCommandByteGeneric(data, "DREG");
+}
+
+/* TEMP($ea0017)経由でCDBの1バイトを受け取る(2026-09-02の仮説、未実測)。
+ * 実測の並びが「PCTL=$02 書き込み→PSNS読み出し→TEMPへの1バイト書き込み→
+ * SCMD上位3bit=111(転送コマンド)書き込み→pc=$ea144aでPSNSをポーリング」
+ * の繰り返しに見えたため、「転送コマンドの書き込みそのものが、直前に
+ * TEMPへ書かれた1バイトをCDBとして送った合図である」という仮説を立てて
+ * 実装する。webx68k_scsi_spc_cdb_from_temp()が真(既定)のときだけ、
+ * SCSI_SpcXferStart から呼ばれる。 */
+static void SCSI_SpcCommandByteFromTemp(void)
+{
+	uint8_t data = SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_TEMP)];
+	SCSI_SpcCommandByteGeneric(data, "TEMP,仮説");
+}
+
+/* DATAIN/STATUS/MSGINフェーズで、こちら(デバイス側)からホストへ渡す
+ * 次の1バイトを取り出す共通処理。srcはログ表示用のラベルで、
+ * 「DREGの読み出しで来た」のか「SCMD書き込み(転送コマンド)がバイト
+ * 授受の合図、という仮説の経路で来た」のかを区別できるようにする
+ * (詳細は SCSI_SpcXferStart のコメント参照)。
+ * STATUS/MSGINは仕様どおり(当てはめ)常に1バイト$00とする。 */
+static uint8_t SCSI_SpcPhaseOutputByte(const char *src)
+{
+	uint8_t v = 0x00;
+	int allow_log = SCSI_SpcDregLogGate();
+
+	switch (SCSISpcPhase)
+	{
+	case SCSI_SPC_PHASE_DATAIN:
+		if (SCSISpcDataPos < SCSISpcDataLen)
+		{
+			v = SCSISpcDataBuf[SCSISpcDataPos++];
+			if (SCSISpcXferTc > 0)
+				SCSISpcXferTc--;	/* TCを実際に減らす(当てはめ、TCH/TCM/TCLレジスタ自体は書き戻さない) */
+		}
+		if (log_cb && allow_log && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] DATAIN受け渡し(経路=%s) pos=%d/%d TC残り=%d data=$%02x\n",
+				src, SCSISpcDataPos, SCSISpcDataLen, SCSISpcXferTc, v);
+		SCSISpcReqLow = 1;
+		if (SCSISpcXferTc <= 0)
+		{
+			/* TCが0(=渡すべきバイトが残っていない)になった。SSTSの
+			 * データビット(当てはめ)を落としTC0ビット(当てはめ)を立てる。
+			 * INTS|=ints_xferはSetPhaseのSTATUS入場処理に任せてSTATUSへ
+			 * 進む。 */
+			SCSI_SpcSstsSetDataBit(0, "DATAIN完了");
+			SCSI_SpcSstsSetTc0Bit(1, "TC=0");
+			SCSI_SpcSetPhase(SCSI_SPC_PHASE_STATUS, "DATAIN完了(TC=0)");
+		}
+		else
+		{
+			/* 実測(2026-09-02): SSTSデータビットは固定値では通らず、
+			 * 掃引(-2)でだけ通った→「値が変わること」自体を見ている
+			 * ハンドシェイクだった。REQと同じパルス化: 1バイト渡した
+			 * 直後の1回だけSSTS読み出しでデータビットを落とし、その次
+			 * からまた立てる(SCSI_SpcSstsPulseRead参照)。 */
+			SCSISpcSstsDataBitLow = 1;
+		}
+		break;
+
+	case SCSI_SPC_PHASE_STATUS:
+		v = 0x00;
+		if (log_cb && allow_log && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] STATUS受け渡し(経路=%s) data=$00\n", src);
+		SCSISpcReqLow = 1;
+		SCSI_SpcSetPhase(SCSI_SPC_PHASE_MSGIN, "STATUS完了");
+		break;
+
+	case SCSI_SPC_PHASE_MSGIN:
+		v = 0x00;
+		if (log_cb && allow_log && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] MSGIN受け渡し(経路=%s) data=$00\n", src);
+		SCSISpcReqLow = 1;
+		SCSI_SpcSetPhase(SCSI_SPC_PHASE_BUSFREE, "MSGIN完了(切断)");
+		break;
+
+	default:
+		break;
+	}
+
+	return v;
+}
+
+
+/* SCMD($ea0005)の上位3bitが$111(=$e0)で書かれたら転送開始とみなす
+ * (未実測の当てはめ)。TCH/TCM/TCL(実測: どの並びかは不明)から転送予定
+ * バイト数を組み立て、両方の並びをログへ出す。COMMANDフェーズへ入り
+ * REQを立てる(=ROMが最初のCDBバイトを送れる状態にする)。 */
+/* COMMANDフェーズへ入る共通処理(CDBバッファをリセットし、REQを立てる)。
+ * セレクト成立の直後(SCSI_SpcWrite参照)と、転送開始(SCMD上位3bit=111)の
+ * どちらからも呼ばれる。 */
+static void SCSI_SpcEnterCommandPhase(const char *reason)
+{
+	SCSISpcCdbLen = 0;
+	SCSISpcCdbExpected = 0;
+	SCSISpcDataLen = 0;
+	SCSISpcDataPos = 0;
+	SCSISpcReqLow = 0;	/* 開始直後はREQを立てる(当てはめ): 最初のCDBバイトを送らせる */
+
+	SCSI_SpcSetPhase(SCSI_SPC_PHASE_COMMAND, reason);
+}
+
+/* SCMD上位3bit=111(転送コマンド)が書かれたときの処理。
+ *
+ * 実測(2026-09-02、その1): 状態機械導入後、ROMはセレクト成立直後から
+ * COMMANDフェーズのPSNS($8a)を読み続けるだけでDREG($ea0015)には一切書かず、
+ * 代わりに「PCTL=$02書き込み→PSNS読み出し→TEMP($ea0017)へ1バイト
+ * 書き込み→SCMD上位3bit=111書き込み→pc=$ea144aでPSNSポーリング」という
+ * 並びを繰り返していた。ここから「CDBはDREGではなくTEMP経由で1バイト
+ * ずつ送られ、転送コマンドの書き込み自体がその合図である」という仮説を
+ * 立てた(未実測、webx68k_scsi_spc_cdb_from_temp()で切り替え可能)。
+ * 実測(2026-09-02、その2): この仮説どおりCDBが6バイト届いてSTATUSへ
+ * 進んだあとも、ROMは同じ並び(PCTL=$03書き込み→PSNS読み出し→転送コマンド
+ * 書き込み→pc=$ea1486でPSNSポーリング)を繰り返した。これを見て、
+ * 「転送コマンドの書き込みがバイト授受の合図」という仮説をCOMMAND以外の
+ * DATAIN/STATUS/MSGINにも広げる(いずれも未実測の当てはめ)。
+ *
+ * webx68k_scsi_spc_cdb_from_temp() が真(既定)のときは、
+ *   - COMMANDフェーズ中: 転送コマンド書き込みをTEMP経由のCDBバイト到着として扱う。
+ *   - DATAIN/STATUS/MSGINフェーズ中: 応答バッファの次の1バイトを取り出し、
+ *     ROMがどちらを読むか未確定なため TEMP($ea0017) と DREG($ea0015) の
+ *     両方の保持値へ同じ値を置く(実際にどちらを読んだかは[SCSI-BUS]の
+ *     生ログから後で分かる)。
+ * 偽(0)のときは従来どおり(このアクセス自体でCOMMANDフェーズへ入り直す
+ * だけで、CDB/応答データはいずれもDREGへのアクセスを待つ)。 */
+static void SCSI_SpcXferStart(void)
+{
+	uint8_t b_tch = SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_TCH)];
+	uint8_t b_tcm = SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_TCM)];
+	uint8_t b_tcl = SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_TCL)];
+	unsigned int as_tch_tcm_tcl = ((unsigned int)b_tch << 16) | ((unsigned int)b_tcm << 8) | b_tcl;
+	unsigned int as_tcl_tcm_tch = ((unsigned int)b_tcl << 16) | ((unsigned int)b_tcm << 8) | b_tch;
+
+	if (log_cb && SCSI_BusLogGate())
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-SPC] 転送コマンド書き込み(phase=%s) 予定バイト数(TCH,TCM,TCL解釈)=%u 予定バイト数(TCL,TCM,TCH解釈)=%u\n",
+			SCSI_SpcPhaseName(SCSISpcPhase), as_tch_tcm_tcl, as_tcl_tcm_tch);
+
+	if (webx68k_scsi_spc_cdb_from_temp())
+	{
+		if (SCSISpcPhase == SCSI_SPC_PHASE_COMMAND)
+		{
+			SCSI_SpcCommandByteFromTemp();
+		}
+		else if (SCSISpcPhase == SCSI_SPC_PHASE_DATAIN
+			|| SCSISpcPhase == SCSI_SPC_PHASE_STATUS
+			|| SCSISpcPhase == SCSI_SPC_PHASE_MSGIN)
+		{
+			uint8_t v = SCSI_SpcPhaseOutputByte("SCMD書き込み,仮説");
+			SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_TEMP)] = v;
+			SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_DREG)] = v;
+		}
+		else if (log_cb && SCSI_BusLogGate())
+		{
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-SPC] 転送コマンド書き込みだがBUSFREEのため無視(仮説)\n");
+		}
+	}
+	else
+	{
+		SCSI_SpcEnterCommandPhase("転送開始(SCMD上位3bit=111)");
+	}
+}
+
+/* SCMD上位3bit=100($80)が書かれたときの処理(未実測の当てはめ)。
+ *
+ * 実測(2026-09-02): TEST UNIT READY応答(STATUS/MSGIN、SCMD上位3bit=111の
+ * 書き込みで駆動)のあと、READ CAPACITYのCDBが届きDATAINへ入った時点で
+ * ROMは別の手順を使った: PCTL=$01書き込み→TC(TCH=$ea0019/TCM=$ea001b/
+ * TCL=$ea001d)へ8を書き込み→INTSクリア→SCMD上位3bit=100($80)書き込み、
+ * という並びのあとpc=$ea13deでSSTS($ea000d)を95回ポーリングし続けた
+ * (応答長8はREAD CAPACITYの8バイトと一致)。111とは異なる値であることから
+ * COMMAND/STATUS/MSGINの「1バイトごとに転送コマンドを書く」手順とは別の、
+ * DATAIN専用の「まとめて転送を開始する」合図だろう、という当てはめ。
+ *
+ * ここでは「SSTSに専用のデータビット(当てはめ、既定$08)を立てて、ROMは
+ * それをポーリングして待っている」という仮説で実装する。実際にDREG/TEMPの
+ * どちらを読むかはSCSI_Read側で両方の口を開けてあるので、読まれた時点で
+ * SCSI_SpcPhaseOutputByte が1バイトずつ渡す。応答データそのものは
+ * SCSI_SpcHandleCommand が既に用意したバッファ(SCSISpcDataBuf/Len)を
+ * そのまま使う(TCは長さの裏取りのためログに出すだけで、上書きはしない)。 */
+static void SCSI_SpcXferStartData(void)
+{
+	uint8_t b_tch = SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_TCH)];
+	uint8_t b_tcm = SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_TCM)];
+	uint8_t b_tcl = SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_TCL)];
+	unsigned int tc = ((unsigned int)b_tch << 16) | ((unsigned int)b_tcm << 8) | b_tcl;
+	int remaining = SCSISpcDataLen - SCSISpcDataPos;
+
+	if (log_cb && SCSI_BusLogGate())
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-SPC] 転送コマンド書き込み(上位3bit=100、仮説, phase=%s) TC(TCH,TCM,TCL)=%u 応答残り=%d\n",
+			SCSI_SpcPhaseName(SCSISpcPhase), tc, remaining);
+
+	if (SCSISpcPhase != SCSI_SPC_PHASE_DATAIN)
+	{
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-SPC] 転送コマンド(上位3bit=100)書き込みだがDATAINフェーズ外(phase=%s)のため無視(仮説)\n",
+				SCSI_SpcPhaseName(SCSISpcPhase));
+		return;
+	}
+
+	if (tc != (unsigned int)remaining && log_cb && SCSI_BusLogGate())
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-SPC] TC(%u)と応答残りバイト数(%d)が一致しない(要再確認、仮説)\n",
+			tc, remaining);
+
+	/* TCの実体を初期化する(当てはめ: TCH/TCM/TCLではなく応答残りバイト数を
+	 * 正とし、TCレジスタの値は裏取りのログにのみ使う。理由はSCSI_SpcXferStartData
+	 * 冒頭のコメント参照)。 */
+	SCSISpcXferTc = remaining;
+
+	if (remaining > 0)
+	{
+		SCSISpcSstsDataBitLow = 0;	/* 開始直後はパルスの「落ち」を保留しない(まず立てて見せる) */
+		SCSI_SpcSstsSetDataBit(1, "DATAIN転送開始(SCMD上位3bit=100、仮説)");
+		SCSI_SpcSstsSetTc0Bit(0, "DATAIN転送開始(TC>0、仮説)");
+	}
+	else
+	{
+		SCSI_SpcSstsSetTc0Bit(1, "DATAIN転送開始だがTC=0(仮説)");
 	}
 }
 
@@ -1282,6 +1984,23 @@ static void SCSI_SpcWrite(uint32_t adr, uint8_t data)
 		SCSI_SpcSelectCheck(data);
 		if ((data & 0xe0) == 0x00)
 			SCSI_SpcSstsSetBit7Reason(0, "SCMDバス開放");	/* バス開放(上位3bit=$000)でbit7を落とす */
+		else if ((data & 0xe0) == 0x20 && SCSISpcSelectOk && webx68k_scsi_spc_psns() == -1)
+			/* 実測(2026-09-02): セレクト成立の時点でROMは既にPSNS=$8a
+			 * (REQ|接続中|COMMAND)を期待して読みに来ており、転送開始
+			 * (SCMD上位3bit=111)を待っていなかった。セレクト成立の
+			 * 時点でCOMMANDフェーズへ入れる(未実測の当てはめ)。 */
+			SCSI_SpcEnterCommandPhase("セレクト成立");
+		else if ((data & 0xe0) == 0xe0 && webx68k_scsi_spc_psns() == -1)
+			SCSI_SpcXferStart();	/* 転送開始(上位3bit=$111、未実測の当てはめ)。状態機械が有効なときだけ */
+		else if ((data & 0xe0) == 0x80 && webx68k_scsi_spc_psns() == -1)
+			SCSI_SpcXferStartData();	/* DATAIN専用の転送開始(上位3bit=$100、未実測の当てはめ) */
+	}
+	else if (adr == SCSI_SPC_ADR_DREG)
+	{
+		/* COMMANDフェーズ中のCDB受け取り。状態機械が有効(webx68k_scsi_spc_psns()==-1)
+		 * なときだけ意味を持たせる(SCSI_SpcCommandByte参照)。 */
+		if (webx68k_scsi_spc_psns() == -1 && SCSISpcPhase == SCSI_SPC_PHASE_COMMAND)
+			SCSI_SpcCommandByte(data);
 	}
 	else if (adr == SCSI_SPC_ADR_SCTL)
 	{
@@ -1331,6 +2050,80 @@ static uint8_t SCSISpcPsnsAltNextIsB = 0;
 static int SCSISpcPsnsAltLogCount = 0;
 #define SCSI_SPC_PSNS_ALT_LOG_MAX 200
 
+/* SSTSデータビットの「掃引」モード(webx68k_scsi_spc_ssts_data_bit()が-2)。
+ *
+ * 実測(2026-09-02): READ CAPACITY応答(DATAIN、TC=8)のあと、固定ビット
+ * ($08含む)を試しても pc=$ea13de で $ea000d(SSTS)を95回以上ポーリングし
+ * 続けて抜けなかった。ポーリング回数が多いため、待っているビットの当たりを
+ * つけるのに掃引が効く(PSNS/SSTSの掃引と同じ発想)。DATAINで渡すべき
+ * バイトが残っている間のSSTS読み出しに限り、$80(接続中、これは常に
+ * 立てたままにする。実測で落とすと別の待ちが壊れることを確認済み)に
+ * 0〜255を1ずつ変えた値をORして返す。DATAIN以外のフェーズや、渡すべき
+ * バイトが残っていない状態のSSTSは従来どおり(SCSI_SpcSstsSetBit7Reason /
+ * SCSI_SpcSstsSetDataBitが管理する値をそのまま使う)で、この掃引には
+ * 一切関与しない(切り分けが壊れるため)。 */
+#define SCSI_SPC_SSTS_DATA_SWEEP_LOG_MAX 200
+static uint8_t SCSISpcSstsDataSweepNext = 0;
+static int SCSISpcSstsDataSweepLogCount = 0;
+
+/* 掃引を働かせる条件: SSTSデータビット設定が掃引(-2)、SSTS本体が既定(-1、
+ * 状態機械モード)、DATAINフェーズで、渡すべきバイトがまだ残っていること。 */
+static int SCSI_SpcSstsDataSweepActive(void)
+{
+	return (webx68k_scsi_spc_ssts_data_bit() == -2)
+		&& (webx68k_scsi_spc_ssts() == -1)
+		&& (SCSISpcPhase == SCSI_SPC_PHASE_DATAIN)
+		&& (SCSISpcDataPos < SCSISpcDataLen);
+}
+
+static uint8_t SCSI_SpcSstsDataSweepRead(void)
+{
+	uint8_t v = (uint8_t)(0x80 | SCSISpcSstsDataSweepNext);
+	SCSISpcSstsDataSweepNext = (uint8_t)(SCSISpcSstsDataSweepNext + 1);
+
+	if (log_cb && SCSI_BusLogGate() && SCSISpcSstsDataSweepLogCount < SCSI_SPC_SSTS_DATA_SWEEP_LOG_MAX)
+	{
+		SCSISpcSstsDataSweepLogCount++;
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-SPC] SSTSデータビット掃引: 値=$%02x を返した (pc=$%08x)%s\n",
+			(unsigned)v, (unsigned)m68000_get_reg(M68K_PC),
+			(SCSISpcSstsDataSweepLogCount == SCSI_SPC_SSTS_DATA_SWEEP_LOG_MAX) ? " (以後この行は抑制)" : "");
+	}
+
+	return v;
+}
+
+/* SSTSデータビットの「パルス」読み出し(固定値モード、cfg>=0のとき)。
+ * 実測(2026-09-02): 固定ビット($30/$20/$10のいずれも)では2コマンド目で
+ * 止まり、掃引(-2)でだけ通った→ROMは「値が変わること」自体を見ている
+ * ハンドシェイクだと判明。COMMANDフェーズのREQパルスと同じ作りにする:
+ * DREGへの1バイト読み出し直後の1回だけこのビットを落として返し、
+ * その次からはまた立てて返す(SCSISpcSstsDataBitLow参照)。 */
+static uint8_t SCSI_SpcSstsPulseRead(uint8_t stored)
+{
+	int cfg = webx68k_scsi_spc_ssts_data_bit();
+	uint8_t bit, v;
+
+	if (cfg < 0)
+		return stored;	/* 掃引(-2)はSCSI_SpcSstsDataSweepReadが別途扱う */
+
+	bit = (uint8_t)cfg;
+	v = stored;
+
+	if (SCSISpcSstsDataBitLow && (stored & bit))
+	{
+		v = (uint8_t)(stored & (uint8_t)~bit);
+		SCSISpcSstsDataBitLow = 0;	/* 1回落としたら次からまた立てる(レジスタ側はONのまま) */
+
+		if (log_cb && SCSI_BusLogGate())
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-SPC] SSTSデータビット($%02x)パルス: 今回のみ落として$%02xを返した (pc=$%08x)\n",
+				bit, (unsigned)v, (unsigned)m68000_get_reg(M68K_PC));
+	}
+
+	return v;
+}
+
 static uint8_t SCSI_SpcSweepRead(uint32_t adr, uint8_t stored)
 {
 	int is_psns = (adr == SCSI_SPC_ADR_PSNS);
@@ -1365,6 +2158,15 @@ static uint8_t SCSI_SpcSweepRead(uint32_t adr, uint8_t stored)
 
 		SCSISpcPsnsAltNextIsB = (uint8_t)(SCSISpcPsnsAltNextIsB ^ 1);
 		return v;
+	}
+
+	if (is_psns && cfg == -1)
+	{
+		/* 既定(-1): SCSI_SpcXferStart で始まる転送状態機械に任せる
+		 * (COMMAND/DATAIN/STATUS/MSGIN、詳細は同関数付近のコメント参照)。
+		 * 転送がまだ始まっていなければBUSFREEのまま(=$00、従来どおり
+		 * PSNSが常に0だったのと結果的に同じ)。 */
+		return SCSI_SpcPhasePsns();
 	}
 
 	if (cfg != -2)
@@ -1422,8 +2224,43 @@ uint8_t FASTCALL SCSI_Read(uint32_t adr)
 	if (SCSIUsingRealRom && in_spc)
 	{
 		int idx = SCSI_SpcRegIndex(adr);
+		int in_output_phase = (SCSISpcPhase == SCSI_SPC_PHASE_DATAIN
+			|| SCSISpcPhase == SCSI_SPC_PHASE_STATUS
+			|| SCSISpcPhase == SCSI_SPC_PHASE_MSGIN);
 		data = (idx >= 0) ? SCSISpcReg[idx] : 0;
-		data = SCSI_SpcSweepRead(adr, data);
+		/* 退行の実測(2026-09-02): 一時、TEMP($ea0017)の読み出しもDREGと
+		 * 同じくバイトを「消費して」フェーズを進める側にしたところ、
+		 * TEST UNIT READYのMSGIN応答がROMの意図しないタイミング
+		 * (SCMD書き込みより前のTEMP読み出し)で先にBUSFREEまで進んでしまい、
+		 * 後続のSCMD書き込み(上位3bit=111)がBUSFREE化けした状態を掴んで
+		 * 無視され、再セレクトに来なくなった。トリガー(消費してフェーズを
+		 * 進める側)は実測どおりDREGの読み出しだけに戻す。TEMPは
+		 * SCSI_SpcPhaseOutputByte/SCSI_SpcXferStart側で渡した値をミラーして
+		 * あるだけの受動的な置き場として扱う(読んでも消費しない)。 */
+		if (adr == SCSI_SPC_ADR_DREG && webx68k_scsi_spc_psns() == -1 && in_output_phase)
+		{
+			uint8_t v = SCSI_SpcPhaseOutputByte("DREG読み出し");
+			SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_TEMP)] = v;
+			SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_DREG)] = v;
+			data = v;
+		}
+		else if (adr == SCSI_SPC_ADR_SSTS && SCSI_SpcSstsDataSweepActive())
+		{
+			/* DATAINで渡すべきバイトが残っている間だけの掃引。他のフェーズ・
+			 * 他の状態のSSTSはここを通らず従来どおり(SCSI_SpcSweepRead)。 */
+			data = SCSI_SpcSstsDataSweepRead();
+		}
+		else if (adr == SCSI_SPC_ADR_SSTS && webx68k_scsi_spc_ssts() == -1
+			&& webx68k_scsi_spc_ssts_data_bit() >= 0)
+		{
+			/* 固定値モード(cfg>=0)でのパルス化。既定($08)含め、
+			 * SCSI_SpcSstsPulseRead参照。 */
+			data = SCSI_SpcSstsPulseRead((idx >= 0) ? SCSISpcReg[idx] : 0);
+		}
+		else
+		{
+			data = SCSI_SpcSweepRead(adr, data);
+		}
 	}
 	else
 	{
