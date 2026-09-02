@@ -89,6 +89,69 @@ extern int webx68k_scsi_spc_ssts_data_bit(void);
  * にする。値はwebx68k_scsi_spc_ssts_tc0_bit()で再ビルドせず振れる。 */
 extern int webx68k_scsi_spc_ssts_tc0_bit(void);
 
+/*
+ * ホスト設定のフレーム単位キャッシュ (2026-09-02 追加)。
+ *
+ * 背景(実測): 本物SCSI ROM使用時、上のwebx68k_scsi_*() 群(EM_JS=wasm→JSの
+ * 往復)をSPCレジスタへのアクセスのたびに直接呼んでいたところ、ROMが
+ * レジスタを何十万回もポーリングするため往復回数が桁違いに増え、
+ * 基準(本物ROM無し・38秒起動)に対し本物ROM+SPC状態機械で568秒かけても
+ * 起動しないところまで悪化した。
+ *
+ * 対策: これらの設定値は「ホストがどう振るか」という設定であって
+ * ゲスト実行中に頻繁に変わるものではないため、フレーム単位(1/60秒に1回)
+ * でまとめて読み直し、以降はこの static へのアクセスだけで済ませる。
+ * 取り込みは SCSI_RefreshHostConfig() が行い、SCSI_Init() で最低1回、
+ * 以降は retro_run から毎フレーム(SCSI_LogPcIfRealRom() の隣)呼ぶ。
+ *
+ * 【重要】キャッシュ対象の一覧(新しい設定を webx68k_scsi_*() 側に足す
+ * ときは、SPC関連・ログ関連([SCSI-BUS]の上限類)・返答関連のいずれかで
+ * あれば必ずここにも足すこと。ここに足し忘れると「設定を変えても
+ * 効かない」という分かりにくい不具合になる。取りこぼしのまま
+ * アクセスごとに直接呼ぶのは新設せず、必ずこのキャッシュ経由にする):
+ *   SPC関連:    spc_ints_sel, spc_ints_timeout, spc_target, spc_ssts,
+ *               spc_psns, spc_psns_base, spc_ssts_base, spc_psns_a,
+ *               spc_psns_b, spc_clear_on_pctl, spc_phase_bits,
+ *               spc_ints_xfer, spc_ints_disc, spc_cdb_from_temp,
+ *               spc_ssts_data_bit, spc_ssts_tc0_bit
+ *   ログ関連:   bus_log_max, bus_pc_limit
+ *   返答関連:   reply_err, reply_units, reply_end, reply_bpb,
+ *               reply_status, reply_d0
+ *
+ * 対象外(キャッシュしない): get_size/read_sector(可変引数または
+ * ディスク差し替えに追随させたいため)、init_d2/init_a4/drv_attr/
+ * sram_init/drv_next/rom_len/rom_byte(いずれもSCSI_Init内でしか
+ * 読まない一回きりの値のため)。
+ */
+static int SCSIHostSpcIntsSel;
+static int SCSIHostSpcIntsTimeout;
+static int SCSIHostSpcTarget;
+static int SCSIHostSpcSsts;
+static int SCSIHostSpcPsns;
+static int SCSIHostSpcPsnsBase;
+static int SCSIHostSpcSstsBase;
+static int SCSIHostSpcPsnsA;
+static int SCSIHostSpcPsnsB;
+static int SCSIHostSpcClearOnPctl;
+static int SCSIHostSpcPhaseBits;
+static int SCSIHostSpcIntsXfer;
+static int SCSIHostSpcIntsDisc;
+static int SCSIHostSpcCdbFromTemp;
+static int SCSIHostSpcSstsDataBit;
+static int SCSIHostSpcSstsTc0Bit;
+static int SCSIHostBusLogMax;
+static int SCSIHostBusPcLimit;
+static int SCSIHostReplyErr;
+static int SCSIHostReplyUnits;
+static uint32_t SCSIHostReplyEnd;
+static uint32_t SCSIHostReplyBpb;
+static int SCSIHostReplyStatus;
+static int SCSIHostReplyD0;
+
+/* このフレームで一度も取り込んでいない(=SCSI_Init直後にまだ
+ * SCSI_RefreshHostConfigを呼んでいない)ことの検出用。 */
+static int SCSIHostConfigLoaded = 0;
+
 uint8_t	SCSIIPL[0x2000];
 
 /* SCSI IOCS 観測フックのログ件数 (詳細は SCSI_IOCSPort_Write を参照) */
@@ -175,6 +238,9 @@ static uint8_t SCSISpcReg[SCSI_SPC_REG_COUNT];
 extern int webx68k_scsi_bus_log_max(void);
 static int SCSIBusLogCount = 0;
 static int SCSIBusLogCapped = 0;
+/* [SCSI-BUS]ログの早期脱出(SCSI_BusLogShouldSkip、定義は本ファイル後方の
+ * SCSI_Write直前)が一度案内済みかどうか。SCSI_Init()で起動のたびに戻す。 */
+static int SCSIBusLogFastPathAnnounced = 0;
 static uint32_t SCSIBusLastAddr = 0;
 static int SCSIBusLastIsWrite = -1;	/* -1 = 保留中の記録なし */
 static uint32_t SCSIBusLastPC = 0;
@@ -222,7 +288,7 @@ static int SCSI_BusLogGate(void)
 		return 0;
 	/* JS側(core-shim.c js_scsi_bus_log_max)が未設定時に既定
 	 * SCSI_BUS_LOG_MAX_DEFAULT を返すので、ここでは素直に使う。 */
-	log_max = webx68k_scsi_bus_log_max();
+	log_max = SCSIHostBusLogMax;
 	if (SCSIBusLogCount >= log_max)
 	{
 		SCSIBusLogCapped = 1;
@@ -266,7 +332,7 @@ static int SCSIBusPcTrackUsed = 0;
 static int SCSI_BusPcAllow(uint32_t pc)
 {
 	int i;
-	int limit = webx68k_scsi_bus_pc_limit();
+	int limit = SCSIHostBusPcLimit;
 	if (limit <= 0)
 		return 1;	/* 0以下(既定は32) = 抑制しない */
 	for (i = 0; i < SCSIBusPcTrackUsed; i++)
@@ -294,6 +360,52 @@ static int SCSI_BusPcAllow(uint32_t pc)
 	return 1;
 }
 
+/* 上のキャッシュ static 群を webx68k_scsi_*() から一括で読み直す。
+ * SCSI_Init() で最低1回、以降は retro_run から毎フレーム
+ * (SCSI_LogPcIfRealRom() の隣で)呼ぶ想定。本物ROM未使用時は
+ * これらの値を一切参照しないため、SCSIUsingRealRom が真のときだけ
+ * 実際に読み直す(自前スタブ経路の挙動・呼び出し回数は変えない)。 */
+void SCSI_RefreshHostConfig(void)
+{
+	if (!SCSIUsingRealRom)
+		return;
+
+	SCSIHostSpcIntsSel = webx68k_scsi_spc_ints_sel();
+	SCSIHostSpcIntsTimeout = webx68k_scsi_spc_ints_timeout();
+	SCSIHostSpcTarget = webx68k_scsi_spc_target();
+	SCSIHostSpcSsts = webx68k_scsi_spc_ssts();
+	SCSIHostSpcPsns = webx68k_scsi_spc_psns();
+	SCSIHostSpcPsnsBase = webx68k_scsi_spc_psns_base();
+	SCSIHostSpcSstsBase = webx68k_scsi_spc_ssts_base();
+	SCSIHostSpcPsnsA = webx68k_scsi_spc_psns_a();
+	SCSIHostSpcPsnsB = webx68k_scsi_spc_psns_b();
+	SCSIHostSpcClearOnPctl = webx68k_scsi_spc_clear_on_pctl();
+	SCSIHostSpcPhaseBits = webx68k_scsi_spc_phase_bits();
+	SCSIHostSpcIntsXfer = webx68k_scsi_spc_ints_xfer();
+	SCSIHostSpcIntsDisc = webx68k_scsi_spc_ints_disc();
+	SCSIHostSpcCdbFromTemp = webx68k_scsi_spc_cdb_from_temp();
+	SCSIHostSpcSstsDataBit = webx68k_scsi_spc_ssts_data_bit();
+	SCSIHostSpcSstsTc0Bit = webx68k_scsi_spc_ssts_tc0_bit();
+	SCSIHostBusLogMax = webx68k_scsi_bus_log_max();
+	SCSIHostBusPcLimit = webx68k_scsi_bus_pc_limit();
+	SCSIHostReplyErr = webx68k_scsi_reply_err();
+	SCSIHostReplyUnits = webx68k_scsi_reply_units();
+	SCSIHostReplyEnd = (uint32_t)webx68k_scsi_reply_end();
+	SCSIHostReplyBpb = (uint32_t)webx68k_scsi_reply_bpb();
+	SCSIHostReplyStatus = webx68k_scsi_reply_status();
+	SCSIHostReplyD0 = webx68k_scsi_reply_d0();
+
+	/* 陽性対照: キャッシュ後も設定が本当に効いているかを1行で確認できる
+	 * ようにする。既定値のままならホストからの指定が届いていない
+	 * (取り込みそのものが壊れている、または呼び忘れ)と分かる。 */
+	if (!SCSIHostConfigLoaded && log_cb)
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI] ホスト設定キャッシュ読み込み: ints_sel=$%02x ssts_data_bit=%d target=$%02x clear_on_pctl=%d\n",
+			(unsigned)(SCSIHostSpcIntsSel & 0xff), SCSIHostSpcSstsDataBit,
+			(unsigned)(SCSIHostSpcTarget & 0xff), SCSIHostSpcClearOnPctl);
+	SCSIHostConfigLoaded = 1;
+}
+
 /* SCSI_BusPcAllow の抑制で落とした件数を、PCごとに上位10件だけ
  * まとめて出す(SCSI_Cleanup、またはログ上限到達時に1回だけ)。
  * 「抑制が一度も発動していない」場合はこのログ自体を出さないことで、
@@ -313,7 +425,7 @@ static void SCSI_BusReportPcDropped(void)
 
 	if (!log_cb)
 		return;
-	limit = webx68k_scsi_bus_pc_limit();
+	limit = SCSIHostBusPcLimit;
 	if (limit <= 0)
 	{
 		log_cb(RETRO_LOG_INFO, "[SCSI-BUS] PC別抑制: 無効(webx68kBusPcLimit=0につき全件出力)\n");
@@ -553,6 +665,7 @@ void SCSI_Init(void)
 	SCSIZeroCallCount = 0;
 	SCSIBusLogCount = 0;
 	SCSIBusLogCapped = 0;
+	SCSIBusLogFastPathAnnounced = 0;
 	SCSIBusLastIsWrite = -1;
 	SCSIBusRunCount = 0;
 	SCSIBusPcTrackUsed = 0;
@@ -560,6 +673,7 @@ void SCSI_Init(void)
 	SCSIBusFetchExcluded = 0;
 	SCSIBusPcDroppedReported = 0;
 	SCSIUsingRealRom = 0;
+	SCSIHostConfigLoaded = 0;	/* 起動のたびに陽性対照ログを出し直す */
 	SCSIReqHeaderAddr = 0;
 	SCSIReqInitCount = 0;
 	memset(SCSITableCallCount, 0, sizeof(SCSITableCallCount));
@@ -583,6 +697,9 @@ void SCSI_Init(void)
 			log_cb(RETRO_LOG_INFO,
 				"[SCSI] 本物のSCSI ROMイメージ(%d バイト)を読み込んだ。自前スタブの処理(d2/a4差し替え・観測用テーブル/スタブ・$ea0110窓selftest・BPB表ポインタ)を飛ばす\n",
 				rom_len);
+		/* 初期化時点でも一度読み込む(SCSI_Init内で使う返答値のため)。
+		 * 以降は retro_run から毎フレーム呼ばれるものと同じ関数。 */
+		SCSI_RefreshHostConfig();
 	}
 	else
 	{
@@ -906,11 +1023,11 @@ static void SCSI_HandleRequestHeader(void)
 
 	if (cmdnum == 0x00)
 	{
-		int reply_err = webx68k_scsi_reply_err();
-		int reply_units = webx68k_scsi_reply_units();
-		uint32_t reply_end = (uint32_t)webx68k_scsi_reply_end();
-		uint32_t reply_bpb = (uint32_t)webx68k_scsi_reply_bpb();
-		int reply_status = webx68k_scsi_reply_status();
+		int reply_err = SCSIHostReplyErr;
+		int reply_units = SCSIHostReplyUnits;
+		uint32_t reply_end = SCSIHostReplyEnd;
+		uint32_t reply_bpb = SCSIHostReplyBpb;
+		int reply_status = SCSIHostReplyStatus;
 
 		SCSIReqInitCount++;
 		cpu_writemem24(addr + 3, (uint8_t)(reply_err & 0xff));			/* +3 エラーコード */
@@ -1137,7 +1254,7 @@ static void SCSI_HostCommand(uint8_t cmd)
 		 * 返答の中身をどう振っても起動が止まる件の残る候補のひとつ。 */
 		if (k == 0 || k == 1)
 		{
-			int reply_d0 = webx68k_scsi_reply_d0();
+			int reply_d0 = SCSIHostReplyD0;
 			if (reply_d0 >= 0)
 			{
 				uint32_t before = m68000_get_reg(M68K_D0);
@@ -1273,7 +1390,7 @@ static void SCSI_SpcSstsSetBit7Reason(int on, const char *reason)
 	int idx = SCSI_SpcRegIndex(SCSI_SPC_ADR_SSTS);
 	uint8_t before, after;
 
-	if (webx68k_scsi_spc_ssts() != -1)
+	if (SCSIHostSpcSsts != -1)
 		return;	/* 固定値/掃引モードでは状態機械を使わない */
 
 	before = SCSISpcReg[idx];
@@ -1294,10 +1411,10 @@ static void SCSI_SpcSstsSetBit7Reason(int on, const char *reason)
 static void SCSI_SpcSstsSetDataBit(int on, const char *reason)
 {
 	int idx = SCSI_SpcRegIndex(SCSI_SPC_ADR_SSTS);
-	int cfg = webx68k_scsi_spc_ssts_data_bit();
+	int cfg = SCSIHostSpcSstsDataBit;
 	uint8_t bit, before, after;
 
-	if (webx68k_scsi_spc_ssts() != -1)
+	if (SCSIHostSpcSsts != -1)
 		return;	/* 固定値/掃引モードでは状態機械を使わない */
 	if (cfg < 0)
 		return;	/* -2(掃引)は読み出し時にSCSI_SpcSstsDataSweepReadが動的計算するため、
@@ -1321,10 +1438,10 @@ static void SCSI_SpcSstsSetDataBit(int on, const char *reason)
 static void SCSI_SpcSstsSetTc0Bit(int on, const char *reason)
 {
 	int idx = SCSI_SpcRegIndex(SCSI_SPC_ADR_SSTS);
-	int cfg = webx68k_scsi_spc_ssts_tc0_bit();
+	int cfg = SCSIHostSpcSstsTc0Bit;
 	uint8_t bit, before, after;
 
-	if (webx68k_scsi_spc_ssts() != -1)
+	if (SCSIHostSpcSsts != -1)
 		return;	/* 固定値/掃引モードでは状態機械を使わない */
 	if (cfg < 0)
 		return;
@@ -1374,11 +1491,11 @@ static void SCSI_SpcSelectCheck(uint8_t scmd)
 
 	temp = SCSISpcReg[idx_temp];
 	size = webx68k_scsi_get_size();
-	target = webx68k_scsi_spc_target();
+	target = SCSIHostSpcTarget;
 	ok = ((int)temp == target && size > 0);
 	SCSISpcSelectOk = ok;
 
-	ints_bit = (uint8_t)(ok ? webx68k_scsi_spc_ints_sel() : webx68k_scsi_spc_ints_timeout());
+	ints_bit = (uint8_t)(ok ? SCSIHostSpcIntsSel : SCSIHostSpcIntsTimeout);
 	SCSISpcReg[idx_ints] |= ints_bit;
 
 	/* この診断ログも [SCSI-BUS] と共通の上限(SCSI_BusLogGate)・PC単位の
@@ -1392,8 +1509,8 @@ static void SCSI_SpcSelectCheck(uint8_t scmd)
 
 	if (ok)
 	{
-		int ssts = webx68k_scsi_spc_ssts();
-		int psns = webx68k_scsi_spc_psns();
+		int ssts = SCSIHostSpcSsts;
+		int psns = SCSIHostSpcPsns;
 		if (ssts == -1)
 			SCSI_SpcSstsSetBit7Reason(1, "セレクト成立");	/* 既定は状態機械: セレクト成立でbit7を立てる */
 		else if (ssts >= 0)
@@ -1537,7 +1654,7 @@ static uint8_t SCSI_SpcPhaseBitsFor(SCSI_SpcPhase_t phase)
 	{
 	case SCSI_SPC_PHASE_COMMAND:
 	{
-		int ov = webx68k_scsi_spc_phase_bits();
+		int ov = SCSIHostSpcPhaseBits;
 		return (uint8_t)((ov >= 0) ? (ov & 0xff) : 0x02);
 	}
 	case SCSI_SPC_PHASE_DATAIN: return 0x01;
@@ -1604,7 +1721,7 @@ static void SCSI_SpcSetPhase(SCSI_SpcPhase_t phase, const char *reason)
 	if (phase == SCSI_SPC_PHASE_STATUS && old != SCSI_SPC_PHASE_STATUS)
 	{
 		int idx_ints = SCSI_SpcRegIndex(SCSI_SPC_ADR_INTS);
-		uint8_t bit = (uint8_t)webx68k_scsi_spc_ints_xfer();
+		uint8_t bit = (uint8_t)SCSIHostSpcIntsXfer;
 		SCSISpcReg[idx_ints] |= bit;
 		if (log_cb && SCSI_BusLogGate())
 			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] 転送完了(当てはめ) INTS|=$%02x\n", bit);
@@ -1614,7 +1731,7 @@ static void SCSI_SpcSetPhase(SCSI_SpcPhase_t phase, const char *reason)
 	{
 		int idx_ssts = SCSI_SpcRegIndex(SCSI_SPC_ADR_SSTS);
 		int idx_ints = SCSI_SpcRegIndex(SCSI_SPC_ADR_INTS);
-		uint8_t bit = (uint8_t)webx68k_scsi_spc_ints_disc();
+		uint8_t bit = (uint8_t)SCSIHostSpcIntsDisc;
 		SCSISpcReg[idx_ssts] &= (uint8_t)~0x80;
 		SCSISpcReg[idx_ints] |= bit;
 		if (log_cb && SCSI_BusLogGate())
@@ -1992,7 +2109,7 @@ static void SCSI_SpcXferStart(void)
 			"[SCSI-SPC] 転送コマンド書き込み(phase=%s) 予定バイト数(TCH,TCM,TCL解釈)=%u 予定バイト数(TCL,TCM,TCH解釈)=%u\n",
 			SCSI_SpcPhaseName(SCSISpcPhase), as_tch_tcm_tcl, as_tcl_tcm_tch);
 
-	if (webx68k_scsi_spc_cdb_from_temp())
+	if (SCSIHostSpcCdbFromTemp)
 	{
 		if (SCSISpcPhase == SCSI_SPC_PHASE_COMMAND)
 		{
@@ -2122,22 +2239,22 @@ static void SCSI_SpcWrite(uint32_t adr, uint8_t data)
 		SCSI_SpcSelectCheck(data);
 		if ((data & 0xe0) == 0x00)
 			SCSI_SpcSstsSetBit7Reason(0, "SCMDバス開放");	/* バス開放(上位3bit=$000)でbit7を落とす */
-		else if ((data & 0xe0) == 0x20 && SCSISpcSelectOk && webx68k_scsi_spc_psns() == -1)
+		else if ((data & 0xe0) == 0x20 && SCSISpcSelectOk && SCSIHostSpcPsns == -1)
 			/* 実測(2026-09-02): セレクト成立の時点でROMは既にPSNS=$8a
 			 * (REQ|接続中|COMMAND)を期待して読みに来ており、転送開始
 			 * (SCMD上位3bit=111)を待っていなかった。セレクト成立の
 			 * 時点でCOMMANDフェーズへ入れる(未実測の当てはめ)。 */
 			SCSI_SpcEnterCommandPhase("セレクト成立");
-		else if ((data & 0xe0) == 0xe0 && webx68k_scsi_spc_psns() == -1)
+		else if ((data & 0xe0) == 0xe0 && SCSIHostSpcPsns == -1)
 			SCSI_SpcXferStart();	/* 転送開始(上位3bit=$111、未実測の当てはめ)。状態機械が有効なときだけ */
-		else if ((data & 0xe0) == 0x80 && webx68k_scsi_spc_psns() == -1)
+		else if ((data & 0xe0) == 0x80 && SCSIHostSpcPsns == -1)
 			SCSI_SpcXferStartData();	/* DATAIN専用の転送開始(上位3bit=$100、未実測の当てはめ) */
 	}
 	else if (adr == SCSI_SPC_ADR_DREG)
 	{
 		/* COMMANDフェーズ中のCDB受け取り。状態機械が有効(webx68k_scsi_spc_psns()==-1)
 		 * なときだけ意味を持たせる(SCSI_SpcCommandByte参照)。 */
-		if (webx68k_scsi_spc_psns() == -1 && SCSISpcPhase == SCSI_SPC_PHASE_COMMAND)
+		if (SCSIHostSpcPsns == -1 && SCSISpcPhase == SCSI_SPC_PHASE_COMMAND)
 			SCSI_SpcCommandByte(data);
 	}
 	else if (adr == SCSI_SPC_ADR_SCTL)
@@ -2152,7 +2269,7 @@ static void SCSI_SpcWrite(uint32_t adr, uint8_t data)
 		 * 「接続の終わり」とみなしてSSTSのbit7を落とす。実機で確認した
 		 * 仕様ではない。webx68k_scsi_spc_clear_on_pctl() で無効化できる
 		 * (既定1=落とす、0=従来どおりSCMD/SCTLのみで落とす)。 */
-		if (webx68k_scsi_spc_clear_on_pctl())
+		if (SCSIHostSpcClearOnPctl)
 			SCSI_SpcSstsSetBit7Reason(0, "PCTL書き込み(実験的規則)");
 	}
 }
@@ -2208,8 +2325,8 @@ static int SCSISpcSstsDataSweepLogCount = 0;
  * 状態機械モード)、DATAINフェーズで、渡すべきバイトがまだ残っていること。 */
 static int SCSI_SpcSstsDataSweepActive(void)
 {
-	return (webx68k_scsi_spc_ssts_data_bit() == -2)
-		&& (webx68k_scsi_spc_ssts() == -1)
+	return (SCSIHostSpcSstsDataBit == -2)
+		&& (SCSIHostSpcSsts == -1)
 		&& (SCSISpcPhase == SCSI_SPC_PHASE_DATAIN)
 		&& (SCSISpcDataPos < SCSISpcDataLen);
 }
@@ -2239,7 +2356,7 @@ static uint8_t SCSI_SpcSstsDataSweepRead(void)
  * その次からはまた立てて返す(SCSISpcSstsDataBitLow参照)。 */
 static uint8_t SCSI_SpcSstsPulseRead(uint8_t stored)
 {
-	int cfg = webx68k_scsi_spc_ssts_data_bit();
+	int cfg = SCSIHostSpcSstsDataBit;
 	uint8_t bit, v;
 
 	if (cfg < 0)
@@ -2273,7 +2390,7 @@ static uint8_t SCSI_SpcSweepRead(uint32_t adr, uint8_t stored)
 	if (!is_psns && !is_ssts)
 		return stored;
 
-	cfg = is_psns ? webx68k_scsi_spc_psns() : webx68k_scsi_spc_ssts();
+	cfg = is_psns ? SCSIHostSpcPsns : SCSIHostSpcSsts;
 
 	if (is_psns && cfg == -3)
 	{
@@ -2281,8 +2398,8 @@ static uint8_t SCSI_SpcSweepRead(uint32_t adr, uint8_t stored)
 		 * 「読むたびに+1」なので連続2回は必ず(v, v+1)にしかならず、
 		 * 「ある値の次に別の特定の値」という決まったハンドシェイクを
 		 * 待っているケースは掃引では原理的に満たせない。それを試す。 */
-		int a = webx68k_scsi_spc_psns_a();
-		int b = webx68k_scsi_spc_psns_b();
+		int a = SCSIHostSpcPsnsA;
+		int b = SCSIHostSpcPsnsB;
 		v = (uint8_t)(SCSISpcPsnsAltNextIsB ? (b & 0xff) : (a & 0xff));
 
 		if (log_cb && SCSI_BusLogGate() && SCSISpcPsnsAltLogCount < SCSI_SPC_PSNS_ALT_LOG_MAX)
@@ -2312,7 +2429,7 @@ static uint8_t SCSI_SpcSweepRead(uint32_t adr, uint8_t stored)
 
 	if (is_psns)
 	{
-		int base = webx68k_scsi_spc_psns_base();
+		int base = SCSIHostSpcPsnsBase;
 		v = (uint8_t)((base + SCSISpcPsnsSweepNext) & 0xff);
 		SCSISpcPsnsSweepNext = (uint8_t)(SCSISpcPsnsSweepNext + 1);
 		name = "PSNS";
@@ -2323,7 +2440,7 @@ static uint8_t SCSI_SpcSweepRead(uint32_t adr, uint8_t stored)
 	}
 	else
 	{
-		int base = webx68k_scsi_spc_ssts_base();
+		int base = SCSIHostSpcSstsBase;
 		v = (uint8_t)((base + SCSISpcSstsSweepNext) & 0xff);
 		SCSISpcSstsSweepNext = (uint8_t)(SCSISpcSstsSweepNext + 1);
 		name = "SSTS";
@@ -2336,12 +2453,54 @@ static uint8_t SCSI_SpcSweepRead(uint32_t adr, uint8_t stored)
 	return v;
 }
 
+/*
+ * [SCSI-BUS]の総件数上限(SCSIBusLogCapped)に達した後は、本物ROMの
+ * 命令フェッチが$ea0000〜$ea1fffから行われるたびにSCSI_Read/Writeが
+ * 呼ばれてもログはもう1行も出せない。にもかかわらず従来はそのたびに
+ * SCSI_BusLog()経由でm68000_get_reg(M68K_PC)を呼んでいたため、
+ * 本物ROM使用時の起動が異常に遅くなっていた(実測: 除外件数900万件超、
+ * 基準38秒に対し400〜600秒でも起動しない)。
+ *
+ * ここでは上限到達後、かつ書き込み監視(webx68k_ram_watch_*)・
+ * 読み出し監視(webx68k_mem_read_watch_*)の両方が無効(既定どおり
+ * lo>hi)なら、m68000_get_reg()を呼ぶ前に早期脱出する。判定は
+ * static変数の比較だけで済ませ、関数呼び出しやJSへの往復は挟まない。
+ *
+ * 早期脱出はあくまで[SCSI-BUS]ログの出力有無だけに関わるもので、
+ * SPCポート域($ea0000〜$ea001f)に対するSCSI_SpcWrite/実際の読み出し
+ * 処理(状態機械の動作に必要)はSCSI_Read/Write側で従来どおり行う。
+ * ここで省くのはログだけ。
+ *
+ * 早期脱出に入る瞬間、保留中の圧縮エントリ([SCSI-BUS]の「継続中」表示の
+ * もと)があれば沈黙を作らないよう一度だけ吐き出してから、以後この経路を
+ * 通らなくなった旨を1回だけ出す。
+ */
+static int SCSI_BusLogShouldSkip(void)
+{
+	if (!SCSIBusLogCapped)
+		return 0;
+	if (webx68k_ram_watch_lo <= webx68k_ram_watch_hi)
+		return 0;	/* 書き込み監視が有効 */
+	if (webx68k_mem_read_watch_lo <= webx68k_mem_read_watch_hi)
+		return 0;	/* 読み出し監視が有効 */
+
+	if (!SCSIBusLogFastPathAnnounced)
+	{
+		SCSIBusLogFastPathAnnounced = 1;
+		SCSI_BusLogFlush();	/* 保留中の圧縮エントリを一度だけ吐き出す(沈黙対策) */
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-BUS] ログ上限到達につき、以後はログ経路を通さない(高速化)\n");
+	}
+	return 1;
+}
+
 void FASTCALL SCSI_Write(uint32_t adr, uint8_t data)
 {
 	int in_window = (adr >= SCSI_WINDOW_LO && adr < SCSI_WINDOW_HI);
 	int in_spc = (adr >= SCSI_SPC_PORT_LO && adr < SCSI_SPC_PORT_HI);
 
-	if (adr >= 0x00ea0000 && adr < 0x00ea2000)
+	if (adr >= 0x00ea0000 && adr < 0x00ea2000 && !SCSI_BusLogShouldSkip())
 		SCSI_BusLog(adr, 1, data, m68000_get_reg(M68K_PC));
 
 	if (SCSIUsingRealRom && in_spc)
@@ -2375,7 +2534,7 @@ uint8_t FASTCALL SCSI_Read(uint32_t adr)
 		 * 進める側)は実測どおりDREGの読み出しだけに戻す。TEMPは
 		 * SCSI_SpcPhaseOutputByte/SCSI_SpcXferStart側で渡した値をミラーして
 		 * あるだけの受動的な置き場として扱う(読んでも消費しない)。 */
-		if (adr == SCSI_SPC_ADR_DREG && webx68k_scsi_spc_psns() == -1 && in_output_phase)
+		if (adr == SCSI_SPC_ADR_DREG && SCSIHostSpcPsns == -1 && in_output_phase)
 		{
 			uint8_t v = SCSI_SpcPhaseOutputByte("DREG読み出し");
 			SCSISpcReg[SCSI_SpcRegIndex(SCSI_SPC_ADR_TEMP)] = v;
@@ -2388,8 +2547,8 @@ uint8_t FASTCALL SCSI_Read(uint32_t adr)
 			 * 他の状態のSSTSはここを通らず従来どおり(SCSI_SpcSweepRead)。 */
 			data = SCSI_SpcSstsDataSweepRead();
 		}
-		else if (adr == SCSI_SPC_ADR_SSTS && webx68k_scsi_spc_ssts() == -1
-			&& webx68k_scsi_spc_ssts_data_bit() >= 0)
+		else if (adr == SCSI_SPC_ADR_SSTS && SCSIHostSpcSsts == -1
+			&& SCSIHostSpcSstsDataBit >= 0)
 		{
 			/* 固定値モード(cfg>=0)でのパルス化。既定($08)含め、
 			 * SCSI_SpcSstsPulseRead参照。 */
@@ -2405,7 +2564,7 @@ uint8_t FASTCALL SCSI_Read(uint32_t adr)
 		data = SCSIIPL[(adr^1)&0x1fff];
 	}
 
-	if (adr >= 0x00ea0000 && adr < 0x00ea2000)
+	if (adr >= 0x00ea0000 && adr < 0x00ea2000 && !SCSI_BusLogShouldSkip())
 		SCSI_BusLog(adr, 0, data, m68000_get_reg(M68K_PC));
 	return data;
 }
