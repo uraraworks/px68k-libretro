@@ -45,9 +45,14 @@ extern int webx68k_scsi_rom_byte(int i);
  * (SCSI_SpcRegIndex/SCSI_SpcSelectCheck のコメントも参照)。 */
 extern int webx68k_scsi_spc_ints_sel(void);
 extern int webx68k_scsi_spc_ints_timeout(void);
-/* セレクトに応答するSCSI IDに相当するTEMP($ea0017)値(既定1)。
+/* セレクトに応答するSCSI IDに相当するTEMP($ea0017)値(既定-1)。
  * TEMPの値がこれと一致したときだけセレクト成功にする(応答する相手を1つに絞る)。
- * core-shim.c の js_scsi_spc_target 参照。 */
+ * 負値(既定の-1)は「どのTEMP値でも成功させる」の意味。
+ * 2026-09-02実測: ROM内蔵ルーチンはTEMP=$07を、RAM上へ転送されて動くルーチン
+ * (pc=$0001cd8c)はTEMP=$0fを使う。TEMPが表す意味(SCSI ID?コマンド種別?)は
+ * 未確定。$07固定だとRAM側が延々セレクトを再試行し(実測で約14,800回)6分超
+ * かかる/$0f固定だとROM側が通らないため、両方に応答する必要があり既定を
+ * -1(どれでも成功)にした。 core-shim.c の js_scsi_spc_target 参照。 */
 extern int webx68k_scsi_spc_target(void);
 extern int webx68k_scsi_spc_ssts(void);
 extern int webx68k_scsi_spc_psns(void);
@@ -399,10 +404,20 @@ void SCSI_RefreshHostConfig(void)
 	 * ようにする。既定値のままならホストからの指定が届いていない
 	 * (取り込みそのものが壊れている、または呼び忘れ)と分かる。 */
 	if (!SCSIHostConfigLoaded && log_cb)
-		log_cb(RETRO_LOG_INFO,
-			"[SCSI] ホスト設定キャッシュ読み込み: ints_sel=$%02x ssts_data_bit=%d target=$%02x clear_on_pctl=%d\n",
-			(unsigned)(SCSIHostSpcIntsSel & 0xff), SCSIHostSpcSstsDataBit,
-			(unsigned)(SCSIHostSpcTarget & 0xff), SCSIHostSpcClearOnPctl);
+	{
+		/* target は負値(既定-1=「どのTEMPでも成功」)を取りうるので $%02x で
+		 * マスクすると $ff 等に化けて見えなくなる。10進のまま出す。 */
+		if (SCSIHostSpcTarget < 0)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI] ホスト設定キャッシュ読み込み: ints_sel=$%02x ssts_data_bit=%d target=%d(どれでも) clear_on_pctl=%d\n",
+				(unsigned)(SCSIHostSpcIntsSel & 0xff), SCSIHostSpcSstsDataBit,
+				SCSIHostSpcTarget, SCSIHostSpcClearOnPctl);
+		else
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI] ホスト設定キャッシュ読み込み: ints_sel=$%02x ssts_data_bit=%d target=%d($%02x) clear_on_pctl=%d\n",
+				(unsigned)(SCSIHostSpcIntsSel & 0xff), SCSIHostSpcSstsDataBit,
+				SCSIHostSpcTarget, (unsigned)(SCSIHostSpcTarget & 0xff), SCSIHostSpcClearOnPctl);
+	}
 	SCSIHostConfigLoaded = 1;
 }
 
@@ -1465,7 +1480,11 @@ static void SCSI_SpcSstsSetTc0Bit(int on, const char *reason)
  * 2026-09-02: 従来は「TEMPが0以外」だけを条件にしていたため、どのIDを
  * 選んでも必ず成功し、ROMからは同じディスクが8台見えていた(欠陥)。
  * 応答する相手を1つに絞るため、TEMPの値が webx68k_scsi_spc_target()
- * (既定1)と一致したときだけ成功にする。
+ * と一致したときだけ成功にする、はずだったが、実測ではROM内蔵ルーチンが
+ * TEMP=$07、RAM上で動くルーチン(pc=$0001cd8c)がTEMP=$0fを使っており、
+ * 片方だけに固定するともう片方が通らない(RAM側はセレクトを約14,800回
+ * 再試行し6分超かかった)。そのため target が負値(既定-1)のときは
+ * TEMPの値によらず常に成功させる(「どれでも」応答する)ようにしてある。
  * 成功/タイムアウトのどちらのビットを INTS に立てるかは再ビルドせず
  * ホストから振れる(webx68k_scsi_spc_ints_sel/timeout、既定 $08/$20)。
  * 成功時は SSTS/PSNS にもホスト指定値を反映する。SSTSは既定(-1)なら
@@ -1492,7 +1511,9 @@ static void SCSI_SpcSelectCheck(uint8_t scmd)
 	temp = SCSISpcReg[idx_temp];
 	size = webx68k_scsi_get_size();
 	target = SCSIHostSpcTarget;
-	ok = ((int)temp == target && size > 0);
+	/* target<0 は「どのTEMP値でも成功」の意味(既定)。実測でROM/RAM双方の
+	 * ルーチンが別々のTEMP値を使うため、固定値1つに絞ると片方が通らない。 */
+	ok = ((target < 0 || (int)temp == target) && size > 0);
 	SCSISpcSelectOk = ok;
 
 	ints_bit = (uint8_t)(ok ? SCSIHostSpcIntsSel : SCSIHostSpcIntsTimeout);
@@ -1504,8 +1525,8 @@ static void SCSI_SpcSelectCheck(uint8_t scmd)
 	 * 出続けると容易にログが数十MBへ膨らむ(実測)ため。 */
 	if (log_cb && SCSI_BusPcAllow(m68000_get_reg(M68K_PC)) && SCSI_BusLogGate())
 		log_cb(RETRO_LOG_INFO,
-			"[SCSI-SPC] セレクト scmd=$%02x TEMP=$%02x 期待=$%02x size=%d -> %s ints|=$%02x\n",
-			scmd, temp, (unsigned)target, size, ok ? "成功" : "タイムアウト", ints_bit);
+			"[SCSI-SPC] セレクト scmd=$%02x TEMP=$%02x 期待=%d size=%d -> %s ints|=$%02x\n",
+			scmd, temp, target, size, ok ? "成功" : "タイムアウト", ints_bit);
 
 	if (ok)
 	{
