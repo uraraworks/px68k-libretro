@@ -72,7 +72,14 @@ static void webx68k_ram_watch_check(uint32_t addr, uint8_t val)
 		return;
 
 	pc = m68000_get_reg(M68K_PC);
-	if (!webx68k_ram_watch_selftest_active && webx68k_ram_watch_pc_lo <= webx68k_ram_watch_pc_hi)
+	/* PCでの絞り込みは「pc_lo が負(既定 -1)なら無効」とする。
+	 * 2026-09-03 実測: 以前は `pc_lo <= pc_hi` だけで判定していたため、
+	 * 既定値 (-1, -1) が「有効かつ範囲は -1 のみ」と解釈され、
+	 * 実PC(必ず0以上)が全件捨てられていた。自己検査だけが
+	 * selftest_active でこの絞り込みを迂回するので陽性対照は通り続け、
+	 * 「フックは繋がっているのに1件も観測されない」という偽の沈黙になった。 */
+	if (!webx68k_ram_watch_selftest_active && webx68k_ram_watch_pc_lo >= 0 &&
+	    webx68k_ram_watch_pc_lo <= webx68k_ram_watch_pc_hi)
 	{
 		if ((int32_t)pc < webx68k_ram_watch_pc_lo || (int32_t)pc > webx68k_ram_watch_pc_hi)
 			return;
@@ -249,7 +256,14 @@ static void webx68k_mem_read_watch_check(uint32_t addr, uint8_t val)
 		return;
 
 	pc = m68000_get_reg(M68K_PC);
-	if (!webx68k_mem_read_watch_selftest_active && webx68k_mem_read_watch_pc_lo <= webx68k_mem_read_watch_pc_hi)
+	/* PCでの絞り込みは「pc_lo が負(既定 -1)なら無効」とする。
+	 * 2026-09-03 実測: 以前は `pc_lo <= pc_hi` だけで判定していたため、
+	 * 既定値 (-1, -1) が「有効かつ範囲は -1 のみ」と解釈され、
+	 * 実PC(必ず0以上)が全件捨てられていた。自己検査だけが
+	 * selftest_active でこの絞り込みを迂回するので陽性対照は通り続け、
+	 * 「フックは繋がっているのに1件も観測されない」という偽の沈黙になった。 */
+	if (!webx68k_mem_read_watch_selftest_active && webx68k_mem_read_watch_pc_lo >= 0 &&
+	    webx68k_mem_read_watch_pc_lo <= webx68k_mem_read_watch_pc_hi)
 	{
 		if ((int32_t)pc < webx68k_mem_read_watch_pc_lo || (int32_t)pc > webx68k_mem_read_watch_pc_hi)
 			return;
