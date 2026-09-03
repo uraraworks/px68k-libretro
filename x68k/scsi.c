@@ -34,6 +34,7 @@ extern int webx68k_scsi_read_sector(unsigned int lba, unsigned char *buf);
 /* ホストコマンド処理(ストラテジ$40/インタラプト$41)の最後に設定する d0。
  * 既定 -1(何もしない)。呼び出し時の値のまま戻す従来の挙動と同じ。 */
 extern int webx68k_scsi_reply_d0(void);
+extern int webx68k_scsi_reply_init_once(void);
 /* デバイスドライバヘッダ +$00(次のヘッダ)に書く値。既定 $ffffffff
  * (このドライバで最後、従来と同じ)。 */
 extern unsigned int webx68k_scsi_drv_next(void);
@@ -125,7 +126,7 @@ extern int webx68k_scsi_spc_ssts_tc0_bit(void);
  *               spc_ssts_data_bit, spc_ssts_tc0_bit
  *   ログ関連:   bus_log_max, bus_pc_limit
  *   返答関連:   reply_err, reply_units, reply_end, reply_bpb,
- *               reply_status, reply_d0
+ *               reply_status, reply_d0, reply_init_once
  *
  * 対象外(キャッシュしない): get_size/read_sector(可変引数または
  * ディスク差し替えに追随させたいため)、init_d2/init_a4/drv_attr/
@@ -156,6 +157,7 @@ static uint32_t SCSIHostReplyEnd;
 static uint32_t SCSIHostReplyBpb;
 static int SCSIHostReplyStatus;
 static int SCSIHostReplyD0;
+static int SCSIHostReplyInitOnce;
 
 /* drv_attr/drv_next はキャッシュ対象外(SCSI_Init内でしか読まない一回きりの
  * 値)だが、起動時の陽性対照ログ(SCSI_RefreshHostConfig内)に含めるために
@@ -426,6 +428,7 @@ void SCSI_RefreshHostConfig(void)
 	SCSIHostReplyBpb = (uint32_t)webx68k_scsi_reply_bpb();
 	SCSIHostReplyStatus = webx68k_scsi_reply_status();
 	SCSIHostReplyD0 = webx68k_scsi_reply_d0();
+	SCSIHostReplyInitOnce = webx68k_scsi_reply_init_once();
 
 	/* 陽性対照: キャッシュ後も設定が本当に効いているかを1行で確認できる
 	 * ようにする。既定値のままならホストからの指定が届いていない
@@ -443,12 +446,12 @@ void SCSI_RefreshHostConfig(void)
 		int spc_target = SCSIHostSpcTarget;
 		log_cb(RETRO_LOG_INFO,
 			"[SCSI] ホスト設定キャッシュ読み込み: ints_sel=$%02x ssts_data_bit=%d target=%d clear_on_pctl=%d"
-			" | reply_err=$%02x reply_units=%d reply_end=$%08x reply_bpb=$%08x reply_status=%d reply_d0=%d"
+			" | reply_err=$%02x reply_units=%d reply_end=$%08x reply_bpb=$%08x reply_status=%d reply_d0=%d reply_init_once=%d"
 			" drv_attr=$%04x drv_next=$%08x (本物ROM使用中=%d)\n",
 			(unsigned)(SCSIHostSpcIntsSel & 0xff), SCSIHostSpcSstsDataBit, spc_target, SCSIHostSpcClearOnPctl,
 			(unsigned)(SCSIHostReplyErr & 0xff), SCSIHostReplyUnits,
 			(unsigned)SCSIHostReplyEnd, (unsigned)SCSIHostReplyBpb,
-			SCSIHostReplyStatus, SCSIHostReplyD0,
+			SCSIHostReplyStatus, SCSIHostReplyD0, SCSIHostReplyInitOnce,
 			(unsigned)(SCSIInitDrvAttrForLog & 0xffff), (unsigned)SCSIInitDrvNextForLog,
 			SCSIUsingRealRom);
 	}
@@ -528,6 +531,7 @@ static uint32_t SCSIDrvRamEnd = 0;
 
 /* 要求ヘッダのコマンド$00(初期化)を処理した回数。 */
 static int SCSIReqInitCount = 0;
+static int SCSIVectorEntryCount = 0;
 
 /* d2 で渡す観測用テーブル/スタブの呼び出し回数 ($40〜$7f, 64要素) */
 #define SCSI_TABLE_ENTRIES 64
@@ -733,6 +737,7 @@ void SCSI_Init(void)
 	SCSIInitDrvNextForLog = 0;
 	SCSIReqHeaderAddr = 0;
 	SCSIReqInitCount = 0;
+	SCSIVectorEntryCount = 0;
 	SCSIDrvRamEnd = 0;
 	memset(SCSITableCallCount, 0, sizeof(SCSITableCallCount));
 	memset(SCSIIPL, 0, 0x2000);
@@ -919,10 +924,21 @@ void SCSI_Init(void)
 		uint32_t v = 0x00ea0610;
 		int have_bpb = 0;
 
-		SCSIIPL[off_bpbptr + 0] = (uint8_t)((v >> 24) & 0xff);
-		SCSIIPL[off_bpbptr + 1] = (uint8_t)((v >> 16) & 0xff);
-		SCSIIPL[off_bpbptr + 2] = (uint8_t)((v >> 8) & 0xff);
-		SCSIIPL[off_bpbptr + 3] = (uint8_t)(v & 0xff);
+		/* BPB表は「ユニットごとの4バイトポインタの配列」である(2026-09-03 実測:
+		 * Human68k は pc=$8328 で要素0を読んだあと、2台目のために要素1
+		 * ($ea0604)を読みに来た。そこが0だと「１セクタあたりのバイト数が
+		 * 大きすぎます」で止まる)。要素は4つとも同じBPBを指しておく。
+		 * ユニット数の申告と表の要素数の整合は未確定のため、多めに置く。 */
+		{
+			int e;
+			for (e = 0; e < 4; e++)
+			{
+				SCSIIPL[off_bpbptr + e * 4 + 0] = (uint8_t)((v >> 24) & 0xff);
+				SCSIIPL[off_bpbptr + e * 4 + 1] = (uint8_t)((v >> 16) & 0xff);
+				SCSIIPL[off_bpbptr + e * 4 + 2] = (uint8_t)((v >> 8) & 0xff);
+				SCSIIPL[off_bpbptr + e * 4 + 3] = (uint8_t)(v & 0xff);
+			}
+		}
 		if (log_cb)
 		{
 			uint32_t rb = ((uint32_t)SCSIIPL[off_bpbptr + 0] << 24) | ((uint32_t)SCSIIPL[off_bpbptr + 1] << 16) |
@@ -1210,29 +1226,72 @@ static void SCSI_HandleRequestHeader(void)
 		int reply_status = SCSIHostReplyStatus;
 
 		SCSIReqInitCount++;
-		cpu_writemem24(addr + 3, (uint8_t)(reply_err & 0xff));			/* +3 エラーコード */
-		cpu_writemem24(addr + 13, (uint8_t)(reply_units & 0xff));		/* +13 ユニット数 */
-		cpu_writemem24(addr + 14, (uint8_t)((reply_end >> 24) & 0xff));	/* +14..17 処理終了アドレス */
-		cpu_writemem24(addr + 15, (uint8_t)((reply_end >> 16) & 0xff));
-		cpu_writemem24(addr + 16, (uint8_t)((reply_end >> 8) & 0xff));
-		cpu_writemem24(addr + 17, (uint8_t)(reply_end & 0xff));
-		cpu_writemem24(addr + 18, (uint8_t)((reply_bpb >> 24) & 0xff));	/* +18..21 パラメータ(BPB表ポインタ) */
-		cpu_writemem24(addr + 19, (uint8_t)((reply_bpb >> 16) & 0xff));
-		cpu_writemem24(addr + 20, (uint8_t)((reply_bpb >> 8) & 0xff));
-		cpu_writemem24(addr + 21, (uint8_t)(reply_bpb & 0xff));
-		if (reply_status >= 0)
+
+		if (SCSIHostReplyInitOnce != 0 && SCSIReqInitCount >= 2)
 		{
-			/* +4 にワードとして書く。-1(既定)のときは何もしない(元の状態と同じ)。 */
-			cpu_writemem24(addr + 4, (uint8_t)((reply_status >> 8) & 0xff));
-			cpu_writemem24(addr + 5, (uint8_t)(reply_status & 0xff));
+			/* 2回目以降: 「ドライバは無い」で返答する。終了アドレスは
+			 * 要求ヘッダの入力(処理前に読んだ buf[14..17])をそのまま
+			 * 返し、メモリを消費しないことを示す。 */
+			uint32_t in_end = ((uint32_t)buf[14] << 24) | ((uint32_t)buf[15] << 16) |
+				((uint32_t)buf[16] << 8) | (uint32_t)buf[17];
+
+			/* 【重要】ユニット数に 0 を返してはいけない。2026-09-03 実測:
+			 * Human68k は要求ヘッダ +13 を d7 の上位ワードに置き、
+			 *   $8344 sub.l d5,d7 / cmp.l d5,d7 / bcs 抜ける  (d5=$00010000)
+			 * でユニット数ぶん回す。0 だと最初の減算で $ffff0000 に借り引きし、
+			 * 符号なし比較で抜けられず約65535回まわる。その間 BPB表の要素を
+			 * 4バイトずつ消費し、表の外まで読んで
+			 * 「１セクタあたりのバイト数が大きすぎます」で止まる。
+			 * よって「もう無い」はユニット数ではなく、ステータスワードの
+			 * エラービット($8000)で伝える。 */
+			cpu_writemem24(addr + 3, (uint8_t)(reply_err & 0xff));			/* +3 エラーコード */
+			cpu_writemem24(addr + 13, 0x01);					/* +13 ユニット数(0は禁止。上のコメント参照) */
+			cpu_writemem24(addr + 14, buf[14]);					/* +14..17 処理終了アドレス(入力のまま) */
+			cpu_writemem24(addr + 15, buf[15]);
+			cpu_writemem24(addr + 16, buf[16]);
+			cpu_writemem24(addr + 17, buf[17]);
+			/* BPB表ポインタは通常時と同じ値を返す。2026-09-03 実測: ここを
+			 * 0 にすると Human68k はそれでも辿りにいき、「１セクタあたりの
+			 * バイト数が大きすぎます」で止まる。ユニット数0でも参照される。 */
+			cpu_writemem24(addr + 18, (uint8_t)((reply_bpb >> 24) & 0xff));	/* +18..21 パラメータ(BPB表ポインタ) */
+			cpu_writemem24(addr + 19, (uint8_t)((reply_bpb >> 16) & 0xff));
+			cpu_writemem24(addr + 20, (uint8_t)((reply_bpb >> 8) & 0xff));
+			cpu_writemem24(addr + 21, (uint8_t)(reply_bpb & 0xff));
+			/* ステータスワード +4 にエラービット($8000)を立てて「登録するな」と伝える。 */
+			cpu_writemem24(addr + 4, 0x80);
+			cpu_writemem24(addr + 5, 0x00);
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-REQ] 初期化コマンド($00) 処理 #%d: 2回目以降のため「ドライバ無し」で返答した"
+					" (unit数=0 終了addr=$%08x 入力のまま)\n",
+					SCSIReqInitCount, (unsigned)in_end);
 		}
-		if (log_cb)
-			log_cb(RETRO_LOG_INFO,
-				"[SCSI-REQ] 初期化コマンド($00) 処理 #%d: err=$%02x unit数=%d 終了addr=$%08x(%s) BPB表ptr=$%08x status=%d%s\n",
-				SCSIReqInitCount, (unsigned)(reply_err & 0xff), reply_units,
-				(unsigned)reply_end, (SCSIDrvRamEnd != 0) ? "RAM配置" : "設定値",
-				(unsigned)reply_bpb, reply_status,
-				(reply_status >= 0) ? "(+4に書いた)" : "(未指定・+4は変更なし)");
+		else
+		{
+			cpu_writemem24(addr + 3, (uint8_t)(reply_err & 0xff));			/* +3 エラーコード */
+			cpu_writemem24(addr + 13, (uint8_t)(reply_units & 0xff));		/* +13 ユニット数 */
+			cpu_writemem24(addr + 14, (uint8_t)((reply_end >> 24) & 0xff));	/* +14..17 処理終了アドレス */
+			cpu_writemem24(addr + 15, (uint8_t)((reply_end >> 16) & 0xff));
+			cpu_writemem24(addr + 16, (uint8_t)((reply_end >> 8) & 0xff));
+			cpu_writemem24(addr + 17, (uint8_t)(reply_end & 0xff));
+			cpu_writemem24(addr + 18, (uint8_t)((reply_bpb >> 24) & 0xff));	/* +18..21 パラメータ(BPB表ポインタ) */
+			cpu_writemem24(addr + 19, (uint8_t)((reply_bpb >> 16) & 0xff));
+			cpu_writemem24(addr + 20, (uint8_t)((reply_bpb >> 8) & 0xff));
+			cpu_writemem24(addr + 21, (uint8_t)(reply_bpb & 0xff));
+			if (reply_status >= 0)
+			{
+				/* +4 にワードとして書く。-1(既定)のときは何もしない(元の状態と同じ)。 */
+				cpu_writemem24(addr + 4, (uint8_t)((reply_status >> 8) & 0xff));
+				cpu_writemem24(addr + 5, (uint8_t)(reply_status & 0xff));
+			}
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-REQ] 初期化コマンド($00) 処理 #%d: err=$%02x unit数=%d 終了addr=$%08x(%s) BPB表ptr=$%08x status=%d%s\n",
+					SCSIReqInitCount, (unsigned)(reply_err & 0xff), reply_units,
+					(unsigned)reply_end, (SCSIDrvRamEnd != 0) ? "RAM配置" : "設定値",
+					(unsigned)reply_bpb, reply_status,
+					(reply_status >= 0) ? "(+4に書いた)" : "(未指定・+4は変更なし)");
+		}
 	}
 	else
 	{
@@ -1309,6 +1368,27 @@ static void SCSI_HostCommand(uint8_t cmd)
 		if (log_cb)
 			log_cb(RETRO_LOG_INFO, "[SCSI] ベクタ設定エントリが呼ばれた(陽性対照) (pc=$%08x)\n",
 				(unsigned)m68000_get_reg(M68K_PC));
+
+		/* ベクタ設定エントリは実測で複数回呼ばれる(2026-09-03)。Human68k は
+		 * 「次のドライバはあるか」を聞き続けているとみられ、毎回同じヘッダを
+		 * 返すと同じドライバが2台ぶん登録され、DPBの並びが壊れて暴走ジャンプ
+		 * (アドレスエラー)になる。reply_init_once が立っているときは、
+		 * 2回目以降は a4 に 0 を返して「もう無い」と伝える。 */
+		SCSIVectorEntryCount++;
+		if (SCSIHostReplyInitOnce != 0 && SCSIVectorEntryCount >= 2)
+		{
+			/* a4 に 0 を返すのは不可(実測 2026-09-03)。Human68k は番地0を
+			 * ドライバヘッダとして読みに行き($831e btst #5,$4(a1))、暴走する。
+			 * 「もう無い」は d2 側で伝える(px68k の元スタブも d2=-1 を返していた)。 */
+			uint32_t k;
+			for (k = 0; k < 4; k++)
+				SCSIIPL[((0x00ea0090 + k) ^ 1) & 0x1fff] = 0xff;
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI] ベクタ設定エントリ #%d: 2回目以降のため d2 に $ffffffff を返す(もうドライバは無い)\n",
+					SCSIVectorEntryCount);
+			return;
+		}
 		/* SCSI 用に追加された SRAM の3番地を記録する(資料『Inside X68000』図8)。
 		 * $ED006F が 'V'($56) のとき $ED0070/$ED0071 が有効。
 		 * $ED0070: bit3 = 0:内蔵 / 1:オプションボード、下位3bit = 本体のSCSI ID。
