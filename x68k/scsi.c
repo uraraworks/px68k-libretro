@@ -1506,6 +1506,47 @@ static void SCSI_HandleRequestHeader(void)
 
 						if (webx68k_scsi_write_sector(host_lba_base + k, sec512) != 0)
 							w_failed = 1;
+						else if (log_cb)
+						{
+							/* 調査用(2026-09-04): 「書けた」と返ってきたバイト列が
+							 * 本当にそのLBAへ落ちているかを、その場で読み返して照合する。
+							 * 空区画への初回書き込みだけ拒否される件の切り分け。 */
+							uint8_t verify[512];
+							if (webx68k_scsi_read_sector(host_lba_base + k, verify) != 0)
+							{
+								log_cb(RETRO_LOG_ERROR,
+									"[SCSI-WRITE-VERIFY] ホストLBA=%u の読み返し自体に失敗した\n",
+									(unsigned)(host_lba_base + k));
+							}
+							else
+							{
+								uint32_t n;
+								int mismatch = 0;
+								for (n = 0; n < 512; n++)
+								{
+									if (verify[n] != sec512[n])
+									{
+										mismatch = 1;
+										break;
+									}
+								}
+								if (mismatch)
+								{
+									log_cb(RETRO_LOG_ERROR,
+										"[SCSI-WRITE-VERIFY] ホストLBA=%u 書いた内容と読み返しが不一致"
+										" (先頭: 書いた=%02x%02x%02x%02x 読んだ=%02x%02x%02x%02x)\n",
+										(unsigned)(host_lba_base + k),
+										sec512[0], sec512[1], sec512[2], sec512[3],
+										verify[0], verify[1], verify[2], verify[3]);
+								}
+								else
+								{
+									log_cb(RETRO_LOG_INFO,
+										"[SCSI-WRITE-VERIFY] ホストLBA=%u 一致(OK)\n",
+										(unsigned)(host_lba_base + k));
+								}
+							}
+						}
 					}
 				}
 			}
