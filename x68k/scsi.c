@@ -31,6 +31,7 @@ extern int webx68k_scsi_reply_end(void);
 extern int webx68k_scsi_reply_bpb(void);
 extern int webx68k_scsi_reply_status(void);
 extern int webx68k_scsi_read_sector(unsigned int lba, unsigned char *buf);
+extern int webx68k_scsi_write_sector(unsigned int lba, const unsigned char *buf);
 /* ホストコマンド処理(ストラテジ$40/インタラプト$41)の最後に設定する d0。
  * 既定 -1(何もしない)。呼び出し時の値のまま戻す従来の挙動と同じ。 */
 extern int webx68k_scsi_reply_d0(void);
@@ -1424,34 +1425,97 @@ static void SCSI_HandleRequestHeader(void)
 		/* 書き込み。要求ヘッダの形は $04(読み出し)と同じ(実測 2026-09-03:
 		 * +13 メディアバイト / +14 転送元 / +18 セクタ数 / +22 開始セクタ)。
 		 *
-		 * ホスト側のイメージは Range 付きXHRで読むだけの経路しか無く、
-		 * まだ書き戻せない(決定2 の OPFS 経路が未実装)。ここで err=$00 を
-		 * 返すと「書けた」と嘘をつくことになり、ゲストのFATキャッシュが
-		 * 実体とずれる。**書けないなら書けないと言う**のが正しい。
-		 * 返し方(エラーコードの置き場所)は未実測なので、+3 と +4..5 の
-		 * 両方に書いて画面の反応で確かめる。 */
+		 * 本命は決定2のOPFS経路(コアをWorkerで回すのが前提でまだ先)。
+		 * webx68k_scsi_write_sector() がフック無しなら -1 を返す(=書き戻し
+		 * 経路が無い)ので、その場合は従来どおり「書けないと言う」。
+		 * フックがあれば($08 は)$04 と同じ要領で論理セクタ→ホストLBAを求め、
+		 * 512バイトずつ webx68k_scsi_write_sector() へ渡す。 */
 		uint32_t w_addr = ((uint32_t)buf[14] << 24) | ((uint32_t)buf[15] << 16) |
 			((uint32_t)buf[16] << 8) | (uint32_t)buf[17];
 		uint32_t w_count = ((uint32_t)buf[18] << 24) | ((uint32_t)buf[19] << 16) |
 			((uint32_t)buf[20] << 8) | (uint32_t)buf[21];
 		uint32_t w_start = ((uint32_t)buf[22] << 24) | ((uint32_t)buf[23] << 16) |
 			((uint32_t)buf[24] << 8) | (uint32_t)buf[25];
+		int w_failed = 0;
 
-		cpu_writemem24(addr + 3, 0x0a);		/* エラーコード。$00 は「ファイル共有違反」になった(実測)ので $13 を試す */
-		cpu_writemem24(addr + 4, 0x81);		/* ステータス上位: bit15=エラー, bit8=処理終了 */
-		cpu_writemem24(addr + 5, 0x0a);
-		/* 【実測 2026-09-03】エラーが伝わる経路は **要求ヘッダ +4..5 の
-		 * ステータスワード** である。画面に「エラー($810A)が発生しました」と
-		 * 出て、ここに書いた値がそのまま表示された。d0 は経路ではない
-		 * (d0 だけ立てても止まったままだった)が、害は無いので併せて立てておく。
-		 * エラーコードの割り当ては未特定: $00 は「ファイル共有違反です」と
-		 * 表示されて誤解を招くので使わない。$0a/$13 は名前が無く生の値が出る。 */
-		SCSIReqReplyD0 = 0x800a;
-		if (log_cb)
-			log_cb(RETRO_LOG_INFO,
-				"[SCSI-REQ] 書き込みコマンド($08) は未対応。書き込み保護として断る"
-				" (論理セクタ=%u 個数=%u 転送元=$%08x)\n",
-				(unsigned)w_start, (unsigned)w_count, (unsigned)w_addr);
+		if (SCSIPartSectorBytes == 0 || SCSIPartStartBlocks == 0)
+		{
+			w_failed = 1;
+		}
+		else if (w_count == 0)
+		{
+			cpu_writemem24(addr + 3, 0x00);
+		}
+		else if (w_count > 256)
+		{
+			w_failed = 1;
+		}
+		else
+		{
+			uint32_t s;
+
+			for (s = 0; s < w_count && !w_failed; s++)
+			{
+				uint32_t logsec = w_start + s;
+				uint32_t host_lba_base = (SCSIPartStartBlocks * 1024 + logsec * SCSIPartSectorBytes) / 512;
+				uint32_t sub_sectors = SCSIPartSectorBytes / 512;
+				uint32_t k;
+
+				for (k = 0; k < sub_sectors && !w_failed; k++)
+				{
+					uint8_t sec512[512];
+					uint32_t n;
+					uint32_t base = w_addr + s * SCSIPartSectorBytes + k * 512;
+
+					for (n = 0; n < 512; n++)
+						sec512[n] = cpu_readmem24(base + n);
+
+					if (webx68k_scsi_write_sector(host_lba_base + k, sec512) != 0)
+						w_failed = 1;
+				}
+			}
+		}
+
+		if (w_failed)
+		{
+			/* 書けない(またはフック無し・上限超過)場合は従来どおり断る。
+			 * 【実測 2026-09-03】エラーが伝わる経路は要求ヘッダ +4..5 の
+			 * ステータスワードである。d0 は経路ではないが害は無いので
+			 * 併せて立てておく。 */
+			cpu_writemem24(addr + 3, 0x0a);
+			cpu_writemem24(addr + 4, 0x81);
+			cpu_writemem24(addr + 5, 0x0a);
+			SCSIReqReplyD0 = 0x800a;
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-REQ] 書き込みコマンド($08) を断った"
+					" (論理セクタ=%u 個数=%u 転送元=$%08x)\n",
+					(unsigned)w_start, (unsigned)w_count, (unsigned)w_addr);
+		}
+		else if (w_count != 0)
+		{
+			/* 成功時はステータスワードに触らない(読み出し($04)と同じ書き方)。 */
+			cpu_writemem24(addr + 3, 0x00);
+
+			if (log_cb)
+			{
+				uint32_t host_lba_first = (SCSIPartStartBlocks * 1024 + w_start * SCSIPartSectorBytes) / 512;
+				uint8_t rb[16];
+				uint32_t n;
+
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-WRITE] 論理セクタ=%u 個数=%u 転送元=$%08x 先頭LBA=%u\n",
+					(unsigned)w_start, (unsigned)w_count, (unsigned)w_addr,
+					(unsigned)host_lba_first);
+				for (n = 0; n < 16; n++)
+					rb[n] = cpu_readmem24(w_addr + n);
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-WRITE] 書き込んだ先頭16バイト: %02x %02x %02x %02x %02x %02x %02x %02x"
+					" %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], rb[6], rb[7],
+					rb[8], rb[9], rb[10], rb[11], rb[12], rb[13], rb[14], rb[15]);
+			}
+		}
 	}
 	else
 	{
