@@ -869,14 +869,45 @@ void SCSI_Init(void)
 		}
 	}
 	/* $ea0600: ユニット0のBPB(ドライブパラメータブロック)へのポインタ
-	 * ($00ea0610)を置く。$ea0610 以降はゼロのままにし、Human68k が
-	 * BPBのどのバイトを読みに来るかを窓読み出しログで実測する。
+	 * ($00ea0610)を置き、$ea0610 以降にBPBの実体を置く。
 	 * バイト入れ替えループより前に、自然なバイト順で書く。
-	 * 本物ROM使用中は飛ばす(自前スタブ前提のBPB表ポインタのため)。 */
+	 * 本物ROM使用中は飛ばす(自前スタブ前提のため)。
+	 *
+	 * BPBの中身は知識で組み立てず、**基準器イメージから写す**。
+	 * 根拠(2026-09-03 実測): 基準器イメージ(100MB SCSI)の
+	 *   - LBA0 先頭が "X68SCSI1"
+	 *   - LBA4($800) にパーティション表。先頭4バイト "X68K" + 12バイトの
+	 *     ヘッダのあと、16バイトのエントリ(名前8 + 開始4 + サイズ4、いずれもBE、
+	 *     **単位は1024バイトブロック**)。実測値は 名前="Human68k" 開始=$20 サイズ=$18c00 で、
+	 *     $18c00 * 1024 = 103,809,024 バイトとイメージ実サイズが整合する
+	 *   - パーティション先頭($20 * 1024 = $8000)がブートセクタで、
+	 *     2バイト分岐 + 16バイトOEM("SHARP/KG    1.00") のあと **+$12 から BPB**
+	 * であった。+$12 からの並びを次のように読むと、FATのセクタ数が
+	 * 独立に計算した値と一致した(総セクタ101376 / 2セクタ per クラスタ =
+	 * 50688クラスタ、FAT16なので 50688*2 = 101376バイト = 1024バイトセクタで99、
+	 * 実際の値は100)。16bit値はすべてビッグエンディアン:
+	 *   +0  word 1セクタのバイト数   = $0400 (1024)
+	 *   +2  byte 1クラスタのセクタ数 = 2
+	 *   +3  byte FATの個数           = 2
+	 *   +4  word 予約セクタ数        = 1
+	 *   +6  word ルートdirエントリ数 = $0200 (512)
+	 *   +8  word 総セクタ数(16bit)   = 0 (65535超なので下の32bit欄を使う)
+	 *   +10 byte メディアバイト      = $f7
+	 *   +11 byte FATのセクタ数       = 100
+	 *   +12 long 総セクタ数(32bit)   = 101376
+	 *   +16 long パーティション開始  = 32
+	 * ただし「Human68k が実際にどの欄をどこまで読むか」は未実測であるため、
+	 * 解釈はログに出すだけにして、**写す範囲は +$12 から20バイトそのまま**とする。
+	 * どこまで読まれるかは --mem-read-watch=0xea0610:0xea0630 で実測する。 */
 	if (!SCSIUsingRealRom)
 	{
+		static uint8_t ptbl[512];
+		static uint8_t boot[512];
 		uint32_t off_bpbptr = 0x600;
+		uint32_t off_bpb    = 0x610;
 		uint32_t v = 0x00ea0610;
+		int have_bpb = 0;
+
 		SCSIIPL[off_bpbptr + 0] = (uint8_t)((v >> 24) & 0xff);
 		SCSIIPL[off_bpbptr + 1] = (uint8_t)((v >> 16) & 0xff);
 		SCSIIPL[off_bpbptr + 2] = (uint8_t)((v >> 8) & 0xff);
@@ -887,6 +918,85 @@ void SCSI_Init(void)
 				((uint32_t)SCSIIPL[off_bpbptr + 2] << 8) | SCSIIPL[off_bpbptr + 3];
 			log_cb(RETRO_LOG_INFO, "[SCSI] BPB表ポインタ書き込み確認: $ea0600=$%08x(期待$%08x)\n", rb, v);
 		}
+
+		/* パーティション表は LBA 4 ($800)。ホスト側の読み出し単位は512バイト。 */
+		if (webx68k_scsi_read_sector(4, ptbl) != 0)
+		{
+			if (log_cb)
+				log_cb(RETRO_LOG_ERROR, "[SCSI-BPB] パーティション表(LBA4)の読み出しに失敗した\n");
+		}
+		else if (!(ptbl[0] == 'X' && ptbl[1] == '6' && ptbl[2] == '8' && ptbl[3] == 'K'))
+		{
+			if (log_cb)
+				log_cb(RETRO_LOG_ERROR,
+					"[SCSI-BPB] LBA4 に \"X68K\" 署名が無い (先頭4バイト=$%02x%02x%02x%02x)\n",
+					ptbl[0], ptbl[1], ptbl[2], ptbl[3]);
+		}
+		else
+		{
+			/* 先頭エントリのみ使う(このドライバはユニット数1で申告しているため)。
+			 * エントリは 16バイト: 名前8 + 開始4(BE) + サイズ4(BE)、単位1024バイト。 */
+			const uint8_t *e = &ptbl[16];
+			uint32_t part_start = ((uint32_t)e[8] << 24) | ((uint32_t)e[9] << 16) | ((uint32_t)e[10] << 8) | e[11];
+			uint32_t part_size  = ((uint32_t)e[12] << 24) | ((uint32_t)e[13] << 16) | ((uint32_t)e[14] << 8) | e[15];
+			uint32_t boot_lba   = part_start * 2;	/* 1024バイト単位 → 512バイト単位 */
+
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-BPB] パーティション0: 名前=\"%c%c%c%c%c%c%c%c\" 開始=%u(1KB単位) サイズ=%u(1KB単位) ブートセクタLBA=%u\n",
+					e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7],
+					(unsigned)part_start, (unsigned)part_size, (unsigned)boot_lba);
+
+			if (part_size == 0)
+			{
+				if (log_cb)
+					log_cb(RETRO_LOG_ERROR, "[SCSI-BPB] パーティション0のサイズが0\n");
+			}
+			else if (webx68k_scsi_read_sector(boot_lba, boot) != 0)
+			{
+				if (log_cb)
+					log_cb(RETRO_LOG_ERROR, "[SCSI-BPB] ブートセクタ(LBA%u)の読み出しに失敗した\n", (unsigned)boot_lba);
+			}
+			else
+			{
+				uint32_t sect_size = ((uint32_t)boot[0x12] << 8) | boot[0x13];
+				if (sect_size != 256 && sect_size != 512 && sect_size != 1024 && sect_size != 2048)
+				{
+					/* 1セクタのバイト数がありえない値なら、BPBの位置か
+					 * イメージの想定が違う。ゼロのままにして誤った値を渡さない。 */
+					if (log_cb)
+						log_cb(RETRO_LOG_ERROR,
+							"[SCSI-BPB] ブートセクタ+$12 が BPB らしくない (1セクタのバイト数=$%04x) OEM=\"%c%c%c%c%c%c%c%c\"\n",
+							(unsigned)sect_size,
+							boot[2], boot[3], boot[4], boot[5], boot[6], boot[7], boot[8], boot[9]);
+				}
+				else
+				{
+					int j;
+					for (j = 0; j < 20; j++)
+						SCSIIPL[off_bpb + j] = boot[0x12 + j];
+					have_bpb = 1;
+					if (log_cb)
+					{
+						uint32_t total32 = ((uint32_t)boot[0x1e] << 24) | ((uint32_t)boot[0x1f] << 16) |
+							((uint32_t)boot[0x20] << 8) | boot[0x21];
+						uint32_t offs32 = ((uint32_t)boot[0x22] << 24) | ((uint32_t)boot[0x23] << 16) |
+							((uint32_t)boot[0x24] << 8) | boot[0x25];
+						log_cb(RETRO_LOG_INFO,
+							"[SCSI-BPB] $ea0610 へBPBを写した(20バイト): 1セクタ=%uバイト クラスタ=%uセクタ FAT数=%u 予約=%u"
+							" ルートdir=%u 総セクタ(16)=%u メディア=$%02x FATセクタ数=%u 総セクタ(32)=%u 開始=%u\n",
+							(unsigned)sect_size, boot[0x14], boot[0x15],
+							(unsigned)(((uint32_t)boot[0x16] << 8) | boot[0x17]),
+							(unsigned)(((uint32_t)boot[0x18] << 8) | boot[0x19]),
+							(unsigned)(((uint32_t)boot[0x1a] << 8) | boot[0x1b]),
+							boot[0x1c], boot[0x1d], (unsigned)total32, (unsigned)offs32);
+					}
+				}
+			}
+		}
+
+		if (!have_bpb && log_cb)
+			log_cb(RETRO_LOG_ERROR, "[SCSI-BPB] BPBを作れなかった。$ea0610 以降はゼロのままである\n");
 	}
 
 	/* ベクタ設定エントリが返す d2 の即値を差し替える。
