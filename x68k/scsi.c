@@ -4,6 +4,7 @@
 * Built-in SCSI (dummy) IPL is defined in winx68k.c
 */
 
+#include <stdio.h>
 #include "common.h"
 #include "../libretro/dosio.h"
 #include "winx68k.h"
@@ -1425,15 +1426,22 @@ static void SCSI_HandleRequestHeader(void)
 					(unsigned)host_lba_first);
 				if (!failed)
 				{
-					uint8_t rb[16];
+					/* 調査用(2026-09-04): 「新規に複数クラスタのチェーンを
+					 * 割り当てる書き込みだけ失敗する」ことが実測で分かったため、
+					 * FATセクタの中身をこれまでの16バイトより広く(96バイト=
+					 * クラスタ0〜47ぶん)見て、割り当てカーソル相当の値が
+					 * どこかに無いかを調べる。一時的な調査用ログであり、
+					 * 常設するかは要検討。 */
+					uint8_t rb[96];
 					uint32_t n;
-					for (n = 0; n < 16; n++)
+					char hex[96 * 3 + 1];
+					for (n = 0; n < 96; n++)
+					{
 						rb[n] = cpu_readmem24(addr_dst + n);
+						snprintf(hex + n * 3, 4, "%02x ", rb[n]);
+					}
 					log_cb(RETRO_LOG_INFO,
-						"[SCSI-READ] 転送後の先頭16バイト: %02x %02x %02x %02x %02x %02x %02x %02x"
-						" %02x %02x %02x %02x %02x %02x %02x %02x\n",
-						rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], rb[6], rb[7],
-						rb[8], rb[9], rb[10], rb[11], rb[12], rb[13], rb[14], rb[15]);
+						"[SCSI-READ] 転送後の先頭96バイト: %s\n", hex);
 				}
 			}
 		}
