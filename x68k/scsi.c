@@ -1227,12 +1227,31 @@ void SCSI_Init(void)
  *   +0 長さ / +1 ユニット番号 / +2 コマンド / +3 エラーコード /
  *   +4..12 予約 / +13 ユニット数 / +14 処理終了アドレス(4) /
  *   +18 パラメータ(4) */
+/* 調査用(2026-09-04): 「新規複数クラスタ割り当ての直後にHuman68kが
+ * 一切SCSI要求を出さなくなる」という観測が、[SCSI-REQ]等のログ(console経由、
+ * Puppeteerのconsoleキャプチャを介す)だけを根拠にしていた。このプロジェクトでは
+ * 過去に「ログが途絶えた=止まった」の誤読を複数回踏んでいるため
+ * (docs/STORAGE-SCSI.md参照)、log_cbを一切通さない独立の経路として、
+ * 生の呼び出し回数をカウンタへ積むだけにする。JS側は
+ * core-shim.c の get_scsi_req_total()/get_scsi_unsupported_count() 経由で
+ * (console/log_cbを介さず)直接読む。static を外して extern 参照できるようにした。 */
+unsigned int SCSIReqTotalCount = 0;		/* SCSI_HandleRequestHeaderが呼ばれた総回数 */
+unsigned int SCSIUnsupportedCmdCount = 0;	/* 末尾のelse(未対応コマンド)へ落ちた回数 */
+unsigned int SCSIReadCount = 0;		/* $04(読み出し)が呼ばれた総回数 */
+unsigned int SCSILastReadUnit = 0xffffffff;	/* 直近の$04のユニット番号 */
+unsigned int SCSILastReadLogsec = 0xffffffff;	/* 直近の$04の開始論理セクタ */
+unsigned int SCSIWriteCount = 0;		/* $08(書き込み)が呼ばれた総回数 */
+unsigned int SCSILastWriteUnit = 0xffffffff;	/* 直近の$08のユニット番号 */
+unsigned int SCSILastWriteLogsec = 0xffffffff;	/* 直近の$08の開始論理セクタ */
+
 static void SCSI_HandleRequestHeader(void)
 {
 	uint8_t buf[26];
 	uint32_t addr = SCSIReqHeaderAddr;
 	uint32_t i;
 	uint8_t cmdnum;
+
+	SCSIReqTotalCount++;
 
 	if (addr == 0)
 	{
@@ -1348,6 +1367,12 @@ static void SCSI_HandleRequestHeader(void)
 			((uint32_t)buf[20] << 8) | (uint32_t)buf[21];
 		uint32_t start = ((uint32_t)buf[22] << 24) | ((uint32_t)buf[23] << 16) |
 			((uint32_t)buf[24] << 8) | (uint32_t)buf[25];
+
+		/* 調査用(2026-09-04): log_cbを介さない独立カウンタ(SCSIReqTotalCount等と同じ趣旨)。
+		 * 「最後のWRITE以降、READが論理セクタいくつまで進んだか」をログ無しで追える。 */
+		SCSIReadCount++;
+		SCSILastReadUnit = unit;
+		SCSILastReadLogsec = start;
 
 		if (unit >= (uint32_t)SCSIPartCount)
 		{
@@ -1466,6 +1491,12 @@ static void SCSI_HandleRequestHeader(void)
 		int w_failed = 0;
 		uint32_t w_part_start = 0;
 		uint32_t w_sect_bytes = 0;
+
+		/* 調査用(2026-09-04): READ側と同じ独立カウンタ。WRITE以降にREADが
+		 * どこまで進んだか(進まなかったか)をログ無しで比較できるようにする。 */
+		SCSIWriteCount++;
+		SCSILastWriteUnit = w_unit;
+		SCSILastWriteLogsec = w_start;
 
 		if (w_unit >= (uint32_t)SCSIPartCount)
 		{
@@ -1603,6 +1634,7 @@ static void SCSI_HandleRequestHeader(void)
 	}
 	else
 	{
+		SCSIUnsupportedCmdCount++;
 		if (log_cb)
 			log_cb(RETRO_LOG_INFO,
 				"[SCSI-REQ] 未対応コマンド $%02x: 内容を観測するため err=$00 だけ書く\n",
