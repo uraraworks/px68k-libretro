@@ -198,6 +198,13 @@ static int SCSIZeroCallCount = 0;
  * BPB表ポインタ)を飛ばし、窓への書き込みも SCSIIPL へ反映しない(ROMのまま)。 */
 static int SCSIUsingRealRom = 0;
 
+/* SCSIイメージが無い/読めないときに通常起動を巻き込まないためのガード。
+ * SCSI_Init の先頭で必ず0へ戻し、BPBを基準器イメージから写せたとき
+ * (have_bpb が立ったとき)だけ1にする。0のままなら、ベクタ設定エントリの
+ * a4/d2 は JS 側の設定に関わらず「ドライバ無し」相当の値を強制し、
+ * SCSI_HostCommand() のRAMへドライバを組み立てる処理も丸ごと飛ばす。 */
+static int SCSIImageReady = 0;
+
 /* 本物ROM使用時のみ、ゲストPCを定期的にログへ出す診断
  * ([SCSI-PC])。retro_run から毎フレーム呼ばれる想定。
  * 60フレームに1回サンプルし、上限40行で止める。 */
@@ -738,6 +745,7 @@ void SCSI_Init(void)
 	SCSIBusFetchExcluded = 0;
 	SCSIBusPcDroppedReported = 0;
 	SCSIUsingRealRom = 0;
+	SCSIImageReady = 0;
 	SCSIHostConfigLoaded = 0;	/* 起動のたびに陽性対照ログを出し直す */
 	SCSIInitDrvAttrForLog = -1;	/* 本物ROM使用中はこの区画を書かないため既定の印に戻す */
 	SCSIInitDrvNextForLog = 0;
@@ -1011,6 +1019,7 @@ void SCSI_Init(void)
 					for (j = 0; j < 20; j++)
 						SCSIIPL[off_bpb + j] = boot[0x12 + j];
 					have_bpb = 1;
+					SCSIImageReady = 1;
 					SCSIPartStartBlocks = part_start;
 					SCSIPartSectorBytes = sect_size;
 					if (log_cb)
@@ -1066,6 +1075,18 @@ void SCSI_Init(void)
 		{
 			int a4 = webx68k_scsi_init_a4();
 			int d2 = webx68k_scsi_init_d2();
+
+			if (!SCSIImageReady)
+			{
+				/* イメージが無いか読めない(BPBを作れなかった)ときは、
+				 * JS側の設定に関わらずドライバを名乗らない(従来の挙動)。 */
+				a4 = 0x00000000;
+				d2 = (int)0xffffffff;
+				if (log_cb)
+					log_cb(RETRO_LOG_INFO,
+						"[SCSI] イメージが無いか読めないため、ドライバとして名乗らない (a4=$00000000 d2=$ffffffff)\n");
+			}
+
 			SCSIIPL[0x8a] = (uint8_t)((a4 >> 24) & 0xff);
 			SCSIIPL[0x8b] = (uint8_t)((a4 >> 16) & 0xff);
 			SCSIIPL[0x8c] = (uint8_t)((a4 >> 8) & 0xff);
@@ -1523,6 +1544,13 @@ static void SCSI_HostCommand(uint8_t cmd)
 		 * 同時に満たせないため、ヘッダとスタブ本体をゲストRAMへ組み立てる。
 		 * base が0(既定、両設定とも無効)のときは何もせず従来どおり。
 		 */
+		if (!SCSIImageReady)
+		{
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI] イメージが無いか読めないため、RAMへドライバを組み立てる処理を飛ばす\n");
+		}
+		else
 		{
 			uint32_t from = webx68k_scsi_drv_ram_from();
 			uint32_t base = 0;
