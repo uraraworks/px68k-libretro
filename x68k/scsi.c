@@ -649,11 +649,15 @@ static void SCSI_BusLog(uint32_t adr, int is_write, uint8_t data, uint32_t pc)
 	SCSIBusRunCount = 1;
 }
 
-/* コマンド$04(読み出し)で使う、BPBから読み取ったパーティション諸元。
- * SCSI_Init が BPB を写せたときだけ設定し、それ以外は0のままにして
- * SCSI_HandleRequestHeader 側で「まだBPB未確定」を検出できるようにする。 */
-static uint32_t SCSIPartStartBlocks = 0;	/* パーティション開始(1024バイトブロック単位) */
-static uint32_t SCSIPartSectorBytes = 0;	/* 1セクタのバイト数(BPBから) */
+/* コマンド$04(読み出し)/$08(書き込み)で使う、BPBから読み取ったパーティション諸元。
+ * SCSI_Init が BPB を写せた区画の数だけ設定し、それ以外は0のままにして
+ * SCSI_HandleRequestHeader 側で「まだBPB未確定」を検出できるようにする。
+ * 1本のイメージ内の複数パーティションを別ドライブとして出すため、配列にする
+ * (2026-09-03)。添字は要求ヘッダ +1 のユニット番号と一致させる。 */
+#define SCSI_MAX_PARTS 8
+static uint32_t SCSIPartStartBlocks[SCSI_MAX_PARTS];	/* パーティション開始(1024バイトブロック単位) */
+static uint32_t SCSIPartSectorBytes[SCSI_MAX_PARTS];	/* 1セクタのバイト数(BPBから) */
+static int SCSIPartCount = 0;				/* 採用できた区画数 */
 
 void SCSI_Init(void)
 {
@@ -759,8 +763,9 @@ void SCSI_Init(void)
 	SCSIReqInitCount = 0;
 	SCSIVectorEntryCount = 0;
 	SCSIDrvRamEnd = 0;
-	SCSIPartStartBlocks = 0;
-	SCSIPartSectorBytes = 0;
+	memset(SCSIPartStartBlocks, 0, sizeof(SCSIPartStartBlocks));
+	memset(SCSIPartSectorBytes, 0, sizeof(SCSIPartSectorBytes));
+	SCSIPartCount = 0;
 	memset(SCSITableCallCount, 0, sizeof(SCSITableCallCount));
 	memset(SCSIIPL, 0, 0x2000);
 	memset(SCSISpcReg, 0, sizeof(SCSISpcReg));
@@ -941,32 +946,13 @@ void SCSI_Init(void)
 	{
 		static uint8_t ptbl[512];
 		static uint8_t boot[512];
+		/* BPB表: $ea0600から4バイト×最大8個 → $ea0600〜$ea061f。
+		 * BPB本体: $ea0620から32バイト刻みで最大8個 → $ea0620〜$ea071f。
+		 * (2026-09-03: 1本のイメージ内の複数パーティションを別ドライブとして
+		 *  出すため、区画ごとに専用のBPBを持たせる) */
 		uint32_t off_bpbptr = 0x600;
-		uint32_t off_bpb    = 0x610;
-		uint32_t v = 0x00ea0610;
-		int have_bpb = 0;
-
-		/* BPB表は「ユニットごとの4バイトポインタの配列」である(2026-09-03 実測:
-		 * Human68k は pc=$8328 で要素0を読んだあと、2台目のために要素1
-		 * ($ea0604)を読みに来た。そこが0だと「１セクタあたりのバイト数が
-		 * 大きすぎます」で止まる)。要素は4つとも同じBPBを指しておく。
-		 * ユニット数の申告と表の要素数の整合は未確定のため、多めに置く。 */
-		{
-			int e;
-			for (e = 0; e < 4; e++)
-			{
-				SCSIIPL[off_bpbptr + e * 4 + 0] = (uint8_t)((v >> 24) & 0xff);
-				SCSIIPL[off_bpbptr + e * 4 + 1] = (uint8_t)((v >> 16) & 0xff);
-				SCSIIPL[off_bpbptr + e * 4 + 2] = (uint8_t)((v >> 8) & 0xff);
-				SCSIIPL[off_bpbptr + e * 4 + 3] = (uint8_t)(v & 0xff);
-			}
-		}
-		if (log_cb)
-		{
-			uint32_t rb = ((uint32_t)SCSIIPL[off_bpbptr + 0] << 24) | ((uint32_t)SCSIIPL[off_bpbptr + 1] << 16) |
-				((uint32_t)SCSIIPL[off_bpbptr + 2] << 8) | SCSIIPL[off_bpbptr + 3];
-			log_cb(RETRO_LOG_INFO, "[SCSI] BPB表ポインタ書き込み確認: $ea0600=$%08x(期待$%08x)\n", rb, v);
-		}
+		uint32_t off_bpb    = 0x620;
+		int idx;
 
 		/* パーティション表は LBA 4 ($800)。ホスト側の読み出し単位は512バイト。 */
 		if (webx68k_scsi_read_sector(4, ptbl) != 0)
@@ -983,72 +969,87 @@ void SCSI_Init(void)
 		}
 		else
 		{
-			/* 先頭エントリのみ使う(このドライバはユニット数1で申告しているため)。
-			 * エントリは 16バイト: 名前8 + 開始4(BE) + サイズ4(BE)、単位1024バイト。 */
-			const uint8_t *e = &ptbl[16];
-			uint32_t part_start = ((uint32_t)e[8] << 24) | ((uint32_t)e[9] << 16) | ((uint32_t)e[10] << 8) | e[11];
-			uint32_t part_size  = ((uint32_t)e[12] << 24) | ((uint32_t)e[13] << 16) | ((uint32_t)e[14] << 8) | e[15];
-			uint32_t boot_lba   = part_start * 2;	/* 1024バイト単位 → 512バイト単位 */
+			/* エントリは 16バイト: 名前8 + 開始4(BE) + サイズ4(BE)、単位1024バイト。
+			 * 先頭から最大 SCSI_MAX_PARTS 個走査し、サイズ0のエントリで打ち切る。 */
+			for (idx = 0; idx < SCSI_MAX_PARTS; idx++)
+			{
+				const uint8_t *e = &ptbl[16 + idx * 16];
+				uint32_t part_start = ((uint32_t)e[8] << 24) | ((uint32_t)e[9] << 16) | ((uint32_t)e[10] << 8) | e[11];
+				uint32_t part_size  = ((uint32_t)e[12] << 24) | ((uint32_t)e[13] << 16) | ((uint32_t)e[14] << 8) | e[15];
+				uint32_t boot_lba;
 
-			if (log_cb)
-				log_cb(RETRO_LOG_INFO,
-					"[SCSI-BPB] パーティション0: 名前=\"%c%c%c%c%c%c%c%c\" 開始=%u(1KB単位) サイズ=%u(1KB単位) ブートセクタLBA=%u\n",
-					e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7],
-					(unsigned)part_start, (unsigned)part_size, (unsigned)boot_lba);
-
-			if (part_size == 0)
-			{
-				if (log_cb)
-					log_cb(RETRO_LOG_ERROR, "[SCSI-BPB] パーティション0のサイズが0\n");
-			}
-			else if (webx68k_scsi_read_sector(boot_lba, boot) != 0)
-			{
-				if (log_cb)
-					log_cb(RETRO_LOG_ERROR, "[SCSI-BPB] ブートセクタ(LBA%u)の読み出しに失敗した\n", (unsigned)boot_lba);
-			}
-			else
-			{
-				uint32_t sect_size = ((uint32_t)boot[0x12] << 8) | boot[0x13];
-				if (sect_size != 256 && sect_size != 512 && sect_size != 1024 && sect_size != 2048)
+				if (part_size == 0)
 				{
-					/* 1セクタのバイト数がありえない値なら、BPBの位置か
-					 * イメージの想定が違う。ゼロのままにして誤った値を渡さない。 */
+					if (log_cb)
+						log_cb(RETRO_LOG_INFO, "[SCSI-BPB] 区画%d: サイズが0のため走査を打ち切る\n", idx);
+					break;
+				}
+
+				boot_lba = part_start * 2;	/* 1024バイト単位 → 512バイト単位 */
+
+				if (webx68k_scsi_read_sector(boot_lba, boot) != 0)
+				{
 					if (log_cb)
 						log_cb(RETRO_LOG_ERROR,
-							"[SCSI-BPB] ブートセクタ+$12 が BPB らしくない (1セクタのバイト数=$%04x) OEM=\"%c%c%c%c%c%c%c%c\"\n",
-							(unsigned)sect_size,
-							boot[2], boot[3], boot[4], boot[5], boot[6], boot[7], boot[8], boot[9]);
+							"[SCSI-BPB] 区画%d: ブートセクタ(LBA%u)の読み出しに失敗したため走査を打ち切る\n",
+							idx, (unsigned)boot_lba);
+					break;
 				}
 				else
 				{
-					int j;
-					for (j = 0; j < 20; j++)
-						SCSIIPL[off_bpb + j] = boot[0x12 + j];
-					have_bpb = 1;
-					SCSIImageReady = 1;
-					SCSIPartStartBlocks = part_start;
-					SCSIPartSectorBytes = sect_size;
-					if (log_cb)
+					uint32_t sect_size = ((uint32_t)boot[0x12] << 8) | boot[0x13];
+
+					if (sect_size != 256 && sect_size != 512 && sect_size != 1024 && sect_size != 2048)
 					{
-						uint32_t total32 = ((uint32_t)boot[0x1e] << 24) | ((uint32_t)boot[0x1f] << 16) |
-							((uint32_t)boot[0x20] << 8) | boot[0x21];
-						uint32_t offs32 = ((uint32_t)boot[0x22] << 24) | ((uint32_t)boot[0x23] << 16) |
-							((uint32_t)boot[0x24] << 8) | boot[0x25];
-						log_cb(RETRO_LOG_INFO,
-							"[SCSI-BPB] $ea0610 へBPBを写した(20バイト): 1セクタ=%uバイト クラスタ=%uセクタ FAT数=%u 予約=%u"
-							" ルートdir=%u 総セクタ(16)=%u メディア=$%02x FATセクタ数=%u 総セクタ(32)=%u 開始=%u\n",
-							(unsigned)sect_size, boot[0x14], boot[0x15],
-							(unsigned)(((uint32_t)boot[0x16] << 8) | boot[0x17]),
-							(unsigned)(((uint32_t)boot[0x18] << 8) | boot[0x19]),
-							(unsigned)(((uint32_t)boot[0x1a] << 8) | boot[0x1b]),
-							boot[0x1c], boot[0x1d], (unsigned)total32, (unsigned)offs32);
+						/* 1セクタのバイト数がありえない値なら、BPBの位置か
+						 * イメージの想定が違う。このエントリは採用せず走査を打ち切る。 */
+						if (log_cb)
+							log_cb(RETRO_LOG_ERROR,
+								"[SCSI-BPB] 区画%d: ブートセクタ+$12 が BPB らしくない (1セクタのバイト数=$%04x) OEM=\"%c%c%c%c%c%c%c%c\" のため採用せず走査を打ち切る\n",
+								idx, (unsigned)sect_size,
+								boot[2], boot[3], boot[4], boot[5], boot[6], boot[7], boot[8], boot[9]);
+						break;
+					}
+					else
+					{
+						uint32_t bpb_addr = 0x00ea0620 + (uint32_t)idx * 32;
+						int j;
+
+						for (j = 0; j < 20; j++)
+							SCSIIPL[off_bpb + idx * 32 + j] = boot[0x12 + j];
+
+						SCSIIPL[off_bpbptr + idx * 4 + 0] = (uint8_t)((bpb_addr >> 24) & 0xff);
+						SCSIIPL[off_bpbptr + idx * 4 + 1] = (uint8_t)((bpb_addr >> 16) & 0xff);
+						SCSIIPL[off_bpbptr + idx * 4 + 2] = (uint8_t)((bpb_addr >> 8) & 0xff);
+						SCSIIPL[off_bpbptr + idx * 4 + 3] = (uint8_t)(bpb_addr & 0xff);
+
+						SCSIPartStartBlocks[idx] = part_start;
+						SCSIPartSectorBytes[idx] = sect_size;
+						SCSIPartCount = idx + 1;
+
+						if (log_cb)
+							log_cb(RETRO_LOG_INFO,
+								"[SCSI-BPB] 区画%d: 名前=\"%c%c%c%c%c%c%c%c\" 開始=%u サイズ=%u"
+								" ブートセクタLBA=%u 1セクタ=%uバイト BPB=$%08x\n",
+								idx, e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7],
+								(unsigned)part_start, (unsigned)part_size,
+								(unsigned)boot_lba, (unsigned)sect_size, (unsigned)bpb_addr);
 					}
 				}
 			}
 		}
 
-		if (!have_bpb && log_cb)
-			log_cb(RETRO_LOG_ERROR, "[SCSI-BPB] BPBを作れなかった。$ea0610 以降はゼロのままである\n");
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "[SCSI-BPB] 区画を %d 個みつけた\n", SCSIPartCount);
+
+		SCSIImageReady = (SCSIPartCount > 0) ? 1 : 0;
+
+		/* デバイスドライバヘッダ($ea0100)+$0e のユニット数を、
+		 * 見つけた区画数で上書きする(0は禁止。上のコメント群を参照)。 */
+		SCSIIPL[0x100 + 0x0e] = (uint8_t)((SCSIPartCount > 0) ? SCSIPartCount : 1);
+
+		if (SCSIPartCount == 0 && log_cb)
+			log_cb(RETRO_LOG_ERROR, "[SCSI-BPB] BPBを作れなかった。$ea0620 以降はゼロのままである\n");
 	}
 
 	/* ベクタ設定エントリが返す d2 の即値を差し替える。
@@ -1258,7 +1259,10 @@ static void SCSI_HandleRequestHeader(void)
 	if (cmdnum == 0x00)
 	{
 		int reply_err = SCSIHostReplyErr;
-		int reply_units = SCSIHostReplyUnits;
+		/* ユニット数は区画数(SCSIPartCount)を最優先で使う。区画が0のときだけ
+		 * 従来どおりホスト設定 reply_units を使う(2026-09-03)。 */
+		int reply_units_from_parts = (SCSIPartCount > 0);
+		int reply_units = reply_units_from_parts ? SCSIPartCount : SCSIHostReplyUnits;
 		uint32_t reply_end = (SCSIDrvRamEnd != 0) ? SCSIDrvRamEnd : SCSIHostReplyEnd;
 		uint32_t reply_bpb = SCSIHostReplyBpb;
 		int reply_status = SCSIHostReplyStatus;
@@ -1324,8 +1328,9 @@ static void SCSI_HandleRequestHeader(void)
 			}
 			if (log_cb)
 				log_cb(RETRO_LOG_INFO,
-					"[SCSI-REQ] 初期化コマンド($00) 処理 #%d: err=$%02x unit数=%d 終了addr=$%08x(%s) BPB表ptr=$%08x status=%d%s\n",
+					"[SCSI-REQ] 初期化コマンド($00) 処理 #%d: err=$%02x unit数=%d(%s) 終了addr=$%08x(%s) BPB表ptr=$%08x status=%d%s\n",
 					SCSIReqInitCount, (unsigned)(reply_err & 0xff), reply_units,
+					reply_units_from_parts ? "区画数を優先" : "reply_units",
 					(unsigned)reply_end, (SCSIDrvRamEnd != 0) ? "RAM配置" : "設定値",
 					(unsigned)reply_bpb, reply_status,
 					(reply_status >= 0) ? "(+4に書いた)" : "(未指定・+4は変更なし)");
@@ -1333,8 +1338,9 @@ static void SCSI_HandleRequestHeader(void)
 	}
 	else if (cmdnum == 0x04)
 	{
-		/* 読み出し。要求ヘッダ +14..17=転送先アドレス +18..21=セクタ数
-		 * +22..25=開始論理セクタ(パーティション先頭を0とする)。 */
+		/* 読み出し。要求ヘッダ +1=ユニット番号 +14..17=転送先アドレス
+		 * +18..21=セクタ数 +22..25=開始論理セクタ(パーティション先頭を0とする)。 */
+		uint32_t unit = buf[1];
 		uint32_t addr_dst = ((uint32_t)buf[14] << 24) | ((uint32_t)buf[15] << 16) |
 			((uint32_t)buf[16] << 8) | (uint32_t)buf[17];
 		uint32_t count = ((uint32_t)buf[18] << 24) | ((uint32_t)buf[19] << 16) |
@@ -1342,11 +1348,20 @@ static void SCSI_HandleRequestHeader(void)
 		uint32_t start = ((uint32_t)buf[22] << 24) | ((uint32_t)buf[23] << 16) |
 			((uint32_t)buf[24] << 8) | (uint32_t)buf[25];
 
-		if (SCSIPartSectorBytes == 0 || SCSIPartStartBlocks == 0)
+		if (unit >= (uint32_t)SCSIPartCount)
 		{
 			if (log_cb)
 				log_cb(RETRO_LOG_ERROR,
-					"[SCSI-READ] パーティション諸元が未確定のため読み出しを拒否した\n");
+					"[SCSI-READ] ユニット=%u が区画数%dの範囲外のため拒否した\n",
+					(unsigned)unit, SCSIPartCount);
+			cpu_writemem24(addr + 3, 0x02);
+		}
+		else if (SCSIPartSectorBytes[unit] == 0 || SCSIPartStartBlocks[unit] == 0)
+		{
+			if (log_cb)
+				log_cb(RETRO_LOG_ERROR,
+					"[SCSI-READ] ユニット=%u のパーティション諸元が未確定のため読み出しを拒否した\n",
+					(unsigned)unit);
 			cpu_writemem24(addr + 3, 0x02);
 		}
 		else if (count == 0)
@@ -1357,19 +1372,22 @@ static void SCSI_HandleRequestHeader(void)
 		{
 			if (log_cb)
 				log_cb(RETRO_LOG_ERROR,
-					"[SCSI-READ] セクタ数=%u が上限256を超えるため拒否した\n", (unsigned)count);
+					"[SCSI-READ] ユニット=%u セクタ数=%u が上限256を超えるため拒否した\n",
+					(unsigned)unit, (unsigned)count);
 			cpu_writemem24(addr + 3, 0x02);
 		}
 		else
 		{
 			uint32_t s;
 			int failed = 0;
+			uint32_t part_start = SCSIPartStartBlocks[unit];
+			uint32_t sect_bytes = SCSIPartSectorBytes[unit];
 
 			for (s = 0; s < count && !failed; s++)
 			{
 				uint32_t logsec = start + s;
-				uint32_t host_lba_base = (SCSIPartStartBlocks * 1024 + logsec * SCSIPartSectorBytes) / 512;
-				uint32_t sub_sectors = SCSIPartSectorBytes / 512;
+				uint32_t host_lba_base = (part_start * 1024 + logsec * sect_bytes) / 512;
+				uint32_t sub_sectors = sect_bytes / 512;
 				uint32_t k;
 
 				for (k = 0; k < sub_sectors && !failed; k++)
@@ -1380,14 +1398,14 @@ static void SCSI_HandleRequestHeader(void)
 					{
 						if (log_cb)
 							log_cb(RETRO_LOG_ERROR,
-								"[SCSI-READ] ホストLBA=%u の読み出しに失敗した(論理セクタ=%u)\n",
-								(unsigned)(host_lba_base + k), (unsigned)logsec);
+								"[SCSI-READ] ユニット=%u ホストLBA=%u の読み出しに失敗した(論理セクタ=%u)\n",
+								(unsigned)unit, (unsigned)(host_lba_base + k), (unsigned)logsec);
 						failed = 1;
 					}
 					else
 					{
 						uint32_t n;
-						uint32_t base = addr_dst + s * SCSIPartSectorBytes + k * 512;
+						uint32_t base = addr_dst + s * sect_bytes + k * 512;
 						for (n = 0; n < 512; n++)
 							cpu_writemem24(base + n, sec512[n]);
 					}
@@ -1398,12 +1416,12 @@ static void SCSI_HandleRequestHeader(void)
 
 			if (log_cb)
 			{
-				uint32_t host_lba_first = (SCSIPartStartBlocks * 1024 + start * SCSIPartSectorBytes) / 512;
+				uint32_t host_lba_first = (part_start * 1024 + start * sect_bytes) / 512;
 				log_cb(RETRO_LOG_INFO,
-					"[SCSI-READ] 論理セクタ=%u 個数=%u 転送先=$%08x"
+					"[SCSI-READ] ユニット=%u 論理セクタ=%u 個数=%u 転送先=$%08x"
 					" (1セクタ=%uバイト パーティション開始=%uブロック 先頭LBA=%u)\n",
-					(unsigned)start, (unsigned)count, (unsigned)addr_dst,
-					(unsigned)SCSIPartSectorBytes, (unsigned)SCSIPartStartBlocks,
+					(unsigned)unit, (unsigned)start, (unsigned)count, (unsigned)addr_dst,
+					(unsigned)sect_bytes, (unsigned)part_start,
 					(unsigned)host_lba_first);
 				if (!failed)
 				{
@@ -1430,6 +1448,7 @@ static void SCSI_HandleRequestHeader(void)
 		 * 経路が無い)ので、その場合は従来どおり「書けないと言う」。
 		 * フックがあれば($08 は)$04 と同じ要領で論理セクタ→ホストLBAを求め、
 		 * 512バイトずつ webx68k_scsi_write_sector() へ渡す。 */
+		uint32_t w_unit = buf[1];
 		uint32_t w_addr = ((uint32_t)buf[14] << 24) | ((uint32_t)buf[15] << 16) |
 			((uint32_t)buf[16] << 8) | (uint32_t)buf[17];
 		uint32_t w_count = ((uint32_t)buf[18] << 24) | ((uint32_t)buf[19] << 16) |
@@ -1437,51 +1456,67 @@ static void SCSI_HandleRequestHeader(void)
 		uint32_t w_start = ((uint32_t)buf[22] << 24) | ((uint32_t)buf[23] << 16) |
 			((uint32_t)buf[24] << 8) | (uint32_t)buf[25];
 		int w_failed = 0;
+		uint32_t w_part_start = 0;
+		uint32_t w_sect_bytes = 0;
 
-		if (SCSIPartSectorBytes == 0 || SCSIPartStartBlocks == 0)
+		if (w_unit >= (uint32_t)SCSIPartCount)
 		{
-			w_failed = 1;
-		}
-		else if (w_count == 0)
-		{
-			cpu_writemem24(addr + 3, 0x00);
-		}
-		else if (w_count > 256)
-		{
+			if (log_cb)
+				log_cb(RETRO_LOG_ERROR,
+					"[SCSI-WRITE] ユニット=%u が区画数%dの範囲外のため拒否する\n",
+					(unsigned)w_unit, SCSIPartCount);
 			w_failed = 1;
 		}
 		else
 		{
-			uint32_t s;
+			w_part_start = SCSIPartStartBlocks[w_unit];
+			w_sect_bytes = SCSIPartSectorBytes[w_unit];
 
-			for (s = 0; s < w_count && !w_failed; s++)
+			if (w_sect_bytes == 0 || w_part_start == 0)
 			{
-				uint32_t logsec = w_start + s;
-				uint32_t host_lba_base = (SCSIPartStartBlocks * 1024 + logsec * SCSIPartSectorBytes) / 512;
-				uint32_t sub_sectors = SCSIPartSectorBytes / 512;
-				uint32_t k;
+				w_failed = 1;
+			}
+			else if (w_count == 0)
+			{
+				cpu_writemem24(addr + 3, 0x00);
+			}
+			else if (w_count > 256)
+			{
+				w_failed = 1;
+			}
+			else
+			{
+				uint32_t s;
 
-				for (k = 0; k < sub_sectors && !w_failed; k++)
+				for (s = 0; s < w_count && !w_failed; s++)
 				{
-					uint8_t sec512[512];
-					uint32_t n;
-					uint32_t base = w_addr + s * SCSIPartSectorBytes + k * 512;
+					uint32_t logsec = w_start + s;
+					uint32_t host_lba_base = (w_part_start * 1024 + logsec * w_sect_bytes) / 512;
+					uint32_t sub_sectors = w_sect_bytes / 512;
+					uint32_t k;
 
-					for (n = 0; n < 512; n++)
-						sec512[n] = cpu_readmem24(base + n);
+					for (k = 0; k < sub_sectors && !w_failed; k++)
+					{
+						uint8_t sec512[512];
+						uint32_t n;
+						uint32_t base = w_addr + s * w_sect_bytes + k * 512;
 
-					if (webx68k_scsi_write_sector(host_lba_base + k, sec512) != 0)
-						w_failed = 1;
+						for (n = 0; n < 512; n++)
+							sec512[n] = cpu_readmem24(base + n);
+
+						if (webx68k_scsi_write_sector(host_lba_base + k, sec512) != 0)
+							w_failed = 1;
+					}
 				}
 			}
 		}
 
 		if (w_failed)
 		{
-			/* 書けない(またはフック無し・上限超過)場合は従来どおり断る。
-			 * 【実測 2026-09-03】エラーが伝わる経路は要求ヘッダ +4..5 の
-			 * ステータスワードである。d0 は経路ではないが害は無いので
-			 * 併せて立てておく。 */
+			/* 書けない(またはフック無し・上限超過・ユニット範囲外)場合は
+			 * 従来どおり断る。【実測 2026-09-03】エラーが伝わる経路は要求
+			 * ヘッダ +4..5 のステータスワードである。d0 は経路ではないが
+			 * 害は無いので併せて立てておく。 */
 			cpu_writemem24(addr + 3, 0x0a);
 			cpu_writemem24(addr + 4, 0x81);
 			cpu_writemem24(addr + 5, 0x0a);
@@ -1489,8 +1524,8 @@ static void SCSI_HandleRequestHeader(void)
 			if (log_cb)
 				log_cb(RETRO_LOG_INFO,
 					"[SCSI-REQ] 書き込みコマンド($08) を断った"
-					" (論理セクタ=%u 個数=%u 転送元=$%08x)\n",
-					(unsigned)w_start, (unsigned)w_count, (unsigned)w_addr);
+					" (ユニット=%u 論理セクタ=%u 個数=%u 転送元=$%08x)\n",
+					(unsigned)w_unit, (unsigned)w_start, (unsigned)w_count, (unsigned)w_addr);
 		}
 		else if (w_count != 0)
 		{
@@ -1499,13 +1534,13 @@ static void SCSI_HandleRequestHeader(void)
 
 			if (log_cb)
 			{
-				uint32_t host_lba_first = (SCSIPartStartBlocks * 1024 + w_start * SCSIPartSectorBytes) / 512;
+				uint32_t host_lba_first = (w_part_start * 1024 + w_start * w_sect_bytes) / 512;
 				uint8_t rb[16];
 				uint32_t n;
 
 				log_cb(RETRO_LOG_INFO,
-					"[SCSI-WRITE] 論理セクタ=%u 個数=%u 転送元=$%08x 先頭LBA=%u\n",
-					(unsigned)w_start, (unsigned)w_count, (unsigned)w_addr,
+					"[SCSI-WRITE] ユニット=%u 論理セクタ=%u 個数=%u 転送元=$%08x 先頭LBA=%u\n",
+					(unsigned)w_unit, (unsigned)w_start, (unsigned)w_count, (unsigned)w_addr,
 					(unsigned)host_lba_first);
 				for (n = 0; n < 16; n++)
 					rb[n] = cpu_readmem24(w_addr + n);
@@ -1701,7 +1736,8 @@ static void SCSI_HostCommand(uint8_t cmd)
 				cpu_writemem24(base + 0x0c, (uint8_t)((interrupt >> 8) & 0xff));
 				cpu_writemem24(base + 0x0d, (uint8_t)(interrupt & 0xff));
 
-				cpu_writemem24(base + 0x0e, 0x01);	/* ユニット数 */
+				/* ユニット数 = 区画数(0は禁止。上のコメント群を参照)。 */
+				cpu_writemem24(base + 0x0e, (uint8_t)((SCSIPartCount > 0) ? SCSIPartCount : 1));
 
 				for (k = 0; k < 7; k++)
 					cpu_writemem24(base + 0x0f + k, (uint8_t)name[k]);
