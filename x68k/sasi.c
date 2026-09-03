@@ -34,6 +34,26 @@ int SASI_IsAccessing = 0;
  */
 int SASI_Dirty = 0;
 
+/*
+ * 調査用(2026-09-04、docs/STORAGE-SCSI.md参照): x68k/scsi.cのSCSI_HandleRequestHeader
+ * 側に足した調査用ログ・独立カウンタと同じ趣旨のものをSASI側にも足す。
+ * 「SASI(成功する側)が、同じ場面(2クラスタ目の確保)で実際にどのセクタを読み書き
+ * しているか」を、SCSI側と同じ形式で突き合わせるために使う。
+ *
+ * SASIは実機同様のレジスタ/フェーズ遷移プロトコルであり、SCSI側のような
+ * 「26バイト要求ヘッダ」単位ではなく「256バイトセクタ」単位(SASI_Blocksが
+ * 1減るたび)で1件とみなす。ログはlog_cb経由(NULLチェック必須、log_cbへ
+ * NULLを渡すと落ちる既知の罠があるため必ずガードする)。加えてlog_cbを
+ * 一切通さない独立カウンタも積む(「ログが途絶えた=止まった」の誤読を
+ * 過去に複数回踏んでいるため、ログ非依存の裏取り経路を必ず用意する)。
+ * どちらも挙動そのものには一切影響しない(読み取り専用の観測)。
+ */
+unsigned int SASIReqTotalCount = 0;		/* SASI_CheckCmdが呼ばれた総回数(コマンド単位) */
+unsigned int SASIReadCount = 0;		/* 256バイトセクタの読み出し完了回数 */
+unsigned int SASILastReadLba = 0xffffffff;	/* 直近に読み終えた256バイトセクタのLBA */
+unsigned int SASIWriteCount = 0;		/* 256バイトセクタの書き込み完了回数 */
+unsigned int SASILastWriteLba = 0xffffffff;	/* 直近に書き終えた256バイトセクタのLBA */
+
 int SASI_StateAction(StateMem *sm, int load, int data_only)
 {
 	SFORMAT StateRegs[] = 
@@ -162,6 +182,22 @@ uint8_t FASTCALL SASI_Read(uint32_t adr)
 			if (SASI_BufPtr==256)
 			{
 				SASI_Blocks--;
+				/* 調査用(2026-09-04): 256バイトセクタ1件ぶんの読み出しが
+				 * 完了した瞬間。SASI_SectorはSASI_Sector++より前、
+				 * SASI_BufはSASI_Seek()で上書きされる前なので、
+				 * 「今読み終えたセクタ」の内容をそのまま観測できる。 */
+				SASIReadCount++;
+				SASILastReadLba = SASI_Sector;
+				if (log_cb)
+					log_cb(RETRO_LOG_INFO,
+						"[SASI-READ] lba=%u blocks_left=%u"
+						" buf[0..15]=%02x %02x %02x %02x %02x %02x %02x %02x"
+						" %02x %02x %02x %02x %02x %02x %02x %02x\n",
+						(unsigned)SASI_Sector, (unsigned)SASI_Blocks,
+						SASI_Buf[0], SASI_Buf[1], SASI_Buf[2], SASI_Buf[3],
+						SASI_Buf[4], SASI_Buf[5], SASI_Buf[6], SASI_Buf[7],
+						SASI_Buf[8], SASI_Buf[9], SASI_Buf[10], SASI_Buf[11],
+						SASI_Buf[12], SASI_Buf[13], SASI_Buf[14], SASI_Buf[15]);
 				if (SASI_Blocks)
 				{
 					SASI_Sector++;
@@ -217,6 +253,11 @@ static void SASI_CheckCmd(void)
 {
 	int16_t result;
 	SASI_Unit = (SASI_Cmd[1]>>5) & 1;
+
+	/* 調査用(2026-09-04): log_cbを一切通さない独立カウンタ。コマンド単位(6バイト
+	 * コマンドを1回受理するたび)でインクリメントする。SCSI側のSCSIReqTotalCountと
+	 * 同じ「本当に要求が来なくなったか」を確かめるための裏取り用途。 */
+	SASIReqTotalCount++;
 
 	switch(SASI_Cmd[0])
    {
@@ -367,6 +408,21 @@ void FASTCALL SASI_Write(uint32_t adr, uint8_t data)
 			{
 				result = SASI_Flush();
 				SASI_Blocks--;
+				/* 調査用(2026-09-04): 256バイトセクタ1件ぶんの書き込み(Flush)が
+				 * 完了した瞬間。SASI_Sector/SASI_Bufはまだ更新前(次のセクタへ
+				 * 進む前)なので、「今書き終えたセクタ」の内容を観測できる。 */
+				SASIWriteCount++;
+				SASILastWriteLba = SASI_Sector;
+				if (log_cb)
+					log_cb(RETRO_LOG_INFO,
+						"[SASI-WRITE] lba=%u blocks_left=%u flush_result=%d"
+						" buf[0..15]=%02x %02x %02x %02x %02x %02x %02x %02x"
+						" %02x %02x %02x %02x %02x %02x %02x %02x\n",
+						(unsigned)SASI_Sector, (unsigned)SASI_Blocks, (int)result,
+						SASI_Buf[0], SASI_Buf[1], SASI_Buf[2], SASI_Buf[3],
+						SASI_Buf[4], SASI_Buf[5], SASI_Buf[6], SASI_Buf[7],
+						SASI_Buf[8], SASI_Buf[9], SASI_Buf[10], SASI_Buf[11],
+						SASI_Buf[12], SASI_Buf[13], SASI_Buf[14], SASI_Buf[15]);
 				if (SASI_Blocks)
 				{
 					SASI_Sector++;
