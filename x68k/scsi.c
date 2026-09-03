@@ -19,6 +19,10 @@ extern int webx68k_scsi_init_d2(void);
 extern int webx68k_scsi_init_a4(void);
 extern int webx68k_scsi_drv_attr(void);
 extern int webx68k_scsi_sram_init(void);
+/* ドライバをゲストRAMへ置く経路(Human68kの門1/門2を満たすため)。
+ * 実体は WebX68k の src/core-shim.c。既定はどちらも0(=無効)。 */
+extern unsigned int webx68k_scsi_drv_ram(void);
+extern unsigned int webx68k_scsi_drv_ram_from(void);
 /* 初期化コマンド($00)への返答値。再ビルドせずに振れるよう JS 側から読む。
  * 意味の確定していない欄の切り分け用。既定値は元のハードコード値と同じ。 */
 extern int webx68k_scsi_reply_err(void);
@@ -516,6 +520,12 @@ static void SCSI_BusReportPcDropped(void)
  * アドレスを控えておく。0 = 未取得。インタラプト($41)側で使う。 */
 static uint32_t SCSIReqHeaderAddr = 0;
 
+/* ドライバをゲストRAMへ置いたときの「終了アドレス」(base + $34)。
+ * 0以外のとき、初期化コマンド($00)応答はこちらを優先し SCSIHostReplyEnd を無視する。
+ * Human68kの門1/門2(ファイル先頭コメント参照)を同時に満たすための値。
+ * SCSI_Init() で起動のたびに0へ戻す。 */
+static uint32_t SCSIDrvRamEnd = 0;
+
 /* 要求ヘッダのコマンド$00(初期化)を処理した回数。 */
 static int SCSIReqInitCount = 0;
 
@@ -723,6 +733,7 @@ void SCSI_Init(void)
 	SCSIInitDrvNextForLog = 0;
 	SCSIReqHeaderAddr = 0;
 	SCSIReqInitCount = 0;
+	SCSIDrvRamEnd = 0;
 	memset(SCSITableCallCount, 0, sizeof(SCSITableCallCount));
 	memset(SCSIIPL, 0, 0x2000);
 	memset(SCSISpcReg, 0, sizeof(SCSISpcReg));
@@ -1194,7 +1205,7 @@ static void SCSI_HandleRequestHeader(void)
 	{
 		int reply_err = SCSIHostReplyErr;
 		int reply_units = SCSIHostReplyUnits;
-		uint32_t reply_end = SCSIHostReplyEnd;
+		uint32_t reply_end = (SCSIDrvRamEnd != 0) ? SCSIDrvRamEnd : SCSIHostReplyEnd;
 		uint32_t reply_bpb = SCSIHostReplyBpb;
 		int reply_status = SCSIHostReplyStatus;
 
@@ -1217,9 +1228,10 @@ static void SCSI_HandleRequestHeader(void)
 		}
 		if (log_cb)
 			log_cb(RETRO_LOG_INFO,
-				"[SCSI-REQ] 初期化コマンド($00) 処理 #%d: err=$%02x unit数=%d 終了addr=$%08x BPB表ptr=$%08x status=%d%s\n",
+				"[SCSI-REQ] 初期化コマンド($00) 処理 #%d: err=$%02x unit数=%d 終了addr=$%08x(%s) BPB表ptr=$%08x status=%d%s\n",
 				SCSIReqInitCount, (unsigned)(reply_err & 0xff), reply_units,
-				(unsigned)reply_end, (unsigned)reply_bpb, reply_status,
+				(unsigned)reply_end, (SCSIDrvRamEnd != 0) ? "RAM配置" : "設定値",
+				(unsigned)reply_bpb, reply_status,
 				(reply_status >= 0) ? "(+4に書いた)" : "(未指定・+4は変更なし)");
 	}
 	else
@@ -1321,6 +1333,115 @@ static void SCSI_HostCommand(uint8_t cmd)
 			uint32_t k;
 			for (k = 0; k < sizeof(stub); k++)
 				cpu_writemem24(k, stub[k]);
+		}
+
+		/*
+		 * Human68k の初期化コマンド返答は次の2つを同時に満たさないと拒否される
+		 * (実行トレースで確認済み):
+		 *   門1: 終了アドレス + $10000 < $00200000
+		 *   門2: 終了アドレス - $22 >= a1(デバイスドライバヘッダの番地)
+		 * 自前スタブのヘッダは SCSIボードROMの窓($00ea0100)にあり、この2つを
+		 * 同時に満たせないため、ヘッダとスタブ本体をゲストRAMへ組み立てる。
+		 * base が0(既定、両設定とも無効)のときは何もせず従来どおり。
+		 */
+		{
+			uint32_t from = webx68k_scsi_drv_ram_from();
+			uint32_t base = 0;
+
+			if (from != 0)
+				base = cpu_readmem24_dword(from);
+			else
+				base = webx68k_scsi_drv_ram();
+
+			if (base != 0)
+			{
+				uint32_t next = webx68k_scsi_drv_next();
+				int attr = webx68k_scsi_drv_attr();
+				uint32_t strategy = base + 0x20;
+				uint32_t interrupt = base + 0x2a;
+				static const uint8_t strategy_code[] = {
+					0x13, 0xfc, 0x00, 0x40, 0x00, 0xe9, 0xf8, 0x02, 0x4e, 0x75
+				};
+				static const uint8_t interrupt_code[] = {
+					0x13, 0xfc, 0x00, 0x41, 0x00, 0xe9, 0xf8, 0x02, 0x4e, 0x75
+				};
+				static const char name[7] = "SCSIHDD";
+				uint32_t k;
+				uint32_t rb0, rb6, rb10;
+				int rb4;
+				uint8_t rb14;
+				char rname[8];
+
+				cpu_writemem24(base + 0x00, (uint8_t)((next >> 24) & 0xff));
+				cpu_writemem24(base + 0x01, (uint8_t)((next >> 16) & 0xff));
+				cpu_writemem24(base + 0x02, (uint8_t)((next >> 8) & 0xff));
+				cpu_writemem24(base + 0x03, (uint8_t)(next & 0xff));
+
+				cpu_writemem24(base + 0x04, (uint8_t)((attr >> 8) & 0xff));
+				cpu_writemem24(base + 0x05, (uint8_t)(attr & 0xff));
+
+				cpu_writemem24(base + 0x06, (uint8_t)((strategy >> 24) & 0xff));
+				cpu_writemem24(base + 0x07, (uint8_t)((strategy >> 16) & 0xff));
+				cpu_writemem24(base + 0x08, (uint8_t)((strategy >> 8) & 0xff));
+				cpu_writemem24(base + 0x09, (uint8_t)(strategy & 0xff));
+
+				cpu_writemem24(base + 0x0a, (uint8_t)((interrupt >> 24) & 0xff));
+				cpu_writemem24(base + 0x0b, (uint8_t)((interrupt >> 16) & 0xff));
+				cpu_writemem24(base + 0x0c, (uint8_t)((interrupt >> 8) & 0xff));
+				cpu_writemem24(base + 0x0d, (uint8_t)(interrupt & 0xff));
+
+				cpu_writemem24(base + 0x0e, 0x01);	/* ユニット数 */
+
+				for (k = 0; k < 7; k++)
+					cpu_writemem24(base + 0x0f + k, (uint8_t)name[k]);
+
+				for (k = 0; k < sizeof(strategy_code); k++)
+					cpu_writemem24(base + 0x20 + k, strategy_code[k]);
+				for (k = 0; k < sizeof(interrupt_code); k++)
+					cpu_writemem24(base + 0x2a + k, interrupt_code[k]);
+
+				SCSIDrvRamEnd = base + 0x34;
+
+				if (log_cb)
+					log_cb(RETRO_LOG_INFO,
+						"[SCSI-DRV] ドライバをRAMへ置いた base=$%08x (from=$%08x の中身 / 直接指定) next=$%08x attr=$%04x\n"
+						"           strategy=$%08x interrupt=$%08x 終了アドレス=$%08x\n",
+						(unsigned)base, (unsigned)from, (unsigned)next, (unsigned)(attr & 0xffff),
+						(unsigned)strategy, (unsigned)interrupt, (unsigned)SCSIDrvRamEnd);
+
+				/* 陽性対照: 書けたことを cpu_readmem24 で読み返して確かめる。 */
+				rb0 = cpu_readmem24_dword(base + 0x00);
+				rb4 = (cpu_readmem24(base + 0x04) << 8) | cpu_readmem24(base + 0x05);
+				rb6 = cpu_readmem24_dword(base + 0x06);
+				rb10 = cpu_readmem24_dword(base + 0x0a);
+				rb14 = cpu_readmem24(base + 0x0e);
+				for (k = 0; k < 7; k++)
+				{
+					uint8_t c = cpu_readmem24(base + 0x0f + k);
+					rname[k] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+				}
+				rname[7] = '\0';
+				if (log_cb)
+					log_cb(RETRO_LOG_INFO,
+						"[SCSI-DRV] 書き戻し確認: base+0=$%08x base+4=$%04x base+6=$%08x base+10=$%08x base+14=$%02x 名前=\"%s\"\n",
+						(unsigned)rb0, (unsigned)rb4, (unsigned)rb6, (unsigned)rb10, (unsigned)rb14, rname);
+
+				/*
+				 * ROMスタブが a4 に積む即値をヘッダ番地(base)へ差し替える。
+				 * SCSI_Init のバイト入れ替えループを通った後なので ^1 で添字を作る。
+				 * $ea0088/$ea0089 が movea.l 命令語であることを照合してから書く。
+				 */
+				if (SCSIIPL[((0x00ea0088) ^ 1) & 0x1fff] == 0x28 &&
+					SCSIIPL[((0x00ea0089) ^ 1) & 0x1fff] == 0x7c)
+				{
+					for (k = 0; k < 4; k++)
+						SCSIIPL[((0x00ea008a + k) ^ 1) & 0x1fff] = (uint8_t)((base >> (24 - k * 8)) & 0xff);
+				}
+				else if (log_cb)
+					log_cb(RETRO_LOG_ERROR,
+						"[SCSI-DRV] a4の即値位置がずれている ($%02x$%02x)\n",
+						SCSIIPL[((0x00ea0088) ^ 1) & 0x1fff], SCSIIPL[((0x00ea0089) ^ 1) & 0x1fff]);
+			}
 		}
 		return;
 	}
