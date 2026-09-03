@@ -539,6 +539,11 @@ static uint32_t SCSIDrvRamEnd = 0;
 /* 要求ヘッダのコマンド$00(初期化)を処理した回数。 */
 static int SCSIReqInitCount = 0;
 static int SCSIVectorEntryCount = 0;
+/* 直近の要求ヘッダ処理で、インタラプトから戻る d0 に入れたい値。
+ * 負なら「触らない」。Human68k のデバイスドライバはエラーを d0 で
+ * 返す規約とみられるため、コマンド単位で指定できるようにする
+ * (ホスト設定 reply_d0 とは別。こちらが優先)。 */
+static int SCSIReqReplyD0 = -1;
 
 /* d2 で渡す観測用テーブル/スタブの呼び出し回数 ($40〜$7f, 64要素) */
 #define SCSI_TABLE_ENTRIES 64
@@ -1246,6 +1251,7 @@ static void SCSI_HandleRequestHeader(void)
 			buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
 			buf[20], buf[21], buf[22], buf[23], buf[24], buf[25]);
 
+	SCSIReqReplyD0 = -1;	/* コマンドごとに設定し直す */
 	cmdnum = buf[2];
 
 	if (cmdnum == 0x00)
@@ -1412,6 +1418,40 @@ static void SCSI_HandleRequestHeader(void)
 				}
 			}
 		}
+	}
+	else if (cmdnum == 0x08)
+	{
+		/* 書き込み。要求ヘッダの形は $04(読み出し)と同じ(実測 2026-09-03:
+		 * +13 メディアバイト / +14 転送元 / +18 セクタ数 / +22 開始セクタ)。
+		 *
+		 * ホスト側のイメージは Range 付きXHRで読むだけの経路しか無く、
+		 * まだ書き戻せない(決定2 の OPFS 経路が未実装)。ここで err=$00 を
+		 * 返すと「書けた」と嘘をつくことになり、ゲストのFATキャッシュが
+		 * 実体とずれる。**書けないなら書けないと言う**のが正しい。
+		 * 返し方(エラーコードの置き場所)は未実測なので、+3 と +4..5 の
+		 * 両方に書いて画面の反応で確かめる。 */
+		uint32_t w_addr = ((uint32_t)buf[14] << 24) | ((uint32_t)buf[15] << 16) |
+			((uint32_t)buf[16] << 8) | (uint32_t)buf[17];
+		uint32_t w_count = ((uint32_t)buf[18] << 24) | ((uint32_t)buf[19] << 16) |
+			((uint32_t)buf[20] << 8) | (uint32_t)buf[21];
+		uint32_t w_start = ((uint32_t)buf[22] << 24) | ((uint32_t)buf[23] << 16) |
+			((uint32_t)buf[24] << 8) | (uint32_t)buf[25];
+
+		cpu_writemem24(addr + 3, 0x0a);		/* エラーコード。$00 は「ファイル共有違反」になった(実測)ので $13 を試す */
+		cpu_writemem24(addr + 4, 0x81);		/* ステータス上位: bit15=エラー, bit8=処理終了 */
+		cpu_writemem24(addr + 5, 0x0a);
+		/* 【実測 2026-09-03】エラーが伝わる経路は **要求ヘッダ +4..5 の
+		 * ステータスワード** である。画面に「エラー($810A)が発生しました」と
+		 * 出て、ここに書いた値がそのまま表示された。d0 は経路ではない
+		 * (d0 だけ立てても止まったままだった)が、害は無いので併せて立てておく。
+		 * エラーコードの割り当ては未特定: $00 は「ファイル共有違反です」と
+		 * 表示されて誤解を招くので使わない。$0a/$13 は名前が無く生の値が出る。 */
+		SCSIReqReplyD0 = 0x800a;
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-REQ] 書き込みコマンド($08) は未対応。書き込み保護として断る"
+				" (論理セクタ=%u 個数=%u 転送元=$%08x)\n",
+				(unsigned)w_start, (unsigned)w_count, (unsigned)w_addr);
 	}
 	else
 	{
@@ -1751,7 +1791,8 @@ static void SCSI_HostCommand(uint8_t cmd)
 		 * 返答の中身をどう振っても起動が止まる件の残る候補のひとつ。 */
 		if (k == 0 || k == 1)
 		{
-			int reply_d0 = SCSIHostReplyD0;
+			/* コマンド単位の指定(SCSIReqReplyD0)があればそちらを優先する。 */
+			int reply_d0 = (k == 1 && SCSIReqReplyD0 >= 0) ? SCSIReqReplyD0 : SCSIHostReplyD0;
 			if (reply_d0 >= 0)
 			{
 				uint32_t before = m68000_get_reg(M68K_D0);
