@@ -96,6 +96,11 @@ void IRQH_Int(uint8_t irq, void* handler)
 	}
 }
 
+int IRQH_IsPending(uint8_t irq)
+{
+	return IRQH_IRQ[irq & 7] != 0;
+}
+
 int32_t my_irqh_callback(int32_t level)
 {
    int i;
