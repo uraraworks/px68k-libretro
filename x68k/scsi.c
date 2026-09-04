@@ -1311,6 +1311,16 @@ unsigned int SCSIWriteCount = 0;		/* $08(書き込み)が呼ばれた総回数 *
 unsigned int SCSILastWriteUnit = 0xffffffff;	/* 直近の$08のユニット番号 */
 unsigned int SCSILastWriteLogsec = 0xffffffff;	/* 直近の$08の開始論理セクタ */
 
+/* 調査用(2026-09-04): PCトレース上の rts($190028/$190032)件数が要求総数
+ * (SCSIReqTotalCount)より大幅に多く見える食い違いの裏取り用。
+ * 既存の SCSITableCallCount[] はログ出力(if(log_cb))の内側でしか
+ * インクリメントされておらず、log_cb を切ると増えない・トレースの
+ * 件数と揃えて比較できないため、SCSIReqTotalCount 等と同じ流儀で
+ * log_cb を一切経由しない独立カウンタを新設する。
+ * SCSITableCallCount[]自体は既存のログ挙動を変えないためそのまま残す。 */
+unsigned int SCSIStrategyCallCount = 0;	/* d2テーブルの+$00(ストラテジ, cmd=$40)が呼ばれた総回数 */
+unsigned int SCSIInterruptCallCount = 0;	/* d2テーブルの+$0a(インタラプト, cmd=$41)が呼ばれた総回数 */
+
 /* 調査用(2026-09-04): Human68kのディスクバッファは「16バイトの記述子+1024バイトの
  * 本体」が$410間隔で並ぶ配列とみられる(実測: 観測されたバッファ番地が$410間隔)。
  * 転送先/転送元アドレスの直前16バイトがその記述子にあたる。$04/$08 それぞれの
@@ -2099,6 +2109,12 @@ static void SCSI_HostCommand(uint8_t cmd)
 		int k = cmd - 0x40;
 		uint32_t sp = m68000_get_reg(M68K_A7);
 		const char *kname = (k == 0) ? "ストラテジ" : (k == 1) ? "インタラプト" : "表";
+		/* log_cb を経由しない独立カウンタ。ログの有無に関わらず、
+		 * この関数が呼ばれた実回数をそのまま積む。 */
+		if (k == 0)
+			SCSIStrategyCallCount++;
+		else if (k == 1)
+			SCSIInterruptCallCount++;
 		if (log_cb)
 		{
 			log_cb(RETRO_LOG_INFO,
