@@ -16,10 +16,14 @@ int SCC_SerialTxAvailable(void);
 int SCC_SerialReadTxByte(void);
 void SCC_SerialHostReset(void);
 void SCC_SerialSetConnected(int connected);
+void SCC_SerialSetTxWritable(int writable);
+int SCC_SerialGetGuestBaudRate(void);
 
+#ifdef WEBX68K_CORE_TEST_EXPORTS
 /* WebX68kの実コア結合テストから割り込み順を観測するための内部API。 */
 uint32_t SCC_TestAcknowledgeInterrupt(void);
 uint8_t SCC_TestCurrentInterruptCause(void);
+#endif
 
 extern int8_t MouseX;
 extern int8_t MouseY;

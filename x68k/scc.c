@@ -10,6 +10,7 @@
 #include <string.h>
 
 #define SCC_SERIAL_FIFO_SIZE 4096
+#define SCC_SERIAL_PCLK_HZ 5000000
 
 int8_t MouseX = 0;
 int8_t MouseY = 0;
@@ -42,6 +43,7 @@ static uint8_t SCC_SerialFirstRxPending = 0;
 static uint8_t SCC_SerialFirstRxArmed = 0;
 static uint8_t SCC_SerialTxInterruptPending = 0;
 static uint8_t SCC_SerialHostConnected = 0;
+static uint8_t SCC_SerialHostWritable = 0;
 
 enum SCCInterruptCause
 {
@@ -54,6 +56,7 @@ enum SCCInterruptCause
 static uint8_t SCC_InterruptCause = SCC_INT_NONE;
 static uint8_t SCC_LastInterruptCause = SCC_INT_NONE;
 static uint8_t SCC_RoundRobinLast = SCC_INT_NONE;
+static uint8_t SCC_MouseInterruptAcknowledged = 0;
 
 static void SCC_ClearInterruptLatches(void)
 {
@@ -80,13 +83,17 @@ int SCC_StateAction(StateMem *sm, int load, int data_only)
 		SFVAR(SCC_DatNum),
 		/* Keep new fields at the end so old fast save states keep their layout. */
 		SFARRAY(SCC_RegsA, 16),
+		SFVAR(SCC_MouseInterruptAcknowledged),
 
 		SFEND
 	};
 
 	int ret;
 	if (load)
+	{
 		memset(SCC_RegsA, 0, sizeof(SCC_RegsA));
+		SCC_MouseInterruptAcknowledged = 0;
+	}
 	ret = PX68KSS_StateAction(sm, load, data_only, StateRegs, "X68K_SCC", false);
 	if (load)
 	{
@@ -117,9 +124,16 @@ static int SCC_SerialTxInterruptEnabled(void)
 	return (SCC_RegsA[1] & 0x02) != 0;
 }
 
+static int SCC_SerialTxReady(void)
+{
+	return !SCC_SerialHostConnected ||
+		(SCC_SerialHostWritable && SCC_SerialTxCount < SCC_SERIAL_FIFO_SIZE);
+}
+
 static int SCC_MouseInterruptPending(void)
 {
-	return ((SCC_DatNum && ((SCC_RegsB[1] & 0x18) == 0x10)) ||
+	return !SCC_MouseInterruptAcknowledged &&
+		((SCC_DatNum && ((SCC_RegsB[1] & 0x18) == 0x10)) ||
 		((SCC_DatNum == 3) && ((SCC_RegsB[1] & 0x18) == 0x08)));
 }
 
@@ -131,7 +145,8 @@ static int SCC_InterruptPending(uint8_t cause)
 		return SCC_SerialRxInterruptPending();
 	case SCC_INT_SERIAL_TX:
 		return SCC_SerialTxInterruptPending && SCC_SerialTxInterruptEnabled() &&
-			SCC_SerialHostConnected && SCC_SerialTxCount < SCC_SERIAL_FIFO_SIZE;
+			SCC_SerialHostConnected && SCC_SerialHostWritable &&
+			SCC_SerialTxCount < SCC_SERIAL_FIFO_SIZE;
 	case SCC_INT_MOUSE:
 		return SCC_MouseInterruptPending();
 	default:
@@ -157,6 +172,34 @@ static uint32_t SCC_NullInterruptVector(void)
 	if (SCC_RegsB[9] & 0x10)
 		return (uint32_t)(SCC_Vector & 0x8f) + 0x60;
 	return (uint32_t)(SCC_Vector & 0xf1) + 6;
+}
+
+static void SCC_SerialIntCheck(void);
+
+/* マウスは接続状態にかかわらず、既存のチャネルB専用割り込み経路を使う。 */
+static uint32_t FASTCALL SCC_MouseInt(uint8_t irq)
+{
+	uint32_t vector;
+
+	IRQH_IRQCallBack(irq);
+	if ((irq == 5) && (!(SCC_RegsB[9] & 2)))
+	{
+		if (SCC_RegsB[9] & 1)
+		{
+			if (SCC_RegsB[9] & 0x10)
+				vector = ((uint32_t)(SCC_Vector & 0x8f) + 0x20);
+			else
+				vector = ((uint32_t)(SCC_Vector & 0xf1) + 4);
+		}
+		else
+			vector = ((uint32_t)SCC_Vector);
+		/* 最初のデータ読出しまでは同じパケットを再通知せず、serialを先へ進める。 */
+		SCC_MouseInterruptAcknowledged = 1;
+		SCC_SerialIntCheck();
+		return vector;
+	}
+	SCC_SerialIntCheck();
+	return (uint32_t)(-1);
 }
 
 static uint32_t FASTCALL SCC_Int(uint8_t irq)
@@ -194,19 +237,10 @@ static uint32_t FASTCALL SCC_Int(uint8_t irq)
 	return vector;
 }
 
-uint32_t SCC_TestAcknowledgeInterrupt(void)
-{
-	return SCC_Int(5);
-}
-
-uint8_t SCC_TestCurrentInterruptCause(void)
-{
-	return SCC_InterruptCause;
-}
-
-void SCC_IntCheck(void)
+static void SCC_SerialIntCheck(void)
 {
 	uint8_t offset;
+
 	if (!(SCC_RegsB[9] & 0x08))
 		return;
 	if (SCC_InterruptCause != SCC_INT_NONE)
@@ -215,14 +249,10 @@ void SCC_IntCheck(void)
 			return;
 		SCC_InterruptCause = SCC_INT_NONE;
 	}
-	/*
-	 * Z8530のpendingビットとベクタ形式は維持しつつ、ブラウザ側RS-232Cとマウスの
-	 * 一方が連続して他方を飢餓させないよう、通知する原因だけはラウンドロビンで選ぶ。
-	 * これは実機の固定優先順位との差を承知した上でのホスト統合上の公平性対策である。
-	 */
-	for (offset = 1; offset <= 3; offset++)
+	/* マウスを除き、チャネルAのRX/TX間だけをラウンドロビンで選ぶ。 */
+	for (offset = 1; offset <= 2; offset++)
 	{
-		uint8_t cause = (uint8_t)(((SCC_RoundRobinLast + offset - 1) % 3) + 1);
+		uint8_t cause = (uint8_t)(((SCC_RoundRobinLast + offset - 1) % 2) + 1);
 		if (SCC_InterruptPending(cause))
 		{
 			SCC_InterruptCause = cause;
@@ -230,14 +260,40 @@ void SCC_IntCheck(void)
 			return;
 		}
 	}
-	/*
-	 * 通知すべき要因が無くなったらIRQ5を取り下げる。受信FIFOを読み切った直後や
-	 * マウス3バイトを読み終えた直後にここを通らないと、要因のないIRQ5が残ったままになり、
-	 * ゲストは毎回null interruptを取らされる。連続受信中はバイトごとに発生しうるため、
-	 * serialとマウスの公平性の実測もその分だけ歪む。
-	 */
 	if (IRQH_IsPending(5))
 		IRQH_IRQCallBack(5);
+}
+
+#ifdef WEBX68K_CORE_TEST_EXPORTS
+uint32_t SCC_TestAcknowledgeInterrupt(void)
+{
+	/* テストでも、実際に登録される割り込み経路と同じコールバックを使う。 */
+	return (SCC_InterruptCause == SCC_INT_NONE) ? SCC_MouseInt(5) : SCC_Int(5);
+}
+
+uint8_t SCC_TestCurrentInterruptCause(void)
+{
+	return SCC_InterruptCause;
+}
+#endif
+
+void SCC_IntCheck(void)
+{
+	if (!(SCC_RegsB[9] & 0x08))
+		return;
+	if (SCC_MouseInterruptPending())
+	{
+		/* 既に通知したserialよりマウスを優先し、serial要因自体はFIFOに残す。 */
+		if (SCC_InterruptCause != SCC_INT_NONE)
+		{
+			SCC_InterruptCause = SCC_INT_NONE;
+			if (IRQH_IsPending(5))
+				IRQH_IRQCallBack(5);
+		}
+		IRQH_Int(5, &SCC_MouseInt);
+		return;
+	}
+	SCC_SerialIntCheck();
 }
 
 
@@ -253,6 +309,7 @@ void SCC_Init(void)
 	SCC_RegSetB = 0;
 	SCC_Vector = 0;
 	SCC_DatNum = 0;
+	SCC_MouseInterruptAcknowledged = 0;
 	SCC_ClearInterruptLatches();
 	SCC_SerialHostReset();
 }
@@ -268,7 +325,7 @@ void SCC_SerialHostReset(void)
 	SCC_SerialFirstRxPending = 0;
 	SCC_SerialFirstRxArmed = 0;
 	SCC_SerialTxInterruptPending =
-		(SCC_SerialHostConnected && SCC_SerialTxInterruptEnabled()) ? 1 : 0;
+		(SCC_SerialHostConnected && SCC_SerialHostWritable && SCC_SerialTxInterruptEnabled()) ? 1 : 0;
 	if (SCC_InterruptCause == SCC_INT_SERIAL_RX || SCC_InterruptCause == SCC_INT_SERIAL_TX)
 		SCC_InterruptCause = SCC_INT_NONE;
 	SCC_IntCheck();
@@ -279,8 +336,49 @@ void SCC_SerialSetConnected(int connected)
 	uint8_t next = connected ? 1 : 0;
 	if (SCC_SerialHostConnected == next)
 		return;
+	/* 接続状態の境界では、以前の経路のコールバックを次の状態へ持ち越さない。 */
+	SCC_ClearInterruptLatches();
+	if (IRQH_IsPending(5))
+		IRQH_IRQCallBack(5);
 	SCC_SerialHostConnected = next;
+	SCC_SerialHostWritable = next;
 	SCC_SerialHostReset();
+}
+
+void SCC_SerialSetTxWritable(int writable)
+{
+	uint8_t next = (SCC_SerialHostConnected && writable) ? 1 : 0;
+	if (SCC_SerialHostWritable == next)
+		return;
+	SCC_SerialHostWritable = next;
+	if (!next)
+		SCC_SerialTxInterruptPending = 0;
+	else if (SCC_SerialTxInterruptEnabled() && SCC_SerialTxCount < SCC_SERIAL_FIFO_SIZE)
+		SCC_SerialTxInterruptPending = 1;
+	SCC_IntCheck();
+}
+
+int SCC_SerialGetGuestBaudRate(void)
+{
+	uint32_t clock_mode;
+	uint32_t time_constant;
+	uint32_t divisor;
+
+	/* 非同期通信、内蔵BRG、PCLKを送受信クロックに使う標準設定だけを判定する。 */
+	if ((SCC_RegsA[4] & 0x0c) == 0 || (SCC_RegsA[14] & 0x03) != 0x03 ||
+		(SCC_RegsA[11] & 0x60) != 0x40 || (SCC_RegsA[11] & 0x18) != 0x10)
+		return 0;
+
+	switch (SCC_RegsA[4] & 0xc0)
+	{
+	case 0x00: clock_mode = 1; break;
+	case 0x40: clock_mode = 16; break;
+	case 0x80: clock_mode = 32; break;
+	default: clock_mode = 64; break;
+	}
+	time_constant = ((uint32_t)SCC_RegsA[13] << 8) | SCC_RegsA[12];
+	divisor = 2 * clock_mode * (time_constant + 2);
+	return (int)((SCC_SERIAL_PCLK_HZ + divisor / 2) / divisor);
 }
 
 int SCC_SerialReceive(const uint8_t *data, int length)
@@ -327,7 +425,7 @@ int SCC_SerialReadTxByte(void)
 	data = SCC_SerialTx[SCC_SerialTxRead];
 	SCC_SerialTxRead = (SCC_SerialTxRead + 1) % SCC_SERIAL_FIFO_SIZE;
 	SCC_SerialTxCount--;
-	if (was_full && SCC_SerialTxInterruptEnabled())
+	if (was_full && SCC_SerialHostWritable && SCC_SerialTxInterruptEnabled())
 		SCC_SerialTxInterruptPending = 1;
 	SCC_IntCheck();
 	return data;
@@ -338,7 +436,6 @@ static void SCC_SerialWriteTxByte(uint8_t data)
 	if (!SCC_SerialHostConnected)
 	{
 		SCC_SerialTxInterruptPending = 0;
-		SCC_IntCheck();
 		return;
 	}
 	if (SCC_SerialTxCount >= SCC_SERIAL_FIFO_SIZE)
@@ -349,7 +446,8 @@ static void SCC_SerialWriteTxByte(uint8_t data)
 	SCC_SerialTx[SCC_SerialTxWrite] = data;
 	SCC_SerialTxWrite = (SCC_SerialTxWrite + 1) % SCC_SERIAL_FIFO_SIZE;
 	SCC_SerialTxCount++;
-	if (SCC_SerialTxInterruptEnabled() && SCC_SerialTxCount < SCC_SERIAL_FIFO_SIZE)
+	if (SCC_SerialHostWritable && SCC_SerialTxInterruptEnabled() &&
+		SCC_SerialTxCount < SCC_SERIAL_FIFO_SIZE)
 		SCC_SerialTxInterruptPending = 1;
 	SCC_IntCheck();
 }
@@ -368,42 +466,44 @@ static uint8_t SCC_SerialReadRxByte(void)
 	return data;
 }
 
-static void SCC_WriteRegister9(uint8_t data)
+static void SCC_WriteRegister9(uint8_t data, int channel_a)
 {
 	uint8_t reset = data & 0xc0;
-	if (reset == 0x80 || reset == 0xc0)
+	if (channel_a && (reset == 0x80 || reset == 0xc0))
 	{
 		memset(SCC_RegsA, 0, sizeof(SCC_RegsA));
 		/* WR2 は共有レジスタであり、チャネル単独リセットでは保持される。 */
 		SCC_RegsA[2] = SCC_Vector;
 		SCC_SerialHostReset();
 	}
-	if (reset == 0x40 || reset == 0xc0)
+	/*
+	 * 既存のチャネルB実装はWR9をリセットコマンドとして解釈せず、
+	 * 書込み値をそのまま保持していた。マウス転送状態を変えないため、
+	 * Bからの書込みではこの動作を維持する。Aからの書込みだけは、
+	 * 自己消去するリセット指定ビットを両チャネルの保存値から除く。
+	 */
+	if (channel_a)
 	{
-		memset(SCC_RegsB, 0, sizeof(SCC_RegsB));
-		SCC_RegsB[2] = SCC_Vector;
-		SCC_DatNum = 0;
-		if (SCC_InterruptCause == SCC_INT_MOUSE)
-			SCC_InterruptCause = SCC_INT_NONE;
+		SCC_RegsA[9] = data & 0x3f;
+		SCC_RegsB[9] = data & 0x3f;
 	}
-	if (reset == 0xc0)
+	else
 	{
-		SCC_Vector = 0;
-		SCC_RegsA[2] = 0;
-		SCC_RegsB[2] = 0;
-		SCC_ClearInterruptLatches();
+		SCC_RegsB[9] = data;
 	}
-	/* WR9 は両チャネルで共有し、リセット指定ビットは書込み後に自己クリアする。 */
-	SCC_RegsA[9] = data & 0x3f;
-	SCC_RegsB[9] = data & 0x3f;
 	if (!(data & 0x08))
 	{
-		/* SCCのマスター割り込みを無効にした時点で、既に通知したIRQ5も取り下げる。 */
-		SCC_InterruptCause = SCC_INT_NONE;
-		IRQH_IRQCallBack(5);
+		/* 共通シリアル経路だけを解除し、従来のマウスACK待ちは維持する。 */
+		if (SCC_InterruptCause != SCC_INT_NONE)
+		{
+			SCC_InterruptCause = SCC_INT_NONE;
+			if (IRQH_IsPending(5))
+				IRQH_IRQCallBack(5);
+		}
 		return;
 	}
-	SCC_IntCheck();
+	if (SCC_SerialHostConnected)
+		SCC_IntCheck();
 }
 
 static void SCC_SerialWriteRegister(uint8_t reg, uint8_t data)
@@ -416,7 +516,7 @@ static void SCC_SerialWriteRegister(uint8_t reg, uint8_t data)
 	}
 	else if (reg == 9)
 	{
-		SCC_WriteRegister9(data);
+		SCC_WriteRegister9(data, 1);
 		return;
 	}
 	if (reg == 1)
@@ -437,7 +537,7 @@ static void SCC_SerialWriteRegister(uint8_t reg, uint8_t data)
 			SCC_SerialFirstRxPending = 0;
 		}
 		if (SCC_SerialHostConnected && (data & 0x02) && !(old & 0x02) &&
-			SCC_SerialTxCount < SCC_SERIAL_FIFO_SIZE)
+			SCC_SerialHostWritable && SCC_SerialTxCount < SCC_SERIAL_FIFO_SIZE)
 			SCC_SerialTxInterruptPending = 1;
 		if (!(data & 0x02))
 			SCC_SerialTxInterruptPending = 0;
@@ -445,7 +545,8 @@ static void SCC_SerialWriteRegister(uint8_t reg, uint8_t data)
 	SCC_RegsA[reg] = data;
 	if (reg == 8)
 		SCC_SerialWriteTxByte(data);
-	SCC_IntCheck();
+	if (SCC_SerialHostConnected)
+		SCC_IntCheck();
 }
 
 static void SCC_SerialWriteCommand(uint8_t data)
@@ -505,7 +606,7 @@ void FASTCALL SCC_Write(uint32_t adr, uint8_t data)
 		{
 			if (SCC_RegNumB == 9)
 			{
-				SCC_WriteRegister9(data);
+				SCC_WriteRegister9(data, 0);
 			}
 			else if (SCC_RegNumB == 5)
 			{
@@ -514,6 +615,7 @@ void FASTCALL SCC_Write(uint32_t adr, uint8_t data)
 				{
 					Mouse_SetData();
 					SCC_DatNum = 3;
+					SCC_MouseInterruptAcknowledged = 0;
 					SCC_Dat[2] = MouseSt;
 					SCC_Dat[1] = MouseX;
 					SCC_Dat[0] = MouseY;
@@ -579,7 +681,7 @@ uint8_t FASTCALL SCC_Read(uint32_t adr)
 
 	if ((adr&7) == 1)
 	{
-		if (SCC_RegNumB == 2)
+		if (SCC_SerialHostConnected && SCC_RegNumB == 2)
 		{
 			/* acknowledge後は次のpending要因より、直前に応答した要因のベクタを優先する。 */
 			uint8_t cause = SCC_LastInterruptCause;
@@ -614,9 +716,10 @@ uint8_t FASTCALL SCC_Read(uint32_t adr)
 	{
 		if (SCC_DatNum)
 		{
+			/* ACK後の最初の読出しで、次バイトの割り込み評価を再び許可する。 */
+			SCC_MouseInterruptAcknowledged = 0;
 			SCC_DatNum--;
 			ret = SCC_Dat[SCC_DatNum];
-			SCC_IntCheck();
 		}
 	}
 	else if ((adr&7) == 5)
@@ -624,26 +727,27 @@ uint8_t FASTCALL SCC_Read(uint32_t adr)
 		switch(SCC_RegNumA)
 		{
 		case 0:
-			ret = ((!SCC_SerialHostConnected || SCC_SerialTxCount < SCC_SERIAL_FIFO_SIZE) ? 4 : 0) |
+			ret = (SCC_SerialTxReady() ? 4 : 0) |
 				(SCC_SerialHostConnected ? 0x28 : 0) | (SCC_SerialRxCount ? 1 : 0);
 			break;
 		case 1:
-			ret = (SCC_SerialTxCount == 0 ? 0x01 : 0);
+			ret = SCC_SerialHostConnected && SCC_SerialHostWritable && SCC_SerialTxCount == 0 ? 0x01 : 0;
 			break;
 		case 2:
-			ret = SCC_Vector;
+			ret = SCC_SerialHostConnected ? SCC_Vector : 0;
 			break;
 		case 3:
-			ret = (SCC_MouseInterruptPending()?4:0) |
-				(SCC_SerialRxInterruptPending()?0x20:0) |
-				(SCC_InterruptPending(SCC_INT_SERIAL_TX)?0x10:0);
+			ret = (SCC_DatNum ? 4 : 0);
+			if (SCC_SerialHostConnected)
+				ret |= (SCC_SerialRxInterruptPending()?0x20:0) |
+					(SCC_InterruptPending(SCC_INT_SERIAL_TX)?0x10:0);
 			break;
 		case 8:
 			ret = SCC_SerialReadRxByte();
 			break;
 		default:
 			/* WR12/WR13/WR15など、保持しているチャネルAレジスタは書込み値を読み戻す。 */
-			ret = SCC_RegsA[SCC_RegNumA];
+			ret = SCC_SerialHostConnected ? SCC_RegsA[SCC_RegNumA] : 0;
 			break;
 		}
 		SCC_RegNumA = 0;
