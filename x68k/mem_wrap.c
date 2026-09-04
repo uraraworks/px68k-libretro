@@ -617,7 +617,11 @@ static void wm_cnt(uint32_t addr, uint8_t val)
 	addr &= 0x00ffffff;
 	if (webx68k_trace_enabled)
 		webx68k_trace_record(m68000_get_reg(M68K_PC));
-	webx68k_drv_hook_check(m68000_get_reg(M68K_PC));
+	/* 既定(両方無効)では m68000_get_reg() すら呼ばない。ここは全メモリ
+	 * アクセスが通るため、無効時に関数呼び出しを増やすとエミュレータの
+	 * 速度そのものが変わり、既存の計測値と条件が揃わなくなる。 */
+	if (webx68k_drv_hook_strategy >= 0 || webx68k_drv_hook_interrupt >= 0)
+		webx68k_drv_hook_check(m68000_get_reg(M68K_PC));
 	if (addr < 0x00c00000) /* Use RAM upto 12MB */
 	{
 		webx68k_ram_watch_check(addr, val);
@@ -659,7 +663,11 @@ static uint8_t rm_main(uint32_t addr)
 
 	if (webx68k_trace_enabled)
 		webx68k_trace_record(m68000_get_reg(M68K_PC));
-	webx68k_drv_hook_check(m68000_get_reg(M68K_PC));
+	/* 既定(両方無効)では m68000_get_reg() すら呼ばない。ここは全メモリ
+	 * アクセスが通るため、無効時に関数呼び出しを増やすとエミュレータの
+	 * 速度そのものが変わり、既存の計測値と条件が揃わなくなる。 */
+	if (webx68k_drv_hook_strategy >= 0 || webx68k_drv_hook_interrupt >= 0)
+		webx68k_drv_hook_check(m68000_get_reg(M68K_PC));
 
 	if (webx68k_mem_read_watch_lo <= webx68k_mem_read_watch_hi)
 		webx68k_mem_read_watch_check(addr, v);
