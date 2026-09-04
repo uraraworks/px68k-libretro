@@ -20,6 +20,13 @@ extern int webx68k_scsi_init_d2(void);
 extern int webx68k_scsi_init_a4(void);
 extern int webx68k_scsi_drv_attr(void);
 extern int webx68k_scsi_sram_init(void);
+
+/* 調査用(2026-09-04、実行トレース): x68k/mem_wrap.c 側の実行トレースを立ち上げる。 */
+extern void webx68k_trace_start(const char *tag);
+/* 調査用: 端数セクタ(論理セクタ54、8MiB試験片固定)の$04読み出しを処理し終えた瞬間に
+ * トリガする。値は試験片(scripts/_gen-scsi-multi.mts で作った8MiBイメージにSRC2.DAT/
+ * DST2.DATを置いたときの実測値)に固定してあり、汎用の設定ではない。 */
+#define WEBX68K_TRACE_TRIGGER_LOGSEC 54
 /* ドライバをゲストRAMへ置く経路(Human68kの門1/門2を満たすため)。
  * 実体は WebX68k の src/core-shim.c。既定はどちらも0(=無効)。 */
 extern unsigned int webx68k_scsi_drv_ram(void);
@@ -1523,6 +1530,11 @@ static void SCSI_HandleRequestHeader(void)
 							cpu_writemem24(base + n, sec512[n]);
 					}
 				}
+
+				/* 調査用(2026-09-04): 端数セクタの読み出しを処理し終えた瞬間
+				 * (このsのループが正常に抜けた直後)にトレースを起動する。 */
+				if (!failed && logsec == WEBX68K_TRACE_TRIGGER_LOGSEC)
+					webx68k_trace_start("SCSI");
 			}
 
 			cpu_writemem24(addr + 3, failed ? 0x02 : 0x00);

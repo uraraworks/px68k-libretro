@@ -54,6 +54,25 @@ unsigned int SASILastReadLba = 0xffffffff;	/* 直近に読み終えた256バイ�
 unsigned int SASIWriteCount = 0;		/* 256バイトセクタの書き込み完了回数 */
 unsigned int SASILastWriteLba = 0xffffffff;	/* 直近に書き終えた256バイトセクタのLBA */
 
+/*
+ * 調査用(2026-09-04、実行トレース): x68k/mem_wrap.c 側の実行トレースを立ち上げる。
+ * SCSI側(x68k/scsi.c)の論理セクタ54(端数、書き戻しが出ない)に対応する、
+ * SASI側の「端数」256バイトセクタの読み出しを処理し終えた瞬間にトリガする。
+ *
+ * 値は試験片(scripts/_gen-sasi-multi.mts で作ったSASIイメージにSRC2.DAT(1500バイト)/
+ * DST2.DAT(1500バイト、別パターン)を置き、copy c:\src2.dat c:\dst2.dat を実行)に
+ * 固定してある。2026-09-04の実測(このイメージそのもので[SASI-READ]/[SASI-WRITE]の
+ * 生ログを確認): 新DST2.DATのデータ領域はSASI論理セクタ732〜737の6セクタ(1500バイト、
+ * 256バイト×6=1536バイトの中に収まる)。732〜735は1クラスタ分(1024バイト)の
+ * 整列済みセクタで、736がその続きの2クラスタ目の先頭(整列済み、SCSI側の論理セクタ53に
+ * 相当)、737がファイル末尾を含む「端数」セクタ(256バイトのうち実データは220バイトのみ、
+ * SCSI側の論理セクタ54に相当)。738・739はファイルの実データ範囲を超えており
+ * 読み出しはされるが元々書く必要が無いセクタなので、SCSI側の「端数」とは別物であり
+ * トリガには使わない。737は実測でREAD後にWRITEもされている(成功する側)。
+ */
+static const uint32_t WEBX68K_SASI_TRACE_TRIGGER_LBA = 737;
+extern void webx68k_trace_start(const char *tag);
+
 int SASI_StateAction(StateMem *sm, int load, int data_only)
 {
 	SFORMAT StateRegs[] = 
@@ -188,6 +207,8 @@ uint8_t FASTCALL SASI_Read(uint32_t adr)
 				 * 「今読み終えたセクタ」の内容をそのまま観測できる。 */
 				SASIReadCount++;
 				SASILastReadLba = SASI_Sector;
+				if (SASI_Sector == WEBX68K_SASI_TRACE_TRIGGER_LBA)
+					webx68k_trace_start("SASI");
 				if (log_cb)
 					log_cb(RETRO_LOG_INFO,
 						"[SASI-READ] lba=%u blocks_left=%u"

@@ -329,6 +329,68 @@ void webx68k_mem_read_watch_selftest(void)
 	}
 }
 
+/*
+ * 実行トレース(調査用、2026-09-04): SCSIの端数セクタ書き戻しが出ない件の分岐点を
+ * 探すため、トリガ(x68k/scsi.c / x68k/sasi.c から webx68k_trace_start() を呼ぶ)
+ * 以降に実行された全メモリアクセスのPCを記録する。
+ * ホットパス(rm_main/wm_cnt、全アクセスが必ず通る)からは
+ * webx68k_trace_enabled の比較1回だけで早期脱出できるようにする。
+ *
+ * 溜め込まず都度printfする(既存の[SCSI-RAM]/[SCSI-MEMR]と同じ流儀)。
+ * 件数上限で打ち切り、打ち切ったこと自体を必ずログに出す
+ * (「途中で切れた」を「そこで止まった」と読み違えないため)。
+ * PC範囲はHuman68k本体が乗る低位番地帯に既定で絞る(ドライバ内部のコードは
+ * 分岐の比較対象ではないため)。
+ * 2度目以降のトリガ発火は無視する(最初に立ったトリガのみ有効。
+ * SCSI実行とSASI実行は別プロセス起動なので、同一プロセス内で両方が
+ * 発火することは無いが、念のため多重発火を防いでおく)。
+ */
+static int webx68k_trace_enabled = 0;
+static int webx68k_trace_truncated = 0;
+static int webx68k_trace_count = 0;
+static char webx68k_trace_tag[16] = "TRACE";
+#define WEBX68K_TRACE_MAX 10000
+int32_t webx68k_trace_pc_lo = 0x00008000;
+int32_t webx68k_trace_pc_hi = 0x00020000;
+
+void webx68k_trace_start(const char *tag)
+{
+	if (webx68k_trace_enabled)
+		return;
+	webx68k_trace_enabled = 1;
+	if (tag)
+	{
+		size_t n = strlen(tag);
+		if (n >= sizeof(webx68k_trace_tag))
+			n = sizeof(webx68k_trace_tag) - 1;
+		memcpy(webx68k_trace_tag, tag, n);
+		webx68k_trace_tag[n] = '\0';
+	}
+	printf("[%s-TRACE] トリガ発火。以降のPCを記録開始(範囲=$%08x-$%08x 上限=%d)\n",
+	       webx68k_trace_tag, (unsigned)webx68k_trace_pc_lo, (unsigned)webx68k_trace_pc_hi,
+	       WEBX68K_TRACE_MAX);
+}
+
+static void webx68k_trace_record(uint32_t pc)
+{
+	if (!webx68k_trace_enabled)
+		return;
+	if (pc < (uint32_t)webx68k_trace_pc_lo || pc > (uint32_t)webx68k_trace_pc_hi)
+		return;
+	if (webx68k_trace_count >= WEBX68K_TRACE_MAX)
+	{
+		if (!webx68k_trace_truncated)
+		{
+			webx68k_trace_truncated = 1;
+			printf("[%s-TRACE] 上限%dに達したため打ち切った(以降は記録しない)\n",
+			       webx68k_trace_tag, WEBX68K_TRACE_MAX);
+		}
+		return;
+	}
+	printf("[%s-TRACE] #%d pc=$%08x\n", webx68k_trace_tag, webx68k_trace_count, (unsigned)pc);
+	webx68k_trace_count++;
+}
+
 /* forward declarations */
 static void wm_opm(uint32_t addr, uint8_t val);
 static void wm_buserr(uint32_t addr, uint8_t val);
@@ -429,6 +491,8 @@ static void wm_buserr(uint32_t addr, uint8_t val)
 static void wm_cnt(uint32_t addr, uint8_t val)
 {
 	addr &= 0x00ffffff;
+	if (webx68k_trace_enabled)
+		webx68k_trace_record(m68000_get_reg(M68K_PC));
 	if (addr < 0x00c00000) /* Use RAM upto 12MB */
 	{
 		webx68k_ram_watch_check(addr, val);
@@ -467,6 +531,9 @@ static uint8_t rm_main(uint32_t addr)
 		v = GVRAM_Read(addr);
 	else
 		v = MemReadTable[(addr >> 13) & 0xff](addr);
+
+	if (webx68k_trace_enabled)
+		webx68k_trace_record(m68000_get_reg(M68K_PC));
 
 	if (webx68k_mem_read_watch_lo <= webx68k_mem_read_watch_hi)
 		webx68k_mem_read_watch_check(addr, v);
