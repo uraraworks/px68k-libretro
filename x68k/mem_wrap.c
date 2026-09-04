@@ -437,15 +437,25 @@ static void webx68k_trace_record(uint32_t pc)
 int32_t webx68k_drv_hook_strategy  = -1; /* ストラテジ入口のPC。負なら無効 */
 int32_t webx68k_drv_hook_interrupt = -1; /* インタラプト入口のPC。負なら無効 */
 int32_t webx68k_drv_hook_outside   = 0x00010000; /* このPC未満へ戻ったら「呼び出し元へ復帰した」とみなす */
+/*
+ * 入口の判定は「完全一致」ではなく「入口番地から span バイトの窓」で行う。
+ * 2026-09-04 実測: メモリアクセス時に読める PC は命令の先頭ではなく
+ * オペコード取得後の値で、入口番地そのものは一度も現れない
+ * (我々のドライバでも入口 $190020 は現れず $190022 から観測された)。
+ * 完全一致にしていたため、フックが1回も発火しなかった。
+ */
+int32_t webx68k_drv_hook_span      = 6;
 
 static int      webx68k_drv_hook_count = 0;
 static int      webx68k_drv_hook_truncated = 0;
 static uint32_t webx68k_drv_hook_req_addr = 0;
 static int       webx68k_drv_hook_pending = 0;
+static uint32_t webx68k_drv_hook_ret_addr = 0;
 static int       webx68k_drv_hook_busy = 0; /* cpu_readmem24経由の再入防止 */
 #define WEBX68K_DRV_HOOK_MAX 3000
 
-uint32_t cpu_readmem24(uint32_t addr); /* 本ファイル下方で定義。前方宣言して先に使う */
+uint32_t cpu_readmem24(uint32_t addr);       /* 本ファイル下方で定義。前方宣言して先に使う */
+uint32_t cpu_readmem24_dword(uint32_t addr); /* 同上 */
 
 static void webx68k_drv_hook_dump(const char *tag, uint32_t addr)
 {
@@ -482,6 +492,8 @@ static void webx68k_drv_hook_dump(const char *tag, uint32_t addr)
 static void webx68k_drv_hook_check(uint32_t pc)
 {
 	static uint32_t last_pc = 0xffffffff;
+	static int in_strategy = 0;
+	static int in_interrupt = 0;
 
 	/* 既定(両方無効)では比較1回だけで早期脱出。既存トレースと同じ流儀。 */
 	if (webx68k_drv_hook_strategy < 0 && webx68k_drv_hook_interrupt < 0)
@@ -492,8 +504,14 @@ static void webx68k_drv_hook_check(uint32_t pc)
 		return; /* 1命令あたり複数回メモリアクセスが来るため */
 	last_pc = pc;
 
-	if (webx68k_drv_hook_strategy >= 0 && pc == (uint32_t)webx68k_drv_hook_strategy)
+	/* 窓に入っている間は1回だけ発火する(armed)。窓から出たら次を受け付ける。 */
+	if (webx68k_drv_hook_strategy >= 0 &&
+	    pc >= (uint32_t)webx68k_drv_hook_strategy &&
+	    pc <= (uint32_t)(webx68k_drv_hook_strategy + webx68k_drv_hook_span))
 	{
+		if (in_strategy)
+			return;
+		in_strategy = 1;
 		webx68k_drv_hook_req_addr = m68000_get_reg(M68K_A5);
 		printf("[DRV-HOOK] ストラテジ pc=$%08x a1=$%08x a5=$%08x\n",
 		       (unsigned)pc, (unsigned)m68000_get_reg(M68K_A1), (unsigned)webx68k_drv_hook_req_addr);
@@ -501,14 +519,38 @@ static void webx68k_drv_hook_check(uint32_t pc)
 		return;
 	}
 
-	if (webx68k_drv_hook_interrupt >= 0 && pc == (uint32_t)webx68k_drv_hook_interrupt)
+	in_strategy = 0;
+
+	if (webx68k_drv_hook_interrupt >= 0 &&
+	    pc >= (uint32_t)webx68k_drv_hook_interrupt &&
+	    pc <= (uint32_t)(webx68k_drv_hook_interrupt + webx68k_drv_hook_span))
 	{
+		if (in_interrupt)
+			return;
+		in_interrupt = 1;
 		webx68k_drv_hook_dump("I-before", webx68k_drv_hook_req_addr);
+		/* JSR で積まれた戻り先。まだサブルーチンの先頭付近なので a7 の指す
+		 * ロングワードがそのまま戻り先になる。 */
+		webx68k_drv_hook_busy = 1;
+		webx68k_drv_hook_ret_addr = cpu_readmem24_dword(m68000_get_reg(M68K_A7));
+		webx68k_drv_hook_busy = 0;
+		printf("[DRV-HOOK] インタラプト pc=$%08x a5=$%08x 戻り先=$%08x\n",
+		       (unsigned)pc, (unsigned)webx68k_drv_hook_req_addr,
+		       (unsigned)webx68k_drv_hook_ret_addr);
 		webx68k_drv_hook_pending = 1;
 		return;
 	}
+	in_interrupt = 0;
 
-	if (webx68k_drv_hook_pending && pc < (uint32_t)webx68k_drv_hook_outside)
+	/*
+	 * 「処理後」は、インタラプト入口でスタックから読んだ戻り先へ実際に
+	 * 戻った瞬間に採る。2026-09-04 実測: 当初は「pcが境界より下になったら」で
+	 * 採っていたが、それだと処理が終わる前に採ってしまい、$04(読み出し)まで
+	 * 含めて全件「変化なし」になった(＝返答を1つも観測できていなかった)。
+	 */
+	if (webx68k_drv_hook_pending &&
+	    pc >= webx68k_drv_hook_ret_addr &&
+	    pc <= webx68k_drv_hook_ret_addr + (uint32_t)webx68k_drv_hook_span)
 	{
 		webx68k_drv_hook_dump("I-after ", webx68k_drv_hook_req_addr);
 		webx68k_drv_hook_pending = 0;
