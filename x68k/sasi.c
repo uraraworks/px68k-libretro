@@ -72,6 +72,13 @@ unsigned int SASILastWriteLba = 0xffffffff;	/* 直近に書き終えた256バイ
  */
 static const uint32_t WEBX68K_SASI_TRACE_TRIGGER_LBA = 737;
 extern void webx68k_trace_start(const char *tag);
+/* 2026-09-04: [SASI-READ]/[SASI-WRITE]はセクタごとの調査用ログのため、
+ * scsi.c側のSCSIVerboseLogと同じホスト設定(webx68k_scsi_verbose_log、
+ * 既定0=出さない)で一括オフにする。SASIReadCount/SASIWriteCount等の
+ * log_cbを介さないカウンタには一切影響しない。sasi.cにはscsi.cのような
+ * 毎フレームのホスト設定キャッシュが無いため、ここでは(呼び出し頻度も
+ * セクタ単位でscsi.cのSPCポーリングほど密ではないため)直接呼ぶ。 */
+extern int webx68k_scsi_verbose_log(void);
 
 int SASI_StateAction(StateMem *sm, int load, int data_only)
 {
@@ -209,7 +216,7 @@ uint8_t FASTCALL SASI_Read(uint32_t adr)
 				SASILastReadLba = SASI_Sector;
 				if (SASI_Sector == WEBX68K_SASI_TRACE_TRIGGER_LBA)
 					webx68k_trace_start("SASI");
-				if (log_cb)
+				if (log_cb && webx68k_scsi_verbose_log())
 					log_cb(RETRO_LOG_INFO,
 						"[SASI-READ] lba=%u blocks_left=%u"
 						" buf[0..15]=%02x %02x %02x %02x %02x %02x %02x %02x"
@@ -434,7 +441,7 @@ void FASTCALL SASI_Write(uint32_t adr, uint8_t data)
 				 * 進む前)なので、「今書き終えたセクタ」の内容を観測できる。 */
 				SASIWriteCount++;
 				SASILastWriteLba = SASI_Sector;
-				if (log_cb)
+				if (log_cb && webx68k_scsi_verbose_log())
 					log_cb(RETRO_LOG_INFO,
 						"[SASI-WRITE] lba=%u blocks_left=%u flush_result=%d"
 						" buf[0..15]=%02x %02x %02x %02x %02x %02x %02x %02x"

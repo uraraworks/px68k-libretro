@@ -65,9 +65,18 @@ extern int webx68k_scsi_cmd_answer_off(void);
  * 我々のドライバには $01 が一度も来ておらず、$05/$01 とも未対応コマンド
  * 分岐に落ちて +13/+14 を書いていない。「$05の+13に$42を返すことが次段
  * ($01、その先の遅延書き戻し)へ進む条件では」という仮説をA/Bで確かめる
- * ためのスイッチ。既定 0(無効)=従来どおり未対応コマンド分岐へ落ちる。 */
+ * ためのスイッチだった。2026-09-04、この組み合わせで端数セクタ/FATの
+ * 書き戻しが実測できたため解決済みとし、既定 1(有効)に変更した。
+ * globalThis.__webx68kScsiOracleReply に 0 を渡したときだけ無効化され、
+ * 従来どおり未対応コマンド分岐へ落ちる(A/B比較を続けられるように残す)。 */
 extern int webx68k_scsi_oracle_reply(void);
 extern int webx68k_scsi_cmd_answer_val(void);
+/* 【ホスト設定】2026-09-04: [SCSI-REQ]/[SCSI-DESC]/[SCSI-READ]/[SCSI-WRITE]等の
+ * 要求ごと・セクタごとの調査用ログをまとめてオンオフする1本のスイッチ。
+ * 既定 0(出さない)。Worker経由では log_cb がpostMessageを介するため、
+ * これらを常時出すと起動が終わらなくなる(実測)。1でON。
+ * log_cbを介さない独立カウンタ(SCSIReqTotalCount等)には一切影響しない。 */
+extern int webx68k_scsi_verbose_log(void);
 /* 【調査用・実験スイッチ】2026-09-04: cmd-answerは1箇所16bitしか埋められない
  * ため、「指定コマンドの要求ヘッダの指定範囲を、指定バイト値で一様に埋める」
  * 実験用スイッチを別に足す。$05(交換チェック相当)の返答欄がどこにあるかを
@@ -169,7 +178,7 @@ extern int webx68k_scsi_spc_ssts_tc0_bit(void);
  *               spc_psns_b, spc_clear_on_pctl, spc_phase_bits,
  *               spc_ints_xfer, spc_ints_disc, spc_cdb_from_temp,
  *               spc_ssts_data_bit, spc_ssts_tc0_bit
- *   ログ関連:   bus_log_max, bus_pc_limit
+ *   ログ関連:   bus_log_max, bus_pc_limit, verbose_log
  *   返答関連:   reply_err, reply_units, reply_end, reply_bpb,
  *               reply_status, reply_d0, reply_init_once
  *
@@ -196,6 +205,11 @@ static int SCSIHostSpcSstsDataBit;
 static int SCSIHostSpcSstsTc0Bit;
 static int SCSIHostBusLogMax;
 static int SCSIHostBusPcLimit;
+/* 調査用ログの既定オフスイッチ(webx68k_scsi_verbose_log)のキャッシュ値。
+ * 既定0(出さない)。上のSCSIHostXxxと同じ流儀で毎フレーム取り込む。
+ * 変数名だけ他と揃えず短くしてある(あちこちのif (log_cb)から頻繁に
+ * 参照するため)。 */
+static int SCSIVerboseLog;
 static int SCSIHostReplyErr;
 static int SCSIHostReplyUnits;
 static uint32_t SCSIHostReplyEnd;
@@ -216,8 +230,12 @@ static int SCSIHostCmdAnswerCmd = -1;
 static int SCSIHostCmdAnswerOff = -1;
 static int SCSIHostCmdAnswerVal = 0;
 
-/* 【調査用・実験スイッチ】上記extern参照(webx68k_scsi_oracle_reply)。
- * 既定0=無効。1で内蔵ドライバの実測応答($05/$01)を有効化する。 */
+/* 上記extern参照(webx68k_scsi_oracle_reply)。内蔵ドライバの実測応答
+ * ($05/$01)を有効化するかどうか。2026-09-04、この組み合わせで端数
+ * セクタ/FATの書き戻しが実測できたため解決済みとし、既定 1(有効)に
+ * 変更した(この行のCレベル初期値は初回キャッシュ取り込み前の値で、
+ * 実際の既定はJS側 webx68k_scsi_oracle_reply() が返す1)。0を渡した
+ * ときだけ無効化しA/B比較を続けられる。 */
 static int SCSIHostOracleReply = 0;
 
 /* 【調査用・実験スイッチ】上記extern参照。既定はどちらも無効を表す値。 */
@@ -385,7 +403,7 @@ static int SCSI_BusLogGate(void)
 	if (SCSIBusLogCount >= log_max)
 	{
 		SCSIBusLogCapped = 1;
-		if (log_cb)
+		if (log_cb && SCSIVerboseLog)
 			log_cb(RETRO_LOG_INFO, "[SCSI-BUS] ログ上限(%d件)に達したため以降は出力を止める\n", log_max);
 		SCSI_BusReportExcluded();
 		SCSI_BusReportPcDropped();
@@ -435,7 +453,7 @@ static int SCSI_BusPcAllow(uint32_t pc)
 			SCSIBusPcTrackCount[i]++;
 			if (SCSIBusPcTrackCount[i] == limit + 1)
 			{
-				if (log_cb)
+				if (log_cb && SCSIVerboseLog)
 					log_cb(RETRO_LOG_INFO,
 						"[SCSI-BUS] pc=$%08x からのログ対象アクセスが通算%d件を超えたため、"
 						"以後このPCからのログを止める(件数のみ数え続ける)\n",
@@ -496,6 +514,7 @@ void SCSI_RefreshHostConfig(void)
 	SCSIHostSpcSstsTc0Bit = webx68k_scsi_spc_ssts_tc0_bit();
 	SCSIHostBusLogMax = webx68k_scsi_bus_log_max();
 	SCSIHostBusPcLimit = webx68k_scsi_bus_pc_limit();
+	SCSIVerboseLog = webx68k_scsi_verbose_log();
 	SCSIHostReplyErr = webx68k_scsi_reply_err();
 	SCSIHostReplyUnits = webx68k_scsi_reply_units();
 	SCSIHostReplyEnd = (uint32_t)webx68k_scsi_reply_end();
@@ -534,7 +553,7 @@ void SCSI_RefreshHostConfig(void)
 			" req_status_off=%d req_status_val=$%04x"
 			" cmd_answer_cmd=%d cmd_answer_off=%d cmd_answer_val=$%04x"
 			" cmd_fill_cmd=%d cmd_fill_lo=%d cmd_fill_hi=%d cmd_fill_val=$%02x"
-			" oracle_reply=%d"
+			" oracle_reply=%d verbose_log=%d"
 			" drv_attr=$%04x drv_next=$%08x (本物ROM使用中=%d)\n",
 			(unsigned)(SCSIHostSpcIntsSel & 0xff), SCSIHostSpcSstsDataBit, spc_target, SCSIHostSpcClearOnPctl,
 			(unsigned)(SCSIHostReplyErr & 0xff), SCSIHostReplyUnits,
@@ -543,7 +562,7 @@ void SCSI_RefreshHostConfig(void)
 			SCSIHostReqStatusOff, (unsigned)(SCSIHostReqStatusVal & 0xffff),
 			SCSIHostCmdAnswerCmd, SCSIHostCmdAnswerOff, (unsigned)(SCSIHostCmdAnswerVal & 0xffff),
 			SCSIHostCmdFillCmd, SCSIHostCmdFillLo, SCSIHostCmdFillHi, (unsigned)(SCSIHostCmdFillVal & 0xff),
-			SCSIHostOracleReply,
+			SCSIHostOracleReply, SCSIVerboseLog,
 			(unsigned)(SCSIInitDrvAttrForLog & 0xffff), (unsigned)SCSIInitDrvNextForLog,
 			SCSIUsingRealRom);
 	}
@@ -567,7 +586,7 @@ static void SCSI_BusReportPcDropped(void)
 		return;
 	SCSIBusPcDroppedReported = 1;
 
-	if (!log_cb)
+	if (!log_cb || !SCSIVerboseLog)
 		return;
 	limit = SCSIHostBusPcLimit;
 	if (limit <= 0)
@@ -648,7 +667,7 @@ static void SCSI_BusLogFlushCommon(int periodic)
 	inc = SCSIBusRunCount - SCSIBusRunReported;
 	if (inc > 0 && SCSI_BusPcAllow(SCSIBusLastPC) && SCSI_BusLogGate())
 	{
-		if (log_cb)
+		if (log_cb && SCSIVerboseLog)
 		{
 			if (inc <= 1)
 				log_cb(RETRO_LOG_INFO,
@@ -1348,7 +1367,7 @@ static void SCSI_LogDescriptor16(const char *tag, uint32_t transfer_addr, uint32
 	uint32_t desc_addr = transfer_addr - 16;
 	uint32_t n;
 
-	if (!log_cb)
+	if (!log_cb || !SCSIVerboseLog)
 		return;
 	for (n = 0; n < 16; n++)
 		d[n] = cpu_readmem24(desc_addr + n);
@@ -1379,7 +1398,7 @@ static void SCSI_HandleRequestHeader(void)
 
 	for (i = 0; i < sizeof(buf); i++)
 		buf[i] = cpu_readmem24(addr + i);
-	if (log_cb)
+	if (log_cb && SCSIVerboseLog)
 		log_cb(RETRO_LOG_INFO,
 			"[SCSI-REQ] 処理前 addr=$%08x:"
 			" %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x"
@@ -1438,7 +1457,7 @@ static void SCSI_HandleRequestHeader(void)
 			/* ステータスワード +4 にエラービット($8000)を立てて「登録するな」と伝える。 */
 			cpu_writemem24(addr + 4, 0x80);
 			cpu_writemem24(addr + 5, 0x00);
-			if (log_cb)
+			if (log_cb && SCSIVerboseLog)
 				log_cb(RETRO_LOG_INFO,
 					"[SCSI-REQ] 初期化コマンド($00) 処理 #%d: 2回目以降のため「ドライバ無し」で返答した"
 					" (unit数=0 終了addr=$%08x 入力のまま)\n",
@@ -1462,7 +1481,7 @@ static void SCSI_HandleRequestHeader(void)
 				cpu_writemem24(addr + 4, (uint8_t)((reply_status >> 8) & 0xff));
 				cpu_writemem24(addr + 5, (uint8_t)(reply_status & 0xff));
 			}
-			if (log_cb)
+			if (log_cb && SCSIVerboseLog)
 				log_cb(RETRO_LOG_INFO,
 					"[SCSI-REQ] 初期化コマンド($00) 処理 #%d: err=$%02x unit数=%d(%s) 終了addr=$%08x(%s) BPB表ptr=$%08x status=%d%s\n",
 					SCSIReqInitCount, (unsigned)(reply_err & 0xff), reply_units,
@@ -1569,7 +1588,7 @@ static void SCSI_HandleRequestHeader(void)
 			 * 論理セクタ番号はstart(先頭)を使う(処理前と揃える)。 */
 			SCSI_LogDescriptor16("R-after", addr_dst, start);
 
-			if (log_cb)
+			if (log_cb && SCSIVerboseLog)
 			{
 				uint32_t host_lba_first = (part_start * 1024 + start * sect_bytes) / 512;
 				log_cb(RETRO_LOG_INFO,
@@ -1677,7 +1696,7 @@ static void SCSI_HandleRequestHeader(void)
 
 						if (webx68k_scsi_write_sector(host_lba_base + k, sec512) != 0)
 							w_failed = 1;
-						else if (log_cb)
+						else if (log_cb && SCSIVerboseLog)
 						{
 							/* 調査用(2026-09-04): 「書けた」と返ってきたバイト列が
 							 * 本当にそのLBAへ落ちているかを、その場で読み返して照合する。
@@ -1733,7 +1752,7 @@ static void SCSI_HandleRequestHeader(void)
 			cpu_writemem24(addr + 4, 0x81);
 			cpu_writemem24(addr + 5, 0x0a);
 			SCSIReqReplyD0 = 0x800a;
-			if (log_cb)
+			if (log_cb && SCSIVerboseLog)
 				log_cb(RETRO_LOG_INFO,
 					"[SCSI-REQ] 書き込みコマンド($08) を断った"
 					" (ユニット=%u 論理セクタ=%u 個数=%u 転送元=$%08x)\n",
@@ -1744,7 +1763,7 @@ static void SCSI_HandleRequestHeader(void)
 			/* 成功時はステータスワードに触らない(読み出し($04)と同じ書き方)。 */
 			cpu_writemem24(addr + 3, 0x00);
 
-			if (log_cb)
+			if (log_cb && SCSIVerboseLog)
 			{
 				uint32_t host_lba_first = (w_part_start * 1024 + w_start * w_sect_bytes) / 512;
 				/* 調査用(2026-09-04): 16→32バイトへ拡張。ディレクトリエントリ
@@ -1798,7 +1817,7 @@ static void SCSI_HandleRequestHeader(void)
 		cpu_writemem24(addr + 3, 0x00);
 		cpu_writemem24(addr + 4, 0x00);
 		cpu_writemem24(addr + 13, 0x42);
-		if (log_cb)
+		if (log_cb && SCSIVerboseLog)
 			log_cb(RETRO_LOG_INFO,
 				"[SCSI-REQ] コマンド$05: オラクル準拠の応答(+3=$00 +4=$00 +13=$42)を書いた\n");
 	}
@@ -1809,14 +1828,14 @@ static void SCSI_HandleRequestHeader(void)
 		 * 内蔵ドライバが実際に書き戻していた値をそのまま返しているだけ。 */
 		cpu_writemem24(addr + 3, 0x00);
 		cpu_writemem24(addr + 14, 0x01);
-		if (log_cb)
+		if (log_cb && SCSIVerboseLog)
 			log_cb(RETRO_LOG_INFO,
 				"[SCSI-REQ] コマンド$01(ディスク交換チェック): +14=$01(交換なし)を返した\n");
 	}
 	else
 	{
 		SCSIUnsupportedCmdCount++;
-		if (log_cb)
+		if (log_cb && SCSIVerboseLog)
 			log_cb(RETRO_LOG_INFO,
 				"[SCSI-REQ] 未対応コマンド $%02x: 内容を観測するため err=$00 だけ書く\n",
 				(unsigned)cmdnum);
@@ -1887,7 +1906,7 @@ static void SCSI_HandleRequestHeader(void)
 
 	for (i = 0; i < sizeof(buf); i++)
 		buf[i] = cpu_readmem24(addr + i);
-	if (log_cb)
+	if (log_cb && SCSIVerboseLog)
 		log_cb(RETRO_LOG_INFO,
 			"[SCSI-REQ] 処理後 addr=$%08x:"
 			" %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x"
@@ -1907,7 +1926,7 @@ static void SCSI_HostCommand(uint8_t cmd)
 	if (cmd == 0x06)
 	{
 		uint32_t sp = m68000_get_reg(M68K_A7);
-		if (log_cb)
+		if (log_cb && SCSIVerboseLog)
 			log_cb(RETRO_LOG_INFO,
 				"[SCSI] $00000000 に飛んできた #%d sr=$%04x sp=$%08x\n"
 				"        d0=$%08x d1=$%08x d2=$%08x d3=$%08x d4=$%08x d5=$%08x d6=$%08x d7=$%08x\n"
@@ -1929,7 +1948,7 @@ static void SCSI_HostCommand(uint8_t cmd)
 	}
 	if (cmd == 0x05)
 	{
-		if (log_cb)
+		if (log_cb && SCSIVerboseLog)
 			log_cb(RETRO_LOG_INFO,
 				"[SCSI] d2で渡したルーチンが呼ばれた #%d pc=$%08x sr=$%04x\n"
 				"        d0=$%08x d1=$%08x d2=$%08x d3=$%08x d4=$%08x d5=$%08x d6=$%08x d7=$%08x\n"
@@ -1948,7 +1967,7 @@ static void SCSI_HostCommand(uint8_t cmd)
 	}
 	if (cmd == 0x03)
 	{
-		if (log_cb)
+		if (log_cb && SCSIVerboseLog)
 			log_cb(RETRO_LOG_INFO, "[SCSI] ベクタ設定エントリが呼ばれた(陽性対照) (pc=$%08x)\n",
 				(unsigned)m68000_get_reg(M68K_PC));
 
@@ -1966,7 +1985,7 @@ static void SCSI_HostCommand(uint8_t cmd)
 			uint32_t k;
 			for (k = 0; k < 4; k++)
 				SCSIIPL[((0x00ea0090 + k) ^ 1) & 0x1fff] = 0xff;
-			if (log_cb)
+			if (log_cb && SCSIVerboseLog)
 				log_cb(RETRO_LOG_INFO,
 					"[SCSI] ベクタ設定エントリ #%d: 2回目以降のため d2 に $ffffffff を返す(もうドライバは無い)\n",
 					SCSIVectorEntryCount);
@@ -1978,7 +1997,7 @@ static void SCSI_HostCommand(uint8_t cmd)
 		 * $ED0071: SASIフラグ。
 		 * 資料の記述が手元の環境で成り立っているかを実測で確かめるために出す。
 		 * peek8 は SRAM を経由しないため、必ず SRAM_Read() で読む。 */
-		if (log_cb)
+		if (log_cb && SCSIVerboseLog)
 			log_cb(RETRO_LOG_INFO, "[SCSI] SRAM $ed006f=$%02x('%c') $ed0070=$%02x $ed0071=$%02x\n",
 				SRAM_Read(0x00ed006f),
 				(SRAM_Read(0x00ed006f) >= 0x20 && SRAM_Read(0x00ed006f) < 0x7f) ? SRAM_Read(0x00ed006f) : '.',
@@ -2156,7 +2175,7 @@ static void SCSI_HostCommand(uint8_t cmd)
 			SCSIStrategyCallCount++;
 		else if (k == 1)
 			SCSIInterruptCallCount++;
-		if (log_cb)
+		if (log_cb && SCSIVerboseLog)
 		{
 			log_cb(RETRO_LOG_INFO,
 				"[SCSI] d2で渡した%s +$%02x(要素 %d)が呼ばれた #%d pc=$%08x sr=$%04x sp=$%08x\n"
@@ -2206,7 +2225,7 @@ static void SCSI_HostCommand(uint8_t cmd)
 		if (k == 0)
 		{
 			SCSIReqHeaderAddr = m68000_get_reg(M68K_A5);
-			if (log_cb)
+			if (log_cb && SCSIVerboseLog)
 				log_cb(RETRO_LOG_INFO,
 					"[SCSI] ストラテジ: 要求ヘッダのアドレスを a5=$%08x として控えた\n",
 					(unsigned)SCSIReqHeaderAddr);
@@ -2227,7 +2246,7 @@ static void SCSI_HostCommand(uint8_t cmd)
 			{
 				uint32_t before = m68000_get_reg(M68K_D0);
 				m68000_set_reg(M68K_D0, (uint32_t)reply_d0);
-				if (log_cb)
+				if (log_cb && SCSIVerboseLog)
 					log_cb(RETRO_LOG_INFO,
 						"[SCSI] %s: d0 を $%08x -> $%08x に設定した\n",
 						kname, (unsigned)before, (unsigned)reply_d0);
@@ -2263,7 +2282,7 @@ void FASTCALL SCSI_IOCSPort_Write(uint32_t adr, uint8_t data)
 	if (SCSIIOCSLogCount >= SCSI_IOCS_LOG_MAX)
 		return;
 	SCSIIOCSLogCount++;
-	if (log_cb)
+	if (log_cb && SCSIVerboseLog)
 		log_cb(RETRO_LOG_INFO,
 			"[SCSI-IOCS] #%d adr=$%06x cmd=$%02x d1=$%08x d2=$%08x d3=$%08x d4=$%08x d5=$%08x a1=$%08x pc=$%08x\n",
 			SCSIIOCSLogCount, (unsigned)adr, (unsigned)data,
@@ -3462,7 +3481,7 @@ static int SCSI_BusLogShouldSkip(void)
 	{
 		SCSIBusLogFastPathAnnounced = 1;
 		SCSI_BusLogFlush();	/* 保留中の圧縮エントリを一度だけ吐き出す(沈黙対策) */
-		if (log_cb)
+		if (log_cb && SCSIVerboseLog)
 			log_cb(RETRO_LOG_INFO,
 				"[SCSI-BUS] ログ上限到達につき、以後はログ経路を通さない(高速化)\n");
 	}
