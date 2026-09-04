@@ -495,15 +495,31 @@ void FASTCALL CRTC_Write(uint32_t adr, uint8_t data)
          case 0x2a:
          case 0x2b:
             break;
-         case 0x2c:
-         case 0x2d:
-            CRTC_RCFlag[reg-0x2c] = 1;
+         case 0x2c:				/* Turn on the raster copy of the CRTC operation port (and leave it on), */
+         case 0x2d:				/* Apparently it's also permissible to change only the Src/Dst (like Dracula) */
+            /* Kept alongside the per-front-porch execution: while bit 3 is
+             * held, an R22 write also triggers a copy. Guests (IOCS text
+             * clear/scroll) issue far more R22 writes than there are
+             * rasters, so front-porch execution alone loses most of them. */
+            CRTC_RCFlag[reg-0x2c] = 1;	/* Is it executed after changing Dst? */
+            if ((CRTC_Mode&8)&&/*(CRTC_RCFlag[0])&&*/(CRTC_RCFlag[1]))
+            {
+               CRTC_RasterCopy();
+               CRTC_RCFlag[0] = 0;
+               CRTC_RCFlag[1] = 0;
+            }
             break;
       }
    }
    else if (adr==0xe80481)
    {					/* CRTC operation port */
       CRTC_Mode = (data|(CRTC_Mode&2));
+      if (CRTC_Mode&8)
+      {				/* Raster Copy: also triggered when bit 3 is set */
+         CRTC_RasterCopy();
+         CRTC_RCFlag[0] = 0;
+         CRTC_RCFlag[1] = 0;
+      }
       if (CRTC_Mode&2) /* FastClear */
       {
          CRTC_FastClrLine = vline;
