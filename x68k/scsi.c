@@ -1651,20 +1651,40 @@ static void SCSI_HandleRequestHeader(void)
 			if (log_cb)
 			{
 				uint32_t host_lba_first = (w_part_start * 1024 + w_start * w_sect_bytes) / 512;
-				uint8_t rb[16];
+				/* 調査用(2026-09-04): 16→32バイトへ拡張。ディレクトリエントリ
+				 * (32バイト固定長)の先頭クラスタ(+0x1a/0x1b)・サイズ(+0x1c〜0x1f)
+				 * がFAT12/FAT16仮説の検証に要るため、従来の16バイトでは届かなかった。 */
+				uint8_t rb[32];
 				uint32_t n;
 
 				log_cb(RETRO_LOG_INFO,
 					"[SCSI-WRITE] ユニット=%u 論理セクタ=%u 個数=%u 転送元=$%08x 先頭LBA=%u\n",
 					(unsigned)w_unit, (unsigned)w_start, (unsigned)w_count, (unsigned)w_addr,
 					(unsigned)host_lba_first);
-				for (n = 0; n < 16; n++)
+				for (n = 0; n < 32; n++)
 					rb[n] = cpu_readmem24(w_addr + n);
 				log_cb(RETRO_LOG_INFO,
-					"[SCSI-WRITE] 書き込んだ先頭16バイト: %02x %02x %02x %02x %02x %02x %02x %02x"
+					"[SCSI-WRITE] 書き込んだ先頭32バイト: %02x %02x %02x %02x %02x %02x %02x %02x"
+					" %02x %02x %02x %02x %02x %02x %02x %02x"
+					" %02x %02x %02x %02x %02x %02x %02x %02x"
 					" %02x %02x %02x %02x %02x %02x %02x %02x\n",
 					rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], rb[6], rb[7],
-					rb[8], rb[9], rb[10], rb[11], rb[12], rb[13], rb[14], rb[15]);
+					rb[8], rb[9], rb[10], rb[11], rb[12], rb[13], rb[14], rb[15],
+					rb[16], rb[17], rb[18], rb[19], rb[20], rb[21], rb[22], rb[23],
+					rb[24], rb[25], rb[26], rb[27], rb[28], rb[29], rb[30], rb[31]);
+				if (w_sect_bytes >= 32)
+				{
+					/* ディレクトリエントリと仮定した場合の先頭クラスタ・サイズを
+					 * 明示的に添える(offsetはFAT仕様どおり: +0x1a=先頭クラスタ、
+					 * +0x1c=サイズ)。FATセクタ等、ディレクトリでない書き込みでも
+					 * 同じ場所を機械的に読んで出すだけなので、値の意味は呼び出し側で判断する。 */
+					uint16_t cluster = ((uint16_t)rb[26] << 8) | rb[27];
+					uint32_t size = ((uint32_t)rb[28] << 24) | ((uint32_t)rb[29] << 16)
+						| ((uint32_t)rb[30] << 8) | rb[31];
+					log_cb(RETRO_LOG_INFO,
+						"[SCSI-WRITE] +0x1a先頭クラスタ(BE想定)=%u +0x1cサイズ(BE想定)=%u\n",
+						(unsigned)cluster, (unsigned)size);
+				}
 			}
 		}
 	}
