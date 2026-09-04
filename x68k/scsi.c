@@ -44,6 +44,14 @@ extern int webx68k_scsi_reply_init_once(void);
  * へ書く。実体は WebX68k の src/core-shim.c。 */
 extern int webx68k_scsi_req_status_off(void);
 extern int webx68k_scsi_req_status_val(void);
+/* 【調査用・実験スイッチ】2026-09-04: 上のreq-status-off/valは全コマンド共通で
+ * 効いてしまうため、「指定したコマンド番号の要求に対してだけ」書きたい場合の
+ * 専用版。既定 cmd=-1(無効)。cmd>=0のときだけ、そのコマンド番号の要求の処理
+ * 直後に addr+off/addr+off+1 へ16bit値valを書く。実体は WebX68k の
+ * src/core-shim.c。 */
+extern int webx68k_scsi_cmd_answer_cmd(void);
+extern int webx68k_scsi_cmd_answer_off(void);
+extern int webx68k_scsi_cmd_answer_val(void);
 /* デバイスドライバヘッダ +$00(次のヘッダ)に書く値。既定 $ffffffff
  * (このドライバで最後、従来と同じ)。 */
 extern unsigned int webx68k_scsi_drv_next(void);
@@ -170,6 +178,15 @@ static int SCSIHostReplyInitOnce;
 /* 【調査用・実験スイッチ】上記extern参照。既定はどちらも無効を表す値。 */
 static int SCSIHostReqStatusOff = -1;
 static int SCSIHostReqStatusVal = 0;
+
+/* 【調査用・実験スイッチ】2026-09-04: 上の req-status-off/val は全コマンド共通で
+ * 効いてしまうため、「特定のコマンド番号の要求に対してだけ」書きたい場合に使う
+ * 専用スイッチ。cmd<0(既定)なら無効。cmd>=0のときだけ、そのコマンド番号の要求の
+ * 処理直後に addr+off/addr+off+1 へ16bit値valを書く(offは要求ヘッダ先頭からの
+ * バイトオフセット。既存req-status-offと同じ書き方)。 */
+static int SCSIHostCmdAnswerCmd = -1;
+static int SCSIHostCmdAnswerOff = -1;
+static int SCSIHostCmdAnswerVal = 0;
 
 /* drv_attr/drv_next はキャッシュ対象外(SCSI_Init内でしか読まない一回きりの
  * 値)だが、起動時の陽性対照ログ(SCSI_RefreshHostConfig内)に含めるために
@@ -450,6 +467,9 @@ void SCSI_RefreshHostConfig(void)
 	SCSIHostReplyInitOnce = webx68k_scsi_reply_init_once();
 	SCSIHostReqStatusOff = webx68k_scsi_req_status_off();
 	SCSIHostReqStatusVal = webx68k_scsi_req_status_val();
+	SCSIHostCmdAnswerCmd = webx68k_scsi_cmd_answer_cmd();
+	SCSIHostCmdAnswerOff = webx68k_scsi_cmd_answer_off();
+	SCSIHostCmdAnswerVal = webx68k_scsi_cmd_answer_val();
 
 	/* 陽性対照: キャッシュ後も設定が本当に効いているかを1行で確認できる
 	 * ようにする。既定値のままならホストからの指定が届いていない
@@ -469,12 +489,14 @@ void SCSI_RefreshHostConfig(void)
 			"[SCSI] ホスト設定キャッシュ読み込み: ints_sel=$%02x ssts_data_bit=%d target=%d clear_on_pctl=%d"
 			" | reply_err=$%02x reply_units=%d reply_end=$%08x reply_bpb=$%08x reply_status=%d reply_d0=%d reply_init_once=%d"
 			" req_status_off=%d req_status_val=$%04x"
+			" cmd_answer_cmd=%d cmd_answer_off=%d cmd_answer_val=$%04x"
 			" drv_attr=$%04x drv_next=$%08x (本物ROM使用中=%d)\n",
 			(unsigned)(SCSIHostSpcIntsSel & 0xff), SCSIHostSpcSstsDataBit, spc_target, SCSIHostSpcClearOnPctl,
 			(unsigned)(SCSIHostReplyErr & 0xff), SCSIHostReplyUnits,
 			(unsigned)SCSIHostReplyEnd, (unsigned)SCSIHostReplyBpb,
 			SCSIHostReplyStatus, SCSIHostReplyD0, SCSIHostReplyInitOnce,
 			SCSIHostReqStatusOff, (unsigned)(SCSIHostReqStatusVal & 0xffff),
+			SCSIHostCmdAnswerCmd, SCSIHostCmdAnswerOff, (unsigned)(SCSIHostCmdAnswerVal & 0xffff),
 			(unsigned)(SCSIInitDrvAttrForLog & 0xffff), (unsigned)SCSIInitDrvNextForLog,
 			SCSIUsingRealRom);
 	}
@@ -1668,6 +1690,24 @@ static void SCSI_HandleRequestHeader(void)
 			log_cb(RETRO_LOG_INFO,
 				"[SCSI-REQ-INJECT] addr+%u へ $%04x を書いた(実験スイッチ)\n",
 				(unsigned)off, (unsigned)val);
+	}
+
+	/* 【調査用・実験スイッチ】2026-09-04: 指定したコマンド番号の要求に対してだけ、
+	 * 要求ヘッダの指定オフセットへ指定16bit値を書く。上のreq-status-offは全コマンド
+	 * 共通で効いてしまうため、コマンドを絞って故障注入したい場合に使う。
+	 * cmd<0(既定)、またはcmdnumが一致しなければ何もしない。 */
+	if (SCSIHostCmdAnswerCmd >= 0 && (uint8_t)SCSIHostCmdAnswerCmd == cmdnum
+		&& SCSIHostCmdAnswerOff >= 0)
+	{
+		uint32_t coff = (uint32_t)SCSIHostCmdAnswerOff;
+		uint16_t cval = (uint16_t)(SCSIHostCmdAnswerVal & 0xffff);
+		cpu_writemem24(addr + coff, (uint8_t)((cval >> 8) & 0xff));
+		cpu_writemem24(addr + coff + 1, (uint8_t)(cval & 0xff));
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-CMD-ANSWER] コマンド $%02x の要求ヘッダ addr+%u へ $%04x を書いた"
+				"(実験スイッチ)\n",
+				(unsigned)cmdnum, (unsigned)coff, (unsigned)cval);
 	}
 
 	for (i = 0; i < sizeof(buf); i++)
