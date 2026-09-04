@@ -44,6 +44,11 @@ typedef struct
 	int JOY_TYPE[2];
 } Win68Conf;
 
+/* px68k_cpuspeed が受け付ける CPU クロック(MHz)の範囲。選択肢に無い値を
+   フロントエンドから渡す場合もここに収まっていること。 */
+#define PX68K_CLOCK_MHZ_MIN 10
+#define PX68K_CLOCK_MHZ_MAX 1000
+
 extern Win68Conf Config;
 
 void LoadConfig(void);

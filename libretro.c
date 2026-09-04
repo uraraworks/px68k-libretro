@@ -1305,6 +1305,18 @@ static void update_variables(int running)
          Config.clockmhz = 66;
       else if (strcmp(var.value, "100Mhz (OC)") == 0)
          Config.clockmhz = 100;
+      else
+      {
+         /*
+          * 既知の文字列に一致しない場合は先頭の10進数を MHz として読む。
+          * フロントエンドが選択肢に無い任意のクロックを渡せるようにするための拡張で、
+          * "200Mhz (OC)" のような表記も "200" も受け付ける。実機は10MHzなので下限は10、
+          * 上限は1フレームぶんのサイクル数が int に収まる範囲で 1000 に切る。
+          */
+         int mhz = atoi(var.value);
+         if (mhz >= PX68K_CLOCK_MHZ_MIN && mhz <= PX68K_CLOCK_MHZ_MAX)
+            Config.clockmhz = mhz;
+      }
    }
 
    var.key = "px68k_ramsize";
@@ -2261,19 +2273,20 @@ static void WinX68k_Exec(void)
       int until_display_start = -1;
       int until_display_end = -1;
 
-      if (HSYNC_CLK > 0 && CRTC_Regs[0x01] != 0)
+      const int hsync_clk = CRTC_HSyncClockScaled();
+      if (hsync_clk > 0 && CRTC_Regs[0x01] != 0)
       {
-         int hpos = ICount % HSYNC_CLK;
+         int hpos = ICount % hsync_clk;
          /* Keep these display boundaries aligned with GetGPIP() in x68k/mfp.c. */
-         int display_start = (int)CRTC_Regs[0x07] * HSYNC_CLK / CRTC_Regs[0x01];
-         int display_end = (int)CRTC_Regs[0x05] * HSYNC_CLK / CRTC_Regs[0x01];
+         int display_start = (int)CRTC_Regs[0x07] * hsync_clk / CRTC_Regs[0x01];
+         int display_end = (int)CRTC_Regs[0x05] * hsync_clk / CRTC_Regs[0x01];
          until_display_end = (hpos > display_end)
                ? hpos - display_end
-               : hpos + HSYNC_CLK - display_end;
+               : hpos + hsync_clk - display_end;
 
          until_display_start = (hpos > display_start)
                ? hpos - display_start
-               : hpos + HSYNC_CLK - display_start;
+               : hpos + hsync_clk - display_start;
          if (until_display_start > 0 && n > until_display_start)
             n = until_display_start;
          if (until_display_end > 0 && n > until_display_end)
