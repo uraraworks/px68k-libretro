@@ -165,6 +165,17 @@ int32_t webx68k_mem_read_watch_hi = -1;
 int32_t webx68k_mem_read_watch_pc_lo = -1;
 int32_t webx68k_mem_read_watch_pc_hi = -1;
 int webx68k_mem_read_watch_count = 0;
+/* 調査用(2026-09-04): 記録を「実行トレース(webx68k_trace_*)のトリガ発火後」
+ * だけに限定するゲート。既定0=従来通り無条件(過去のwatchA/watchB等の
+ * 使い方を壊さない)。1にすると webx68k_trace_enabled が立つまで
+ * webx68k_mem_read_watch_check() は何もしない。SCSI/SASIの分岐条件を
+ * 突き合わせる際、無関係な場面(起動時のディレクトリ走査等)の読み出しが
+ * 同じPC範囲を通って紛れ込むのを防ぐために追加した。 */
+int webx68k_mem_read_watch_require_trigger = 0;
+
+/* webx68k_trace_enabled の実体は本ファイル下方(実行トレース節)にある static int。
+ * 上の require_trigger ゲートから使うため前方参照する。 */
+static int webx68k_trace_enabled;
 
 /* 自己検査実行中はPCでの絞り込みを適用しない(理由はwebx68k_ram_watch_selftest_active参照) */
 static int webx68k_mem_read_watch_selftest_active = 0;
@@ -253,6 +264,9 @@ static void webx68k_mem_read_watch_check(uint32_t addr, uint8_t val)
 	if (webx68k_mem_read_watch_lo > webx68k_mem_read_watch_hi)
 		return;
 	if ((int32_t)addr < webx68k_mem_read_watch_lo || (int32_t)addr > webx68k_mem_read_watch_hi)
+		return;
+	if (webx68k_mem_read_watch_require_trigger && !webx68k_mem_read_watch_selftest_active &&
+	    !webx68k_trace_enabled)
 		return;
 
 	pc = m68000_get_reg(M68K_PC);
@@ -352,6 +366,13 @@ static char webx68k_trace_tag[16] = "TRACE";
 #define WEBX68K_TRACE_MAX 10000
 int32_t webx68k_trace_pc_lo = 0x00008000;
 int32_t webx68k_trace_pc_hi = 0x00020000;
+/* 調査用(2026-09-04): 「SCSI側が我々のドライバ($190000付近)を呼んでいるか」を
+ * 確定するため、Human68k本体の範囲($8000-$20000)に加えてドライバヘッダ帯
+ * ($180000-$1a0000、我々のドライバヘッダ$190000・SCSIのDPB$190034を含む)も
+ * 同時に記録できるよう、互いに素な第2範囲を追加した。無効化するには
+ * pc2_lo > pc2_hi にする(既定は有効)。 */
+int32_t webx68k_trace_pc2_lo = 0x00180000;
+int32_t webx68k_trace_pc2_hi = 0x001a0000;
 
 void webx68k_trace_start(const char *tag)
 {
@@ -366,16 +387,26 @@ void webx68k_trace_start(const char *tag)
 		memcpy(webx68k_trace_tag, tag, n);
 		webx68k_trace_tag[n] = '\0';
 	}
-	printf("[%s-TRACE] トリガ発火。以降のPCを記録開始(範囲=$%08x-$%08x 上限=%d)\n",
-	       webx68k_trace_tag, (unsigned)webx68k_trace_pc_lo, (unsigned)webx68k_trace_pc_hi,
-	       WEBX68K_TRACE_MAX);
+	if (webx68k_trace_pc2_lo <= webx68k_trace_pc2_hi)
+		printf("[%s-TRACE] トリガ発火。以降のPCを記録開始(範囲=$%08x-$%08x および $%08x-$%08x 上限=%d)\n",
+		       webx68k_trace_tag, (unsigned)webx68k_trace_pc_lo, (unsigned)webx68k_trace_pc_hi,
+		       (unsigned)webx68k_trace_pc2_lo, (unsigned)webx68k_trace_pc2_hi, WEBX68K_TRACE_MAX);
+	else
+		printf("[%s-TRACE] トリガ発火。以降のPCを記録開始(範囲=$%08x-$%08x 上限=%d)\n",
+		       webx68k_trace_tag, (unsigned)webx68k_trace_pc_lo, (unsigned)webx68k_trace_pc_hi,
+		       WEBX68K_TRACE_MAX);
 }
 
 static void webx68k_trace_record(uint32_t pc)
 {
+	int in_range1, in_range2;
+
 	if (!webx68k_trace_enabled)
 		return;
-	if (pc < (uint32_t)webx68k_trace_pc_lo || pc > (uint32_t)webx68k_trace_pc_hi)
+	in_range1 = (pc >= (uint32_t)webx68k_trace_pc_lo && pc <= (uint32_t)webx68k_trace_pc_hi);
+	in_range2 = (webx68k_trace_pc2_lo <= webx68k_trace_pc2_hi) &&
+	            (pc >= (uint32_t)webx68k_trace_pc2_lo && pc <= (uint32_t)webx68k_trace_pc2_hi);
+	if (!in_range1 && !in_range2)
 		return;
 	if (webx68k_trace_count >= WEBX68K_TRACE_MAX)
 	{

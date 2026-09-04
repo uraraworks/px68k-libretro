@@ -59,6 +59,9 @@ extern int32_t webx68k_mem_read_watch_hi;
 extern int32_t webx68k_mem_read_watch_pc_lo;
 extern int32_t webx68k_mem_read_watch_pc_hi;
 extern int      webx68k_mem_read_watch_count;
+/* 調査用(2026-09-04): 実行トレース(webx68k_trace_*)のトリガ発火後だけに
+ * 記録を限定するゲート。既定0=従来通り無条件。x68k/mem_wrap.c 参照。 */
+extern int      webx68k_mem_read_watch_require_trigger;
 
 void webx68k_mem_read_watch_selftest(void);
 void webx68k_mem_read_watch_refresh(void); /* WebX68k-storage/src/core-shim.c 側で定義 */
