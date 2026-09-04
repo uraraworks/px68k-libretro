@@ -422,6 +422,99 @@ static void webx68k_trace_record(uint32_t pc)
 	webx68k_trace_count++;
 }
 
+/*
+ * デバイスドライバ入口フック(調査用、2026-09-04): 「Human68kが我々のSCSIドライバへ
+ * 書き戻し($08)を発行しない」件の比較対象として、成功している側
+ * (Human68k内蔵HARDDSKドライバ=SASI用)が受け取る要求ヘッダをそのまま覗く。
+ * 逆アセはせず、走らせて外から観測するだけ。
+ *
+ * ストラテジ入口PC・インタラプト入口PCをJS側(core-shim.cのwebx68k_drv_hook_refresh()
+ * 経由)から指定し、そこに来た時点のa5(要求ヘッダ番地。x68k/scsi.cのSCSIReqHeaderAddrと
+ * 同じ流儀で、我々のドライバではa5で来ることを実測済み)を控えて26バイトダンプする。
+ * 既定は全部無効(strategy/interrupt < 0)で、1バイトも挙動を変えない。
+ * ホットパス(rm_main/wm_cnt)からは先頭の比較1回だけで早期脱出できるようにする。
+ */
+int32_t webx68k_drv_hook_strategy  = -1; /* ストラテジ入口のPC。負なら無効 */
+int32_t webx68k_drv_hook_interrupt = -1; /* インタラプト入口のPC。負なら無効 */
+int32_t webx68k_drv_hook_outside   = 0x00010000; /* このPC未満へ戻ったら「呼び出し元へ復帰した」とみなす */
+
+static int      webx68k_drv_hook_count = 0;
+static int      webx68k_drv_hook_truncated = 0;
+static uint32_t webx68k_drv_hook_req_addr = 0;
+static int       webx68k_drv_hook_pending = 0;
+static int       webx68k_drv_hook_busy = 0; /* cpu_readmem24経由の再入防止 */
+#define WEBX68K_DRV_HOOK_MAX 3000
+
+uint32_t cpu_readmem24(uint32_t addr); /* 本ファイル下方で定義。前方宣言して先に使う */
+
+static void webx68k_drv_hook_dump(const char *tag, uint32_t addr)
+{
+	uint8_t buf[26];
+	unsigned i;
+
+	if (webx68k_drv_hook_count >= WEBX68K_DRV_HOOK_MAX)
+	{
+		if (!webx68k_drv_hook_truncated)
+		{
+			webx68k_drv_hook_truncated = 1;
+			printf("[DRV-HOOK] 上限%dに達したため打ち切った(以降は記録しない)\n", WEBX68K_DRV_HOOK_MAX);
+		}
+		return;
+	}
+	if (addr == 0 || addr >= 0x00c00000)
+		return;
+
+	webx68k_drv_hook_busy = 1;
+	for (i = 0; i < sizeof(buf); i++)
+		buf[i] = (uint8_t)cpu_readmem24(addr + i);
+	webx68k_drv_hook_busy = 0;
+
+	printf("[DRV-HOOK] %s addr=$%08x:"
+	       " %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x"
+	       " %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+	       tag, (unsigned)addr,
+	       buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+	       buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+	       buf[20], buf[21], buf[22], buf[23], buf[24], buf[25]);
+	webx68k_drv_hook_count++;
+}
+
+static void webx68k_drv_hook_check(uint32_t pc)
+{
+	static uint32_t last_pc = 0xffffffff;
+
+	/* 既定(両方無効)では比較1回だけで早期脱出。既存トレースと同じ流儀。 */
+	if (webx68k_drv_hook_strategy < 0 && webx68k_drv_hook_interrupt < 0)
+		return;
+	if (webx68k_drv_hook_busy)
+		return; /* cpu_readmem24経由の再入 */
+	if (pc == last_pc)
+		return; /* 1命令あたり複数回メモリアクセスが来るため */
+	last_pc = pc;
+
+	if (webx68k_drv_hook_strategy >= 0 && pc == (uint32_t)webx68k_drv_hook_strategy)
+	{
+		webx68k_drv_hook_req_addr = m68000_get_reg(M68K_A5);
+		printf("[DRV-HOOK] ストラテジ pc=$%08x a1=$%08x a5=$%08x\n",
+		       (unsigned)pc, (unsigned)m68000_get_reg(M68K_A1), (unsigned)webx68k_drv_hook_req_addr);
+		webx68k_drv_hook_dump("S-before", webx68k_drv_hook_req_addr);
+		return;
+	}
+
+	if (webx68k_drv_hook_interrupt >= 0 && pc == (uint32_t)webx68k_drv_hook_interrupt)
+	{
+		webx68k_drv_hook_dump("I-before", webx68k_drv_hook_req_addr);
+		webx68k_drv_hook_pending = 1;
+		return;
+	}
+
+	if (webx68k_drv_hook_pending && pc < (uint32_t)webx68k_drv_hook_outside)
+	{
+		webx68k_drv_hook_dump("I-after ", webx68k_drv_hook_req_addr);
+		webx68k_drv_hook_pending = 0;
+	}
+}
+
 /* forward declarations */
 static void wm_opm(uint32_t addr, uint8_t val);
 static void wm_buserr(uint32_t addr, uint8_t val);
@@ -524,6 +617,7 @@ static void wm_cnt(uint32_t addr, uint8_t val)
 	addr &= 0x00ffffff;
 	if (webx68k_trace_enabled)
 		webx68k_trace_record(m68000_get_reg(M68K_PC));
+	webx68k_drv_hook_check(m68000_get_reg(M68K_PC));
 	if (addr < 0x00c00000) /* Use RAM upto 12MB */
 	{
 		webx68k_ram_watch_check(addr, val);
@@ -565,6 +659,7 @@ static uint8_t rm_main(uint32_t addr)
 
 	if (webx68k_trace_enabled)
 		webx68k_trace_record(m68000_get_reg(M68K_PC));
+	webx68k_drv_hook_check(m68000_get_reg(M68K_PC));
 
 	if (webx68k_mem_read_watch_lo <= webx68k_mem_read_watch_hi)
 		webx68k_mem_read_watch_check(addr, v);

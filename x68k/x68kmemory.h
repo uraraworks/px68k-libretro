@@ -70,4 +70,18 @@ void webx68k_mem_read_watch_refresh(void); /* WebX68k-storage/src/core-shim.c �
  * 詳細は x68k/mem_wrap.c の webx68k_mem_read_watch_flush_periodic() 参照。 */
 void webx68k_mem_read_watch_flush_periodic(void);
 
+/*
+ * デバイスドライバ入口フック(調査用、2026-09-04): 成功している側(Human68k内蔵
+ * HARDDSKドライバ=SASI用)が受け取る要求ヘッダを、逆アセせず走らせて外から覗く。
+ * 監視対象PCは core-shim.c の webx68k_drv_hook_refresh() が
+ * globalThis.__webx68kDrvHookStrategy / __webx68kDrvHookInterrupt から
+ * 毎フレーム反映する。既定は無効(共に -1)で1バイトも挙動を変えない。
+ * 詳細は x68k/mem_wrap.c 冒頭付近のコメント参照。
+ */
+extern int32_t webx68k_drv_hook_strategy;
+extern int32_t webx68k_drv_hook_interrupt;
+extern int32_t webx68k_drv_hook_outside;
+
+void webx68k_drv_hook_refresh(void); /* WebX68k-storage/src/core-shim.c 側で定義 */
+
 #endif

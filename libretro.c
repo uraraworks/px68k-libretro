@@ -2451,6 +2451,7 @@ void retro_run(void)
       webx68k_ram_watch_selftest(); /* 初期化の最後に陽性対照 */
       webx68k_mem_read_watch_refresh();
       webx68k_mem_read_watch_selftest(); /* 初期化の最後に陽性対照 */
+      webx68k_drv_hook_refresh();
       /* Initialization done */
       update_variables(0);
       soundbuf_size = current_soundbuf_size();
@@ -2459,6 +2460,7 @@ void retro_run(void)
 
    webx68k_ram_watch_refresh(); /* 毎フレーム先頭でJS側の監視範囲をstaticへ反映 */
    webx68k_mem_read_watch_refresh();
+   webx68k_drv_hook_refresh();
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       update_variables(1);
