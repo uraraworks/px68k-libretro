@@ -1280,6 +1280,29 @@ unsigned int SCSIWriteCount = 0;		/* $08(書き込み)が呼ばれた総回数 *
 unsigned int SCSILastWriteUnit = 0xffffffff;	/* 直近の$08のユニット番号 */
 unsigned int SCSILastWriteLogsec = 0xffffffff;	/* 直近の$08の開始論理セクタ */
 
+/* 調査用(2026-09-04): Human68kのディスクバッファは「16バイトの記述子+1024バイトの
+ * 本体」が$410間隔で並ぶ配列とみられる(実測: 観測されたバッファ番地が$410間隔)。
+ * 転送先/転送元アドレスの直前16バイトがその記述子にあたる。$04/$08 それぞれの
+ * 処理の前後で、この16バイトを論理セクタ番号と対応づけてログに出す。挙動は変えない
+ * (読み出すだけ)。tag は "R-before" のように呼び出し側で区別できる文字列を渡す。 */
+static void SCSI_LogDescriptor16(const char *tag, uint32_t transfer_addr, uint32_t logsec)
+{
+	uint8_t d[16];
+	uint32_t desc_addr = transfer_addr - 16;
+	uint32_t n;
+
+	if (!log_cb)
+		return;
+	for (n = 0; n < 16; n++)
+		d[n] = cpu_readmem24(desc_addr + n);
+	log_cb(RETRO_LOG_INFO,
+		"[SCSI-DESC] %s 論理セクタ=%u 転送先/元=$%08x 記述子addr=$%08x:"
+		" %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		tag, (unsigned)logsec, (unsigned)transfer_addr, (unsigned)desc_addr,
+		d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+		d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+}
+
 static void SCSI_HandleRequestHeader(void)
 {
 	uint8_t buf[26];
@@ -1410,6 +1433,10 @@ static void SCSI_HandleRequestHeader(void)
 		SCSILastReadUnit = unit;
 		SCSILastReadLogsec = start;
 
+		/* 調査用(2026-09-04): 転送先の直前16バイト(記述子)を処理前に記録する。
+		 * addr_dstが0や不正でも読み出すだけなので実害は無い。 */
+		SCSI_LogDescriptor16("R-before", addr_dst, start);
+
 		if (unit >= (uint32_t)SCSIPartCount)
 		{
 			if (log_cb)
@@ -1476,6 +1503,10 @@ static void SCSI_HandleRequestHeader(void)
 
 			cpu_writemem24(addr + 3, failed ? 0x02 : 0x00);
 
+			/* 調査用(2026-09-04): 処理後の記述子。処理前と突き合わせるため
+			 * 論理セクタ番号はstart(先頭)を使う(処理前と揃える)。 */
+			SCSI_LogDescriptor16("R-after", addr_dst, start);
+
 			if (log_cb)
 			{
 				uint32_t host_lba_first = (part_start * 1024 + start * sect_bytes) / 512;
@@ -1533,6 +1564,9 @@ static void SCSI_HandleRequestHeader(void)
 		SCSIWriteCount++;
 		SCSILastWriteUnit = w_unit;
 		SCSILastWriteLogsec = w_start;
+
+		/* 調査用(2026-09-04): 転送元の直前16バイト(記述子)を処理前に記録する。 */
+		SCSI_LogDescriptor16("W-before", w_addr, w_start);
 
 		if (w_unit >= (uint32_t)SCSIPartCount)
 		{
@@ -1687,6 +1721,10 @@ static void SCSI_HandleRequestHeader(void)
 				}
 			}
 		}
+
+		/* 調査用(2026-09-04): 処理後の記述子。w_failedで断った場合も含めて
+		 * 必ず出す(断った場合に記述子が変わっていないかも確認材料になる)。 */
+		SCSI_LogDescriptor16("W-after", w_addr, w_start);
 	}
 	else
 	{
