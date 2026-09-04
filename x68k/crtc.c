@@ -12,6 +12,7 @@
 #include	"bg.h"
 #include	"m68000.h"
 #include	"crtc.h"
+#include	"prop.h"
 
 uint8_t	CRTC_Regs[24*2];
 uint8_t	CRTC_Mode = 0;
@@ -88,6 +89,21 @@ int CRTC_StateAction(StateMem *sm, int load, int data_only)
    }
 
 	return ret;
+}
+
+/*
+ * ICount(CPUの残りサイクル)は Config.clockmhz でスケールされるが、HSYNC_CLK は CRTC の
+ * タイミングから求まる 10MHz 基準のマシン定数でスケールされない。両者を直接 % で
+ * 突き合わせると、OC設定時に1ラスタあたり clockmhz/10 回ぶん水平位置が周回してしまう
+ * (100MHz で10回)。ICount と比較する側だけを同じ単位へ換算する。
+ */
+int CRTC_HSyncClockScaled(void)
+{
+	int scaled;
+	if (HSYNC_CLK <= 0)
+		return 0;
+	scaled = (int)(((int64_t)HSYNC_CLK * Config.clockmhz) / 10);
+	return (scaled > 0) ? scaled : 1;
 }
 
 static void CRTC_RasterCopy(void)

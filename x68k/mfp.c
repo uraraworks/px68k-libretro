@@ -147,15 +147,16 @@ void MFP_Init(void)
 static uint8_t GetGPIP(void)
 {
 	uint8_t ret = 0x20; /* bit 5 is always 1 */
-	int hpos    = (int)(m68000_current_icount() % HSYNC_CLK);
+	const int hsync_clk = CRTC_HSyncClockScaled();
+	int hpos    = (hsync_clk > 0) ? (int)(m68000_current_icount() % hsync_clk) : 0;
 
 	if ((vline >= CRTC_VSTART) && (vline < CRTC_VEND))
 		ret     |= 0x13;
 	else
 		ret     |= 0x03;
 
-	if ((hpos >= ((int)CRTC_Regs[0x05] * HSYNC_CLK / CRTC_Regs[0x01])) &&
-	    (hpos < ((int)CRTC_Regs[0x07] * HSYNC_CLK / CRTC_Regs[0x01])))
+	if ((hpos >= ((int)CRTC_Regs[0x05] * hsync_clk / CRTC_Regs[0x01])) &&
+	    (hpos < ((int)CRTC_Regs[0x07] * hsync_clk / CRTC_Regs[0x01])))
 		ret     &= 0x7f;
 	else
 		ret     |= 0x80;

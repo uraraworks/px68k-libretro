@@ -31,6 +31,7 @@ void CRTC_Init(void);
 uint32_t CRTC_GetFrameClocks(void);
 
 void CRTC_HorizontalFrontPorch(void);
+int CRTC_HSyncClockScaled(void);
 
 uint8_t FASTCALL CRTC_Read(uint32_t adr);
 void FASTCALL CRTC_Write(uint32_t adr, uint8_t data);
