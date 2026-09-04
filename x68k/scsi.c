@@ -37,6 +37,13 @@ extern int webx68k_scsi_write_sector(unsigned int lba, const unsigned char *buf)
  * 既定 -1(何もしない)。呼び出し時の値のまま戻す従来の挙動と同じ。 */
 extern int webx68k_scsi_reply_d0(void);
 extern int webx68k_scsi_reply_init_once(void);
+/* 【調査用・実験スイッチ】2026-09-04: 成功した要求の処理直後に、要求ヘッダの
+ * 任意オフセットへ任意の16bit値を書き込む。Human68kが要求ヘッダの
+ * どの欄を実際に読んでいるか(故障注入で壊せるか)を確認するための道具。
+ * 既定 off=-1(無効)。off>=0 のときだけ addr+off(上位byte)/addr+off+1(下位byte)
+ * へ書く。実体は WebX68k の src/core-shim.c。 */
+extern int webx68k_scsi_req_status_off(void);
+extern int webx68k_scsi_req_status_val(void);
 /* デバイスドライバヘッダ +$00(次のヘッダ)に書く値。既定 $ffffffff
  * (このドライバで最後、従来と同じ)。 */
 extern unsigned int webx68k_scsi_drv_next(void);
@@ -160,6 +167,9 @@ static uint32_t SCSIHostReplyBpb;
 static int SCSIHostReplyStatus;
 static int SCSIHostReplyD0;
 static int SCSIHostReplyInitOnce;
+/* 【調査用・実験スイッチ】上記extern参照。既定はどちらも無効を表す値。 */
+static int SCSIHostReqStatusOff = -1;
+static int SCSIHostReqStatusVal = 0;
 
 /* drv_attr/drv_next はキャッシュ対象外(SCSI_Init内でしか読まない一回きりの
  * 値)だが、起動時の陽性対照ログ(SCSI_RefreshHostConfig内)に含めるために
@@ -438,6 +448,8 @@ void SCSI_RefreshHostConfig(void)
 	SCSIHostReplyStatus = webx68k_scsi_reply_status();
 	SCSIHostReplyD0 = webx68k_scsi_reply_d0();
 	SCSIHostReplyInitOnce = webx68k_scsi_reply_init_once();
+	SCSIHostReqStatusOff = webx68k_scsi_req_status_off();
+	SCSIHostReqStatusVal = webx68k_scsi_req_status_val();
 
 	/* 陽性対照: キャッシュ後も設定が本当に効いているかを1行で確認できる
 	 * ようにする。既定値のままならホストからの指定が届いていない
@@ -456,11 +468,13 @@ void SCSI_RefreshHostConfig(void)
 		log_cb(RETRO_LOG_INFO,
 			"[SCSI] ホスト設定キャッシュ読み込み: ints_sel=$%02x ssts_data_bit=%d target=%d clear_on_pctl=%d"
 			" | reply_err=$%02x reply_units=%d reply_end=$%08x reply_bpb=$%08x reply_status=%d reply_d0=%d reply_init_once=%d"
+			" req_status_off=%d req_status_val=$%04x"
 			" drv_attr=$%04x drv_next=$%08x (本物ROM使用中=%d)\n",
 			(unsigned)(SCSIHostSpcIntsSel & 0xff), SCSIHostSpcSstsDataBit, spc_target, SCSIHostSpcClearOnPctl,
 			(unsigned)(SCSIHostReplyErr & 0xff), SCSIHostReplyUnits,
 			(unsigned)SCSIHostReplyEnd, (unsigned)SCSIHostReplyBpb,
 			SCSIHostReplyStatus, SCSIHostReplyD0, SCSIHostReplyInitOnce,
+			SCSIHostReqStatusOff, (unsigned)(SCSIHostReqStatusVal & 0xffff),
 			(unsigned)(SCSIInitDrvAttrForLog & 0xffff), (unsigned)SCSIInitDrvNextForLog,
 			SCSIUsingRealRom);
 	}
@@ -1640,6 +1654,20 @@ static void SCSI_HandleRequestHeader(void)
 				"[SCSI-REQ] 未対応コマンド $%02x: 内容を観測するため err=$00 だけ書く\n",
 				(unsigned)cmdnum);
 		cpu_writemem24(addr + 3, 0x00);
+	}
+
+	/* 【調査用・実験スイッチ】2026-09-04: 成功した要求の処理後に、任意の
+	 * オフセットへ任意の16bit値を書く。off<0(既定)なら何もしない。 */
+	if (SCSIHostReqStatusOff >= 0)
+	{
+		uint32_t off = (uint32_t)SCSIHostReqStatusOff;
+		uint16_t val = (uint16_t)(SCSIHostReqStatusVal & 0xffff);
+		cpu_writemem24(addr + off, (uint8_t)((val >> 8) & 0xff));
+		cpu_writemem24(addr + off + 1, (uint8_t)(val & 0xff));
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-REQ-INJECT] addr+%u へ $%04x を書いた(実験スイッチ)\n",
+				(unsigned)off, (unsigned)val);
 	}
 
 	for (i = 0; i < sizeof(buf); i++)
