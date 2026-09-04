@@ -438,6 +438,11 @@ CXXFLAGS += $(FLAGS) $(CPU_FLAGS) -fpermissive
 #CFLAGS   += $(FLAGS) -std=c99 $(CPU_FLAGS) -D_GNU_SOURCE
 CFLAGS   += $(FLAGS) $(CPU_FLAGS)
 
+# WebX68kのSCC結合テスト専用APIは、明示した診断ビルドだけに含める。
+ifeq ($(WEBX68K_CORE_TEST_EXPORTS),1)
+CFLAGS += -DWEBX68K_CORE_TEST_EXPORTS=1
+endif
+
 $(TARGET): $(OBJECTS)
 ifeq ($(STATIC_LINKING), 1)
 	$(AR) rcs $@ $(OBJECTS)
