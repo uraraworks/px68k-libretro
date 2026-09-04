@@ -58,6 +58,15 @@ extern int webx68k_scsi_req_status_val(void);
  * src/core-shim.c。 */
 extern int webx68k_scsi_cmd_answer_cmd(void);
 extern int webx68k_scsi_cmd_answer_off(void);
+/* 2026-09-04: SASI(内蔵HARDDSKドライバ、成功する側)とSCSI(我々のドライバ、
+ * 失敗する側)を同時マウントした1回の起動で、内蔵ドライバが要求ヘッダに
+ * 書き戻す値を実測した。$05のあと必ず$01(ディスク交換チェック)が来て、
+ * 内蔵ドライバは $05 で +3=$00 +4=$00 +13=$42、$01 で +14=$01 を返している。
+ * 我々のドライバには $01 が一度も来ておらず、$05/$01 とも未対応コマンド
+ * 分岐に落ちて +13/+14 を書いていない。「$05の+13に$42を返すことが次段
+ * ($01、その先の遅延書き戻し)へ進む条件では」という仮説をA/Bで確かめる
+ * ためのスイッチ。既定 0(無効)=従来どおり未対応コマンド分岐へ落ちる。 */
+extern int webx68k_scsi_oracle_reply(void);
 extern int webx68k_scsi_cmd_answer_val(void);
 /* 【調査用・実験スイッチ】2026-09-04: cmd-answerは1箇所16bitしか埋められない
  * ため、「指定コマンドの要求ヘッダの指定範囲を、指定バイト値で一様に埋める」
@@ -206,6 +215,10 @@ static int SCSIHostReqStatusVal = 0;
 static int SCSIHostCmdAnswerCmd = -1;
 static int SCSIHostCmdAnswerOff = -1;
 static int SCSIHostCmdAnswerVal = 0;
+
+/* 【調査用・実験スイッチ】上記extern参照(webx68k_scsi_oracle_reply)。
+ * 既定0=無効。1で内蔵ドライバの実測応答($05/$01)を有効化する。 */
+static int SCSIHostOracleReply = 0;
 
 /* 【調査用・実験スイッチ】上記extern参照。既定はどちらも無効を表す値。 */
 static int SCSIHostCmdFillCmd = -1;
@@ -495,6 +508,7 @@ void SCSI_RefreshHostConfig(void)
 	SCSIHostCmdAnswerCmd = webx68k_scsi_cmd_answer_cmd();
 	SCSIHostCmdAnswerOff = webx68k_scsi_cmd_answer_off();
 	SCSIHostCmdAnswerVal = webx68k_scsi_cmd_answer_val();
+	SCSIHostOracleReply = webx68k_scsi_oracle_reply();
 	SCSIHostCmdFillCmd = webx68k_scsi_cmd_fill_cmd();
 	SCSIHostCmdFillLo = webx68k_scsi_cmd_fill_lo();
 	SCSIHostCmdFillHi = webx68k_scsi_cmd_fill_hi();
@@ -520,6 +534,7 @@ void SCSI_RefreshHostConfig(void)
 			" req_status_off=%d req_status_val=$%04x"
 			" cmd_answer_cmd=%d cmd_answer_off=%d cmd_answer_val=$%04x"
 			" cmd_fill_cmd=%d cmd_fill_lo=%d cmd_fill_hi=%d cmd_fill_val=$%02x"
+			" oracle_reply=%d"
 			" drv_attr=$%04x drv_next=$%08x (本物ROM使用中=%d)\n",
 			(unsigned)(SCSIHostSpcIntsSel & 0xff), SCSIHostSpcSstsDataBit, spc_target, SCSIHostSpcClearOnPctl,
 			(unsigned)(SCSIHostReplyErr & 0xff), SCSIHostReplyUnits,
@@ -528,6 +543,7 @@ void SCSI_RefreshHostConfig(void)
 			SCSIHostReqStatusOff, (unsigned)(SCSIHostReqStatusVal & 0xffff),
 			SCSIHostCmdAnswerCmd, SCSIHostCmdAnswerOff, (unsigned)(SCSIHostCmdAnswerVal & 0xffff),
 			SCSIHostCmdFillCmd, SCSIHostCmdFillLo, SCSIHostCmdFillHi, (unsigned)(SCSIHostCmdFillVal & 0xff),
+			SCSIHostOracleReply,
 			(unsigned)(SCSIInitDrvAttrForLog & 0xffff), (unsigned)SCSIInitDrvNextForLog,
 			SCSIUsingRealRom);
 	}
@@ -1771,6 +1787,31 @@ static void SCSI_HandleRequestHeader(void)
 		/* 調査用(2026-09-04): 処理後の記述子。w_failedで断った場合も含めて
 		 * 必ず出す(断った場合に記述子が変わっていないかも確認材料になる)。 */
 		SCSI_LogDescriptor16("W-after", w_addr, w_start);
+	}
+	else if (SCSIHostOracleReply != 0 && cmdnum == 0x05)
+	{
+		/* 【調査用・実験スイッチ】2026-09-04: SASI(内蔵HARDDSKドライバ)を
+		 * 同時マウントして実測した値をそのまま返す。$42 の意味は未確定
+		 * (逆アセンブルはしていない。内蔵ドライバが実際に書き戻していた
+		 * 値を写しただけ)。既定は無効(SCSIHostOracleReply==0)で、その
+		 * ときは従来どおり下の「未対応コマンド」分岐へ落ちる。 */
+		cpu_writemem24(addr + 3, 0x00);
+		cpu_writemem24(addr + 4, 0x00);
+		cpu_writemem24(addr + 13, 0x42);
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-REQ] コマンド$05: オラクル準拠の応答(+3=$00 +4=$00 +13=$42)を書いた\n");
+	}
+	else if (SCSIHostOracleReply != 0 && cmdnum == 0x01)
+	{
+		/* 【調査用・実験スイッチ】2026-09-04: 上と同じく内蔵ドライバの実測値。
+		 * +14=$01 の意味は未確定(「交換なし」という解釈は未検証の推測)。
+		 * 内蔵ドライバが実際に書き戻していた値をそのまま返しているだけ。 */
+		cpu_writemem24(addr + 3, 0x00);
+		cpu_writemem24(addr + 14, 0x01);
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-REQ] コマンド$01(ディスク交換チェック): +14=$01(交換なし)を返した\n");
 	}
 	else
 	{
