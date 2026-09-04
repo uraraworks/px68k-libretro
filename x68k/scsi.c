@@ -52,6 +52,18 @@ extern int webx68k_scsi_req_status_val(void);
 extern int webx68k_scsi_cmd_answer_cmd(void);
 extern int webx68k_scsi_cmd_answer_off(void);
 extern int webx68k_scsi_cmd_answer_val(void);
+/* 【調査用・実験スイッチ】2026-09-04: cmd-answerは1箇所16bitしか埋められない
+ * ため、「指定コマンドの要求ヘッダの指定範囲を、指定バイト値で一様に埋める」
+ * 実験用スイッチを別に足す。$05(交換チェック相当)の返答欄がどこにあるかを
+ * 総当たりで絞り込むための道具。既定 cmd=-1(無効)。cmd>=0 かつ lo<=hi の
+ * ときだけ、そのコマンド番号の要求の処理直後に addr+lo〜addr+hi(両端含む)を
+ * 1バイトずつ val で埋める。+3(結果コード)は既知の理由(非ゼロにすると
+ * マウントごと壊れる)により対象外とし、範囲に+3が含まれていても skip する。
+ * 実体は WebX68k の src/core-shim.c。 */
+extern int webx68k_scsi_cmd_fill_cmd(void);
+extern int webx68k_scsi_cmd_fill_lo(void);
+extern int webx68k_scsi_cmd_fill_hi(void);
+extern int webx68k_scsi_cmd_fill_val(void);
 /* デバイスドライバヘッダ +$00(次のヘッダ)に書く値。既定 $ffffffff
  * (このドライバで最後、従来と同じ)。 */
 extern unsigned int webx68k_scsi_drv_next(void);
@@ -187,6 +199,12 @@ static int SCSIHostReqStatusVal = 0;
 static int SCSIHostCmdAnswerCmd = -1;
 static int SCSIHostCmdAnswerOff = -1;
 static int SCSIHostCmdAnswerVal = 0;
+
+/* 【調査用・実験スイッチ】上記extern参照。既定はどちらも無効を表す値。 */
+static int SCSIHostCmdFillCmd = -1;
+static int SCSIHostCmdFillLo = -1;
+static int SCSIHostCmdFillHi = -1;
+static int SCSIHostCmdFillVal = 0;
 
 /* drv_attr/drv_next はキャッシュ対象外(SCSI_Init内でしか読まない一回きりの
  * 値)だが、起動時の陽性対照ログ(SCSI_RefreshHostConfig内)に含めるために
@@ -470,6 +488,10 @@ void SCSI_RefreshHostConfig(void)
 	SCSIHostCmdAnswerCmd = webx68k_scsi_cmd_answer_cmd();
 	SCSIHostCmdAnswerOff = webx68k_scsi_cmd_answer_off();
 	SCSIHostCmdAnswerVal = webx68k_scsi_cmd_answer_val();
+	SCSIHostCmdFillCmd = webx68k_scsi_cmd_fill_cmd();
+	SCSIHostCmdFillLo = webx68k_scsi_cmd_fill_lo();
+	SCSIHostCmdFillHi = webx68k_scsi_cmd_fill_hi();
+	SCSIHostCmdFillVal = webx68k_scsi_cmd_fill_val();
 
 	/* 陽性対照: キャッシュ後も設定が本当に効いているかを1行で確認できる
 	 * ようにする。既定値のままならホストからの指定が届いていない
@@ -490,6 +512,7 @@ void SCSI_RefreshHostConfig(void)
 			" | reply_err=$%02x reply_units=%d reply_end=$%08x reply_bpb=$%08x reply_status=%d reply_d0=%d reply_init_once=%d"
 			" req_status_off=%d req_status_val=$%04x"
 			" cmd_answer_cmd=%d cmd_answer_off=%d cmd_answer_val=$%04x"
+			" cmd_fill_cmd=%d cmd_fill_lo=%d cmd_fill_hi=%d cmd_fill_val=$%02x"
 			" drv_attr=$%04x drv_next=$%08x (本物ROM使用中=%d)\n",
 			(unsigned)(SCSIHostSpcIntsSel & 0xff), SCSIHostSpcSstsDataBit, spc_target, SCSIHostSpcClearOnPctl,
 			(unsigned)(SCSIHostReplyErr & 0xff), SCSIHostReplyUnits,
@@ -497,6 +520,7 @@ void SCSI_RefreshHostConfig(void)
 			SCSIHostReplyStatus, SCSIHostReplyD0, SCSIHostReplyInitOnce,
 			SCSIHostReqStatusOff, (unsigned)(SCSIHostReqStatusVal & 0xffff),
 			SCSIHostCmdAnswerCmd, SCSIHostCmdAnswerOff, (unsigned)(SCSIHostCmdAnswerVal & 0xffff),
+			SCSIHostCmdFillCmd, SCSIHostCmdFillLo, SCSIHostCmdFillHi, (unsigned)(SCSIHostCmdFillVal & 0xff),
 			(unsigned)(SCSIInitDrvAttrForLog & 0xffff), (unsigned)SCSIInitDrvNextForLog,
 			SCSIUsingRealRom);
 	}
@@ -1766,6 +1790,36 @@ static void SCSI_HandleRequestHeader(void)
 				"[SCSI-CMD-ANSWER] コマンド $%02x の要求ヘッダ addr+%u へ $%04x を書いた"
 				"(実験スイッチ)\n",
 				(unsigned)cmdnum, (unsigned)coff, (unsigned)cval);
+	}
+
+	/* 【調査用・実験スイッチ】2026-09-04: 指定したコマンド番号の要求ヘッダの
+	 * 指定範囲[lo,hi]を1バイトずつvalで埋める。cmd<0(既定)、cmdnumが不一致、
+	 * またはlo>hiなら何もしない。+3(結果コード)は範囲に含まれていてもskipする
+	 * (非ゼロにするとマウントごと壊れることが既知のため、範囲実験の対象外)。 */
+	if (SCSIHostCmdFillCmd >= 0 && (uint8_t)SCSIHostCmdFillCmd == cmdnum
+		&& SCSIHostCmdFillLo >= 0 && SCSIHostCmdFillHi >= SCSIHostCmdFillLo)
+	{
+		uint32_t flo = (uint32_t)SCSIHostCmdFillLo;
+		uint32_t fhi = (uint32_t)SCSIHostCmdFillHi;
+		uint8_t fval = (uint8_t)(SCSIHostCmdFillVal & 0xff);
+		uint32_t foff;
+		int fskipped3 = 0;
+
+		for (foff = flo; foff <= fhi; foff++)
+		{
+			if (foff == 3)
+			{
+				fskipped3 = 1;
+				continue;
+			}
+			cpu_writemem24(addr + foff, fval);
+		}
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-CMD-FILL] コマンド $%02x の要求ヘッダ addr+%u〜addr+%u を $%02x で埋めた"
+				"(実験スイッチ%s)\n",
+				(unsigned)cmdnum, (unsigned)flo, (unsigned)fhi, (unsigned)fval,
+				fskipped3 ? "、+3は既知の理由によりskip" : "");
 	}
 
 	for (i = 0; i < sizeof(buf); i++)
