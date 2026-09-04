@@ -1305,6 +1305,18 @@ static void update_variables(int running)
          Config.clockmhz = 66;
       else if (strcmp(var.value, "100Mhz (OC)") == 0)
          Config.clockmhz = 100;
+      else
+      {
+         /*
+          * 既知の文字列に一致しない場合は先頭の10進数を MHz として読む。
+          * フロントエンドが選択肢に無い任意のクロックを渡せるようにするための拡張で、
+          * "200Mhz (OC)" のような表記も "200" も受け付ける。実機は10MHzなので下限は10、
+          * 上限は1フレームぶんのサイクル数が int に収まる範囲で 1000 に切る。
+          */
+         int mhz = atoi(var.value);
+         if (mhz >= PX68K_CLOCK_MHZ_MIN && mhz <= PX68K_CLOCK_MHZ_MAX)
+            Config.clockmhz = mhz;
+      }
    }
 
    var.key = "px68k_ramsize";

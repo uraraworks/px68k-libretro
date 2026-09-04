@@ -102,6 +102,9 @@ struct retro_core_option_v2_definition option_defs_fr[] = {
          { "33Mhz (OC)",  NULL },
          { "66Mhz (OC)",  NULL },
          { "100Mhz (OC)", NULL },
+         { "200Mhz (OC)", NULL },
+         { "400Mhz (OC)", NULL },
+         { "800Mhz (OC)", NULL },
          { NULL,          NULL },
       },
       "10Mhz"
