@@ -32,6 +32,12 @@ extern void webx68k_trace_start(const char *tag);
  * 実体は WebX68k の src/core-shim.c。既定はどちらも0(=無効)。 */
 extern unsigned int webx68k_scsi_drv_ram(void);
 extern unsigned int webx68k_scsi_drv_ram_from(void);
+/* 【実験用スイッチ】2026-09-05: drv_ram/drv_ram_from が使えないとき、
+ * ヘッダをRAMへ組み立てず ROM窓 $00ea0100 のまま名乗り、初期化コマンド
+ * 返答の終了アドレスだけをこの値に差し替える。Human68kの門1/門2の
+ * 読み方そのものを実測するための道具。既定0(無効)。
+ * 実体は WebX68k の src/core-shim.c。 */
+extern unsigned int webx68k_scsi_rom_header_end(void);
 /* 初期化コマンド($00)への返答値。再ビルドせずに振れるよう JS 側から読む。
  * 意味の確定していない欄の切り分け用。既定値は元のハードコード値と同じ。 */
 extern int webx68k_scsi_reply_err(void);
@@ -218,6 +224,10 @@ static uint32_t SCSIHostReplyBpb;
 static int SCSIHostReplyStatus;
 static int SCSIHostReplyD0;
 static int SCSIHostReplyInitOnce;
+/* 【実験用スイッチ】上のwebx68k_scsi_rom_header_end()のキャッシュ値。
+ * 0以外のとき、RAM配置が使えない場合にROM窓のヘッダのまま名乗り、
+ * この値を初期化コマンド返答の終了アドレスに使う。 */
+static uint32_t SCSIHostRomHeaderEnd;
 /* 【調査用・実験スイッチ】上記extern参照。既定はどちらも無効を表す値。 */
 static int SCSIHostReqStatusOff = -1;
 static int SCSIHostReqStatusVal = 0;
@@ -523,6 +533,7 @@ void SCSI_RefreshHostConfig(void)
 	SCSIHostReplyStatus = webx68k_scsi_reply_status();
 	SCSIHostReplyD0 = webx68k_scsi_reply_d0();
 	SCSIHostReplyInitOnce = webx68k_scsi_reply_init_once();
+	SCSIHostRomHeaderEnd = webx68k_scsi_rom_header_end();
 	SCSIHostReqStatusOff = webx68k_scsi_req_status_off();
 	SCSIHostReqStatusVal = webx68k_scsi_req_status_val();
 	SCSIHostCmdAnswerCmd = webx68k_scsi_cmd_answer_cmd();
@@ -640,6 +651,11 @@ static uint32_t SCSIReqHeaderAddr = 0;
  * Human68kの門1/門2(ファイル先頭コメント参照)を同時に満たすための値。
  * SCSI_Init() で起動のたびに0へ戻す。 */
 static uint32_t SCSIDrvRamEnd = 0;
+
+/* 【実験用スイッチ】0以外のとき、ヘッダをRAMへ組み立てず ROM窓 $00ea0100
+ * のまま名乗っており、初期化コマンド($00)応答の終了アドレスは
+ * SCSIHostRomHeaderEnd を使う。SCSI_Init() で起動のたびに0へ戻す。 */
+static int SCSIDrvRomHeaderActive = 0;
 
 /* 要求ヘッダのコマンド$00(初期化)を処理した回数。 */
 static int SCSIReqInitCount = 0;
@@ -867,6 +883,7 @@ void SCSI_Init(void)
 	SCSIReqInitCount = 0;
 	SCSIVectorEntryCount = 0;
 	SCSIDrvRamEnd = 0;
+	SCSIDrvRomHeaderActive = 0;
 	memset(SCSIPartStartBlocks, 0, sizeof(SCSIPartStartBlocks));
 	memset(SCSIPartSectorBytes, 0, sizeof(SCSIPartSectorBytes));
 	SCSIPartCount = 0;
@@ -1419,7 +1436,8 @@ static void SCSI_HandleRequestHeader(void)
 		 * 従来どおりホスト設定 reply_units を使う(2026-09-03)。 */
 		int reply_units_from_parts = (SCSIPartCount > 0);
 		int reply_units = reply_units_from_parts ? SCSIPartCount : SCSIHostReplyUnits;
-		uint32_t reply_end = (SCSIDrvRamEnd != 0) ? SCSIDrvRamEnd : SCSIHostReplyEnd;
+		uint32_t reply_end = (SCSIDrvRamEnd != 0) ? SCSIDrvRamEnd :
+			(SCSIDrvRomHeaderActive != 0) ? SCSIHostRomHeaderEnd : SCSIHostReplyEnd;
 		uint32_t reply_bpb = SCSIHostReplyBpb;
 		int reply_status = SCSIHostReplyStatus;
 
@@ -1487,7 +1505,8 @@ static void SCSI_HandleRequestHeader(void)
 					"[SCSI-REQ] 初期化コマンド($00) 処理 #%d: err=$%02x unit数=%d(%s) 終了addr=$%08x(%s) BPB表ptr=$%08x status=%d%s\n",
 					SCSIReqInitCount, (unsigned)(reply_err & 0xff), reply_units,
 					reply_units_from_parts ? "区画数を優先" : "reply_units",
-					(unsigned)reply_end, (SCSIDrvRamEnd != 0) ? "RAM配置" : "設定値",
+					(unsigned)reply_end, (SCSIDrvRamEnd != 0) ? "RAM配置" :
+						(SCSIDrvRomHeaderActive != 0) ? "ROM窓実験" : "設定値",
 					(unsigned)reply_bpb, reply_status,
 					(reply_status >= 0) ? "(+4に書いた)" : "(未指定・+4は変更なし)");
 		}
@@ -2276,6 +2295,24 @@ static void SCSI_HostCommand(uint8_t cmd)
 					log_cb(RETRO_LOG_ERROR,
 						"[SCSI-DRV] a4の即値位置がずれている ($%02x$%02x)\n",
 						SCSIIPL[((0x00ea0088) ^ 1) & 0x1fff], SCSIIPL[((0x00ea0089) ^ 1) & 0x1fff]);
+			}
+			else if (SCSIHostRomHeaderEnd != 0)
+			{
+				/*
+				 * 【実験用】base が使えないが、ホストから終了アドレスが
+				 * 指定されている(SCSIHostRomHeaderEnd != 0)。ヘッダは
+				 * RAMへ組み立てず ROM窓 $00ea0100 に置いたままにし(a4/d2は
+				 * SCSI_Init の既定のまま触らない)、初期化コマンド($00)応答の
+				 * 終了アドレスだけをこの値に差し替える。Human68kの門1/門2
+				 * (上のコメント参照)の読み方そのものを実測するためのもの。
+				 * スイッチが0(既定)のときはこの分岐に入らず、従来どおり
+				 * 「名乗らない」(else節)になる。
+				 */
+				SCSIDrvRomHeaderActive = 1;
+				if (log_cb)
+					log_cb(RETRO_LOG_INFO,
+						"[SCSI-DRV] ROM窓のヘッダのまま名乗る(終了アドレス=$%08x、実験用)\n",
+						(unsigned)SCSIHostRomHeaderEnd);
 			}
 			else
 			{
