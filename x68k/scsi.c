@@ -2070,34 +2070,6 @@ static void SCSI_HostCommand(uint8_t cmd)
 				base = webx68k_scsi_drv_ram();
 
 			/*
-			 * $66ca 経由の base が使えないとき、代替経路として a1 を試す。
-			 * 実測(2026-09-05)で、ベクタ設定エントリに入った時点の a1 が
-			 * 「次に置ける番地」を指している見込みが確認されている
-			 * (同梱システムディスクの2回目呼び出しで、前回の終了アドレス
-			 * 直後を指していた)。base と同じ検査を通ったときだけ採用する。
-			 * 優先順位(from の中身 → webx68k_scsi_drv_ram())は変えない。
-			 */
-			if (!(base != 0 &&
-				(base & 1) == 0 &&
-				(uint64_t)base + 0x34 < (uint64_t)Config.ram_size &&
-				(uint64_t)base + 0x34 + 0x10000 < (uint64_t)Config.ram_size))
-			{
-				uint32_t a1 = m68000_get_reg(M68K_A1);
-
-				if (a1 != 0 &&
-					(a1 & 1) == 0 &&
-					(uint64_t)a1 + 0x34 < (uint64_t)Config.ram_size &&
-					(uint64_t)a1 + 0x34 + 0x10000 < (uint64_t)Config.ram_size)
-				{
-					if (log_cb)
-						log_cb(RETRO_LOG_INFO,
-							"[SCSI-DRV] $66ca から置き場が取れないため a1=$%08x を使う\n",
-							(unsigned)a1);
-					base = a1;
-				}
-			}
-
-			/*
 			 * base の中身をそのまま信用しない。実測(2026-09-05、CHACHA.XDF)で
 			 * $66ca の中身が $00000000 のままのケースがあり、その場合ここを
 			 * 素通りするとヘッダが ROM窓 $ea0100 に残ったまま登録されて
