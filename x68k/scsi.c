@@ -2111,11 +2111,73 @@ static void SCSI_HostCommand(uint8_t cmd)
 		{
 			uint32_t from = webx68k_scsi_drv_ram_from();
 			uint32_t base = 0;
+			int base_is_a1_reserved = 0;
+			uint32_t a1_reserve_adr = 0;
 
 			if (from != 0)
 				base = cpu_readmem24_dword(from);
 			else
 				base = webx68k_scsi_drv_ram();
+
+#define SCSI_DRV_BASE_USABLE(b) \
+	((b) != 0 && ((b) & 1) == 0 && \
+	 (uint64_t)(b) + 0x34 < (uint64_t)Config.ram_size && \
+	 (uint64_t)(b) + 0x34 + 0x10000 < (uint64_t)Config.ram_size)
+
+			/*
+			 * $66ca からも取れないとき、a1(空きメモリの先頭に見える値)を
+			 * 代わりに使えないか試す。a1 をそのまま置き場にすると、そこは
+			 * 予約されていないため後から別の用途に払い出されてヘッダごと
+			 * 壊れる(実測 2026-09-05、CHACHA.XDF: base=$00019eae のとき
+			 * pc=$00040778 が先頭4バイトへ書き込んだ)。そこで、a1 と同じ値を
+			 * 保持しているゲストRAM上の変数(=空きメモリ先頭を指す変数そのもの
+			 * と見られる)を毎回その場で走査して特定し、採用したときはその
+			 * 変数を書き換えて確保領域ぶん空きメモリの先頭を進める。
+			 * 番地をコードに焼き込まない(過去に $66ca を焼き込んで不具合に
+			 * なった轍を踏まないため)。一致がちょうど1件のときだけ採用する。
+			 */
+			if (!SCSI_DRV_BASE_USABLE(base))
+			{
+				uint32_t a1 = m68000_get_reg(M68K_A1);
+				if (SCSI_DRV_BASE_USABLE(a1))
+				{
+					uint32_t adr;
+					uint32_t hit_adr = 0;
+					int hits = 0;
+
+					for (adr = 0x000000; adr < 0x00020000; adr += 2)
+					{
+						if (cpu_readmem24_dword(adr) == a1)
+						{
+							hits++;
+							hit_adr = adr;
+						}
+					}
+
+					if (hits == 1)
+					{
+						uint32_t newfree = (a1 + 0x34 + 15) & ~(uint32_t)15;
+
+						base = a1;
+						base_is_a1_reserved = 1;
+						a1_reserve_adr = hit_adr;
+						cpu_writemem24_dword(a1_reserve_adr, newfree);
+
+						if (log_cb)
+							log_cb(RETRO_LOG_INFO,
+								"[SCSI-DRV] $66ca から取れないため a1=$%08x を使う。"
+								"空きメモリ先頭の変数を $%06x に特定(一致=%d件)、"
+								"$%08x へ進めた\n",
+								(unsigned)a1, (unsigned)a1_reserve_adr, hits, (unsigned)newfree);
+					}
+					else if (log_cb)
+						log_cb(RETRO_LOG_INFO,
+							"[SCSI-DRV] $66ca から取れないため a1=$%08x を試したが、"
+							"空きメモリ先頭の変数を一意に特定できない(一致=%d件)。"
+							"ドライバとして名乗らない\n",
+							(unsigned)a1, hits);
+				}
+			}
 
 			/*
 			 * base の中身をそのまま信用しない。実測(2026-09-05、CHACHA.XDF)で
@@ -2125,10 +2187,7 @@ static void SCSI_HostCommand(uint8_t cmd)
 			 * 止まっていた。base が使えないときは「ドライバとして名乗らない」
 			 * ほうが安全: SCSIが使えないだけで済み、起動不能にはならない。
 			 */
-			if (base != 0 &&
-				(base & 1) == 0 &&
-				(uint64_t)base + 0x34 < (uint64_t)Config.ram_size &&
-				(uint64_t)base + 0x34 + 0x10000 < (uint64_t)Config.ram_size)
+			if (SCSI_DRV_BASE_USABLE(base))
 			{
 				uint32_t next = webx68k_scsi_drv_next();
 				int attr = webx68k_scsi_drv_attr();
@@ -2237,6 +2296,7 @@ static void SCSI_HostCommand(uint8_t cmd)
 				for (k = 0; k < 4; k++)
 					SCSIIPL[((0x00ea0090 + k) ^ 1) & 0x1fff] = 0xff;
 			}
+#undef SCSI_DRV_BASE_USABLE
 		}
 		return;
 	}
