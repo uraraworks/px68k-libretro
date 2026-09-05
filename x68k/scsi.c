@@ -1972,6 +1972,32 @@ static void SCSI_HostCommand(uint8_t cmd)
 			log_cb(RETRO_LOG_INFO, "[SCSI] ベクタ設定エントリが呼ばれた(陽性対照) (pc=$%08x)\n",
 				(unsigned)m68000_get_reg(M68K_PC));
 
+		/* $66ca は1回の観測から当てた借り物の番地であり、置き場になりうる値が
+		 * 別経路(レジスタやスタック)で渡って来ていないかを確かめるための
+		 * 観測用ログ。動作は変えない(読み取りのみ)。 */
+		if (log_cb && SCSIVerboseLog)
+		{
+			uint32_t sp = m68000_get_reg(M68K_A7);
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI] ベクタ設定エントリの文脈: pc=$%08x sr=$%04x sp=$%08x\n"
+				"        d0=$%08x d1=$%08x d2=$%08x d3=$%08x d4=$%08x d5=$%08x d6=$%08x d7=$%08x\n"
+				"        a0=$%08x a1=$%08x a2=$%08x a3=$%08x a4=$%08x a5=$%08x a6=$%08x a7=$%08x\n"
+				"        stack: [0]=$%08x [1]=$%08x [2]=$%08x [3]=$%08x\n"
+				"        $66ca=$%08x\n",
+				(unsigned)m68000_get_reg(M68K_PC), (unsigned)m68000_get_reg(M68K_SR), (unsigned)sp,
+				(unsigned)m68000_get_reg(M68K_D0), (unsigned)m68000_get_reg(M68K_D1),
+				(unsigned)m68000_get_reg(M68K_D2), (unsigned)m68000_get_reg(M68K_D3),
+				(unsigned)m68000_get_reg(M68K_D4), (unsigned)m68000_get_reg(M68K_D5),
+				(unsigned)m68000_get_reg(M68K_D6), (unsigned)m68000_get_reg(M68K_D7),
+				(unsigned)m68000_get_reg(M68K_A0), (unsigned)m68000_get_reg(M68K_A1),
+				(unsigned)m68000_get_reg(M68K_A2), (unsigned)m68000_get_reg(M68K_A3),
+				(unsigned)m68000_get_reg(M68K_A4), (unsigned)m68000_get_reg(M68K_A5),
+				(unsigned)m68000_get_reg(M68K_A6), (unsigned)m68000_get_reg(M68K_A7),
+				(unsigned)cpu_readmem24_dword(sp), (unsigned)cpu_readmem24_dword(sp + 4),
+				(unsigned)cpu_readmem24_dword(sp + 8), (unsigned)cpu_readmem24_dword(sp + 12),
+				(unsigned)cpu_readmem24_dword(0x66ca));
+		}
+
 		/* ベクタ設定エントリは実測で複数回呼ばれる(2026-09-03)。Human68k は
 		 * 「次のドライバはあるか」を聞き続けているとみられ、毎回同じヘッダを
 		 * 返すと同じドライバが2台ぶん登録され、DPBの並びが壊れて暴走ジャンプ
