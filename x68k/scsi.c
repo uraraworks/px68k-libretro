@@ -12,6 +12,7 @@
 #include "scsi.h"
 #include "x68kmemory.h"
 #include "sram.h"
+#include "prop.h"
 
 /* SCSI のセクタI/O(ホスト側)。実体は WebX68k の src/core-shim.c。
  * 決定2 により emscripten のファイルシステムは経由しない。 */
@@ -2042,7 +2043,18 @@ static void SCSI_HostCommand(uint8_t cmd)
 			else
 				base = webx68k_scsi_drv_ram();
 
-			if (base != 0)
+			/*
+			 * base の中身をそのまま信用しない。実測(2026-09-05、CHACHA.XDF)で
+			 * $66ca の中身が $00000000 のままのケースがあり、その場合ここを
+			 * 素通りするとヘッダが ROM窓 $ea0100 に残ったまま登録されて
+			 * Human68k の門(上のコメント)を満たせず、ログも出さずに起動が
+			 * 止まっていた。base が使えないときは「ドライバとして名乗らない」
+			 * ほうが安全: SCSIが使えないだけで済み、起動不能にはならない。
+			 */
+			if (base != 0 &&
+				(base & 1) == 0 &&
+				(uint64_t)base + 0x34 < (uint64_t)Config.ram_size &&
+				(uint64_t)base + 0x34 + 0x10000 < (uint64_t)Config.ram_size)
 			{
 				uint32_t next = webx68k_scsi_drv_next();
 				int attr = webx68k_scsi_drv_attr();
@@ -2131,6 +2143,25 @@ static void SCSI_HostCommand(uint8_t cmd)
 					log_cb(RETRO_LOG_ERROR,
 						"[SCSI-DRV] a4の即値位置がずれている ($%02x$%02x)\n",
 						SCSIIPL[((0x00ea0088) ^ 1) & 0x1fff], SCSIIPL[((0x00ea0089) ^ 1) & 0x1fff]);
+			}
+			else
+			{
+				/*
+				 * base が使えない(0、奇数番地、または RAM 上限を超えて
+				 * Human68k の門を満たせない)。ここで無理にヘッダを組み立てても
+				 * 起動そのものが止まる(実測 2026-09-05、CHACHA.XDF)ため、
+				 * SCSIが使えないほうを選ぶ: ドライバとして名乗らない。
+				 * a4 は触らない(0を返すと Human68k が番地0をヘッダとして
+				 * 読みに行き暴走することが実測済み、上のコメント参照)。
+				 */
+				uint32_t k;
+				if (log_cb)
+					log_cb(RETRO_LOG_ERROR,
+						"[SCSI-DRV] ドライバの置き場が取れない (from=$%06x の中身=$%08x, RAM=$%08x)。"
+						"ドライバとして名乗らない(このまま登録すると Human68k が起動を諦めるため)\n",
+						(unsigned)from, (unsigned)base, (unsigned)Config.ram_size);
+				for (k = 0; k < 4; k++)
+					SCSIIPL[((0x00ea0090 + k) ^ 1) & 0x1fff] = 0xff;
 			}
 		}
 		return;
