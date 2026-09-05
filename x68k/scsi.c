@@ -1998,6 +1998,54 @@ static void SCSI_HostCommand(uint8_t cmd)
 				(unsigned)cpu_readmem24_dword(0x66ca));
 		}
 
+		/* a1(空きメモリの先頭に見える値)と $66ca の中身のどちらかと同じ値を
+		 * 保持しているゲストRAM上の変数を探す観測用の走査。動作は変えない
+		 * (読み取りのみ)。cmd==$03 の1回目の呼び出しのときだけ行う
+		 * (SCSIVectorEntryCount==0 の間、つまりこの直後のインクリメント前)。
+		 * 注意: cpu_readmem24_dword を $000000-$01fffe の範囲で2バイト刻みに
+		 * 大量に呼ぶため、既存のメモリ読み出し監視(webx68k_mem_read_watch)が
+		 * 有効だとログが爆発する。プローブ側では --mem-read-watch を使わない
+		 * ので今回は問題ないが、念のため書き添えておく。 */
+		if (log_cb && SCSIVerboseLog && SCSIVectorEntryCount == 0)
+		{
+			uint32_t target1 = m68000_get_reg(M68K_A1);
+			uint32_t target2 = cpu_readmem24_dword(0x66ca);
+			uint32_t adr;
+			int hit1 = 0, hit2 = 0;
+
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-SCAN] 走査開始 範囲=$000000-$01ffff a1=$%08x $66ca値=$%08x\n",
+				(unsigned)target1, (unsigned)target2);
+
+			for (adr = 0x000000; adr < 0x00020000; adr += 2)
+			{
+				uint32_t v = cpu_readmem24_dword(adr);
+				if (target1 != 0 && v == target1)
+				{
+					hit1++;
+					if (hit1 <= 64)
+						log_cb(RETRO_LOG_INFO,
+							"[SCSI-SCAN] a1=$%08x と一致: $%06x\n",
+							(unsigned)target1, (unsigned)adr);
+				}
+				if (target2 != 0 && v == target2)
+				{
+					hit2++;
+					if (hit2 <= 64)
+						log_cb(RETRO_LOG_INFO,
+							"[SCSI-SCAN] $66ca値=$%08x と一致: $%06x\n",
+							(unsigned)target2, (unsigned)adr);
+				}
+			}
+			if (hit1 > 64)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-SCAN] a1 と一致: 上限64件で打ち切った(総数=%d)\n", hit1);
+			if (hit2 > 64)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-SCAN] $66ca値と一致: 上限64件で打ち切った(総数=%d)\n", hit2);
+			log_cb(RETRO_LOG_INFO, "[SCSI-SCAN] 走査終了\n");
+		}
+
 		/* ベクタ設定エントリは実測で複数回呼ばれる(2026-09-03)。Human68k は
 		 * 「次のドライバはあるか」を聞き続けているとみられ、毎回同じヘッダを
 		 * 返すと同じドライバが2台ぶん登録され、DPBの並びが壊れて暴走ジャンプ
