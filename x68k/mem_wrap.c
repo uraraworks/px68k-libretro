@@ -604,12 +604,28 @@ extern int webx68k_hostfs_poll(void);
 static uint8_t HostFsAddrBytes[4];
 static int HostFsStatus = 0; /* 0=完了, 1=保留 */
 
+/*
+ * P2a #1(性能): 以前はHOSTFS_Read(状態ポート+5の読み)のたびに、保留中なら
+ * 毎回 webx68k_hostfs_poll() を呼んでいた。ゲストのbusy-loop(tools/x68/hostfs.s
+ * のrelay_poll)は1回の待ちでこのポートを1万回超読むことがあり、その都度
+ * wasm→JSの呼び出しが発生していた(実測)。
+ *
+ * 変更後: HOSTFS_ReadはHostFsStatusフラグを読むだけでJSを一切呼ばない。
+ * 代わりにJS側(src/hostfs/worker-bridge.ts)が非同期処理(listDir/readFile)の
+ * 解決した"その場"でこの webx68k_hostfs_complete() を1回呼び、フラグを
+ * 落とす(JS→wasmの呼び出しなので、wasm→JSの回数には数えない)。
+ * これで1回の待ちあたりのwasm→JS呼び出しは request 1回だけになる想定。
+ */
+__attribute__((used))
+void webx68k_hostfs_complete(void)
+{
+	HostFsStatus = 0;
+}
+
 static uint8_t HOSTFS_Read(uint32_t adr)
 {
 	if (adr == HOSTFS_PORT_STATUS)
 	{
-		if (HostFsStatus)
-			HostFsStatus = webx68k_hostfs_poll();
 		return (uint8_t)HostFsStatus;
 	}
 	return 0;
