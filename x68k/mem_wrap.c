@@ -567,6 +567,71 @@ static uint8_t rm_font(uint32_t addr);
 static uint8_t rm_nop(uint32_t addr) { return 0; }
 static void wm_nop(uint32_t addr, uint8_t val) { }
 
+/* ===== HostFS ポート (feature/hostfs, プロトコルv0) =====
+ * 番地: $e8c000 台。MemReadTable/MemWriteTable の添字70
+ * ((addr>>13)&0xff==70。8KB窓、$e8c000〜$e8dfff)。
+ *
+ * 選定理由: 読み込み表・書き込み表の双方で rm_nop/wm_nop のまま(=未使用)の
+ * 番地は $e86000(添字67, DMAとMFPの間)と $e8c000(添字70, RTCとSysPortの間)の
+ * 2箇所のみ。$e9e000 は読み込み表こそ rm_nop だが書き込み表では既に
+ * SCSI_IOCSPort_Write が使っている($e9f802=SCSI_HOST_PORT)ため使えない。
+ * 残った2箇所のうち $e8c000 を選んだ: SCSIのI/Oバンク($e94000〜$ea0000の
+ * FDC/SASI/SCC/PIA/IOC/SCSI群)と同じ8KB刻みの窓の並びの中にあり、
+ * かつSCSI本体の番地($e9e000/$ea0000近辺)から離れているぶん、既存のSCSI
+ * ログ([SCSI-IOCS]/[SCSI-BUS]等)や実機のSCSIボードが使う番地と混線しない。
+ * 実機の既知デバイス(CRTC/DMA/MFP/RTC/SysPort/OPM/ADPCM/FDC/SASI/SCC/PIA/
+ * IOC/SCSI/MIDI/BG/SRAM等)とは重ならない。
+ *
+ * プロトコル:
+ *   +0〜+3 (write, ビッグエンディアン) : 要求ヘッダのゲストアドレス(A5)
+ *   +4     (write, 値は無視)           : 上のアドレスへ要求を出す(トリガ)
+ *   +5     (read)                      : ステータス。0=完了 1=保留。
+ *                                        保留中に読むと毎回 poll() を呼び直す。
+ * JS側の実体(globalThis.__webx68kHostFs)がWorkerに生えていない場合の安全側の
+ * 既定(常に完了・エラー値を返す)は webx68k_hostfs_request/poll の実装
+ * (WebX68k側 src/core-shim.c)が担う。ここのCコードはJSの有無を意識しない。
+ */
+#define HOSTFS_PORT_BASE     0x00e8c000u
+#define HOSTFS_PORT_ADDR0    (HOSTFS_PORT_BASE + 0)
+#define HOSTFS_PORT_ADDR3    (HOSTFS_PORT_BASE + 3)
+#define HOSTFS_PORT_TRIGGER  (HOSTFS_PORT_BASE + 4)
+#define HOSTFS_PORT_STATUS   (HOSTFS_PORT_BASE + 5)
+
+/* WebX68k側(src/core-shim.c)でEM_JS経由の実体を持つ。戻り値は 0=完了 1=保留。 */
+extern int webx68k_hostfs_request(unsigned int addr);
+extern int webx68k_hostfs_poll(void);
+
+static uint8_t HostFsAddrBytes[4];
+static int HostFsStatus = 0; /* 0=完了, 1=保留 */
+
+static uint8_t HOSTFS_Read(uint32_t adr)
+{
+	if (adr == HOSTFS_PORT_STATUS)
+	{
+		if (HostFsStatus)
+			HostFsStatus = webx68k_hostfs_poll();
+		return (uint8_t)HostFsStatus;
+	}
+	return 0;
+}
+
+static void HOSTFS_Write(uint32_t adr, uint8_t val)
+{
+	if (adr >= HOSTFS_PORT_ADDR0 && adr <= HOSTFS_PORT_ADDR3)
+	{
+		HostFsAddrBytes[adr - HOSTFS_PORT_ADDR0] = val;
+		return;
+	}
+	if (adr == HOSTFS_PORT_TRIGGER)
+	{
+		uint32_t reqAddr = ((uint32_t)HostFsAddrBytes[0] << 24) |
+		                    ((uint32_t)HostFsAddrBytes[1] << 16) |
+		                    ((uint32_t)HostFsAddrBytes[2] << 8) |
+		                    (uint32_t)HostFsAddrBytes[3];
+		HostFsStatus = webx68k_hostfs_request(reqAddr);
+	}
+}
+
 uint8_t (*MemReadTable[])(uint32_t) = {
 	TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read,
 	TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read,
@@ -576,7 +641,7 @@ uint8_t (*MemReadTable[])(uint32_t) = {
 	TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read,
 	TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read,
 	TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read, TVRAM_Read,
-	CRTC_Read, VCtrl_Read, DMA_Read, rm_nop, MFP_Read, RTC_Read, rm_nop, SysPort_Read,
+	CRTC_Read, VCtrl_Read, DMA_Read, rm_nop, MFP_Read, RTC_Read, HOSTFS_Read, SysPort_Read,
 	rm_opm, ADPCM_Read, FDC_Read, SASI_Read, SCC_Read, PIA_Read, IOC_Read, rm_nop,
 	SCSI_Read, rm_buserr, rm_buserr, rm_buserr, rm_buserr, rm_buserr, rm_buserr, MIDI_Read,
 	BG_Read, BG_Read, BG_Read, BG_Read, BG_Read, BG_Read, BG_Read, BG_Read,
@@ -616,7 +681,7 @@ void (*MemWriteTable[])(uint32_t, uint8_t) = {
 	TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write,
 	TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write,
 	TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write, TVRAM_Write,
-	CRTC_Write, VCtrl_Write, DMA_Write, wm_nop, MFP_Write, RTC_Write, wm_nop, SysPort_Write,
+	CRTC_Write, VCtrl_Write, DMA_Write, wm_nop, MFP_Write, RTC_Write, HOSTFS_Write, SysPort_Write,
 	wm_opm, ADPCM_Write, FDC_Write, SASI_Write, SCC_Write, PIA_Write, IOC_Write, SCSI_IOCSPort_Write,
 	SCSI_Write, wm_buserr, wm_buserr, wm_buserr, wm_buserr, wm_buserr, wm_buserr, MIDI_Write,
 	BG_Write, BG_Write, BG_Write, BG_Write, BG_Write, BG_Write, BG_Write, BG_Write,
