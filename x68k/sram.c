@@ -103,8 +103,23 @@ uint8_t FASTCALL SRAM_Read(uint32_t adr)
 }
 
 
+/*
+ * 調査用(2026-09-26、段階0): SCSI_Init()で$ed0018(起動デバイス)/$ed000c(ROM起動アドレス)を
+ * 書いても、IPL自身が起動直後(pc≒$00ff0010)に$ed000c〜$ed001bをまるごと固定値へ
+ * 上書きすることが実測で分かった(docs/STORAGE-SCSI.md「SRAM 段階0」参照。書いたアドレスの
+ * 上位バイトを$00/$01で振っても同じ固定値で上書きされ、無条件の書き換えと確認済み)。
+ * そのため、この上書き(=$ed001bへの書き込みで完了する)の直後に、こちら側の設定を
+ * もう一度書き直す。既定(webx68k_scsi_sram_boot_addr()が0)では一切何もしない。 */
+extern int webx68k_scsi_sram_boot_addr(void);
+static int webx68k_sram_reinject_active = 0; /* 再注入自身の書き込みで再帰しないようにする */
+
 void FASTCALL SRAM_Write(uint32_t adr, uint8_t data)
 {
+	uint32_t orig_adr = adr; /* 下でadr自身を書き換えるため、判定用に元の値を控える */
+
+	if ((adr >= 0x00ed000c && adr <= 0x00ed001b) && log_cb)
+		log_cb(RETRO_LOG_INFO, "[SRAM-WRITE] adr=$%08x data=$%02x write_enabled=%d\n",
+			(unsigned)adr, (unsigned)data, write_enabled);
 	if ( write_enabled && (adr < 0xed4000) )
 	{
 		adr       &= 0xffff;
@@ -112,6 +127,31 @@ void FASTCALL SRAM_Write(uint32_t adr, uint8_t data)
 		adr       ^= 1;
 #endif
 		SRAM[adr]  = data;
+	}
+
+	/* IPL自身の書き換え(上のコメント参照)が$ed001bまで進んだ直後に、こちらの設定を
+	 * 上書きし直す。再注入自身の書き込み(このifを再度満たさないよう再帰は避ける)。 */
+	if (orig_adr == 0x00ed001b && !webx68k_sram_reinject_active)
+	{
+		int boot_addr = webx68k_scsi_sram_boot_addr();
+		if (boot_addr)
+		{
+			webx68k_sram_reinject_active = 1;
+			SRAM_Write(0x00ed0018, 0xa0);
+			SRAM_Write(0x00ed0019, 0x00);
+			SRAM_Write(0x00ed000c, (uint8_t)((boot_addr >> 24) & 0xff));
+			SRAM_Write(0x00ed000d, (uint8_t)((boot_addr >> 16) & 0xff));
+			SRAM_Write(0x00ed000e, (uint8_t)((boot_addr >> 8) & 0xff));
+			SRAM_Write(0x00ed000f, (uint8_t)(boot_addr & 0xff));
+			webx68k_sram_reinject_active = 0;
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-BOOT-REINJECT] IPL自身の上書き直後に再設定 (要求addr=$%08x, 読み返し $ed0018=$%02x%02x $ed000c=$%02x%02x%02x%02x)\n",
+					(unsigned)boot_addr,
+					SRAM_Read(0x00ed0018), SRAM_Read(0x00ed0019),
+					SRAM_Read(0x00ed000c), SRAM_Read(0x00ed000d),
+					SRAM_Read(0x00ed000e), SRAM_Read(0x00ed000f));
+		}
 	}
 }
 
