@@ -113,6 +113,20 @@ uint8_t FASTCALL SRAM_Read(uint32_t adr)
  * もう一度書き直す。既定(webx68k_scsi_sram_boot_addr()が0)では一切何もしない。 */
 extern int webx68k_scsi_sram_boot_addr(void);
 static int webx68k_sram_reinject_active = 0; /* 再注入自身の書き込みで再帰しないようにする */
+/*
+ * UI実装(段階4)時に判明した不備の是正(2026-09-26): $ed001bへの書き込みはIPL自身の
+ * まっさらなSRAM初期化コピー(署名不一致時のみ発生。docs/STORAGE-SCSI.md「段階0」の
+ * 訂正参照)だけでなく、Human68k自身の無関係な書き込み(実測: pc=$001a2c02、$ed001aと
+ * $ed001bへ元と同じ値$4e/$07を書き戻すだけの処理。段階1a参照)でも発火することが
+ * わかっている。再注入を「その起動でIPLがSRAMを初期化した(=この不確定な$ed001b書き込みが
+ * 最初に来た)ときの1回だけ」に限定するため、一度発火したら(webx68k_scsi_sram_boot_addr()が
+ * 0で何もしない場合も含め)以後は二度と発火しないようにする。各起動(コア再生成、
+ * src/libretro-host.tsのinit()が毎回新しいwasmモジュールを作る)ごとにこの静的変数も
+ * ゼロから再初期化されるため、明示的なリセット呼び出しは不要。
+ * 呼び出し側(JS)は、さらに「起動前のSRAM署名が無効だったとき」だけ
+ * webx68k_scsi_sram_boot_addr()が非0を返すよう既に絞っている
+ * (src/main.tsのapplyDesiredBootDeviceGlobal())。両方を満たして初めて再注入する。 */
+static int webx68k_sram_reinject_done = 0;
 
 /* 段階1a調査用: SRAM_Write の呼び出し経路を区別する。
  * mem_wrap.c のメモリ書き込み表からCPU(m68k_execute実行中のゲスト命令、または
@@ -146,10 +160,13 @@ void FASTCALL SRAM_Write(uint32_t adr, uint8_t data)
 	}
 
 	/* IPL自身の書き換え(上のコメント参照)が$ed001bまで進んだ直後に、こちらの設定を
-	 * 上書きし直す。再注入自身の書き込み(このifを再度満たさないよう再帰は避ける)。 */
-	if (orig_adr == 0x00ed001b && !webx68k_sram_reinject_active)
+	 * 上書きし直す。再注入自身の書き込み(このifを再度満たさないよう再帰は避ける)。
+	 * webx68k_sram_reinject_doneで「この起動で最初に来た$ed001b書き込みの1回だけ」に
+	 * 絞る(上のコメント参照。boot_addrが0=何もしない場合もここで消費して以後発火しない)。 */
+	if (orig_adr == 0x00ed001b && !webx68k_sram_reinject_active && !webx68k_sram_reinject_done)
 	{
 		int boot_addr = webx68k_scsi_sram_boot_addr();
+		webx68k_sram_reinject_done = 1;
 		if (boot_addr)
 		{
 			webx68k_sram_reinject_active = 1;

@@ -1663,6 +1663,15 @@ unsigned int SCSIWriteCount = 0;		/* $08(書き込み)が呼ばれた総回数 *
 unsigned int SCSILastWriteUnit = 0xffffffff;	/* 直近の$08のユニット番号 */
 unsigned int SCSILastWriteLogsec = 0xffffffff;	/* 直近の$08の開始論理セクタ */
 
+/* SCSI起動 段階4(UI)是正(2026-09-26): 「SCSIから実際に起動したか」をUI側の推定
+ * (読み出しカウンタ増加+FDDアクセス無し、等)に頼るのをやめ、自前スタブの起動エントリが
+ * 実際にディスクへ制御を渡した瞬間(cmd $07ハンドラでbootable=1が確定し、ゲスト側asmへ
+ * jmp $2000させるレジスタを整えるところ、下記参照)にコア自身がフラグを立てる方式にした。
+ * 起動ごとに1回だけ立つラッチで、リセット(=コアの再生成、wasmモジュールがまるごと
+ * 作り直されるため静的変数もゼロから再初期化される)で自動的に消える。明示的なクリア
+ * APIは無い(不要)。JS側は core-shim.c の get_scsi_boot_control_transferred() 経由で読む。 */
+unsigned int SCSIBootControlTransferred = 0;
+
 /* 調査用(2026-09-04): PCトレース上の rts($190028/$190032)件数が要求総数
  * (SCSIReqTotalCount)より大幅に多く見える食い違いの裏取り用。
  * 既存の SCSITableCallCount[] はログ出力(if(log_cb))の内側でしか
@@ -2682,6 +2691,10 @@ static void SCSI_HostCommand(uint8_t cmd)
 
 		if (bootable)
 		{
+			/* SCSI起動 段階4是正: ここが「自前スタブの起動エントリが実際にディスクへ
+			 * 制御を渡す」瞬間(このあとD0=0を返し、ゲスト側asmが無条件でjmp $2000する)。
+			 * UI側のSCSIスロットロック判定はこのフラグの有無だけを見る。 */
+			SCSIBootControlTransferred = 1;
 			/* 段階2追加実測: 新設した[SCSI-BOOT-TRACE]/[SCSI-ROM-ENTRY]で
 			 * 追跡したところ、$2000のディスク上コードは(a)TRAP#15
 			 * d0=$04相当の呼び出し(正常に戻る)のあと、(b)TRAP#15
