@@ -110,4 +110,24 @@ extern int32_t webx68k_code_entry_hi[2];
 void webx68k_ram_locate_watch_refresh(void);  /* WebX68k-storage/src/core-shim.c 側で定義 */
 void webx68k_code_entry_watch_refresh(void);  /* WebX68k-storage/src/core-shim.c 側で定義 */
 
+/*
+ * 【調査用フック・段階2追加】RAM上のコードからボードROM窓へのPC遷移を
+ * (leave-rom-watchのように1回限りでなく)複数回記録する観測フック。
+ * 既定は無効(0)。実体は x68k/scsi.c、有効化は core-shim.c の
+ * refresh() が毎フレーム globalThis.__webx68kRomEntryTraceWatch から反映する。
+ */
+extern int32_t webx68k_rom_entry_trace_enabled;
+
+void webx68k_rom_entry_trace_watch_refresh(void); /* WebX68k-storage/src/core-shim.c 側で定義 */
+
+/*
+ * 【調査用フック・段階2追加】$2000〜のディスク上コードに入った後の
+ * 命令単位トレース。既定は無効(0)。実体は x68k/scsi.c、有効化は
+ * core-shim.c の refresh() が毎フレーム globalThis.__webx68kBootPcTraceWatch
+ * から反映する。
+ */
+extern int32_t webx68k_boot_pc_trace_enabled;
+
+void webx68k_boot_pc_trace_watch_refresh(void); /* WebX68k-storage/src/core-shim.c 側で定義 */
+
 #endif

@@ -957,6 +957,18 @@ extern void webx68k_leave_rom_pc_check(uint32_t pc);
 extern int32_t webx68k_code_entry_watch_enabled;
 extern void webx68k_code_entry_pc_check(uint32_t pc);
 
+/* 【調査用フック・段階2追加】RAM上のコードからボードROM窓へのPC遷移を
+ * 複数回記録するフック。既定は無効。実体は x68k/scsi.c の
+ * webx68k_rom_entry_trace_check()。 */
+extern int32_t webx68k_rom_entry_trace_enabled;
+extern void webx68k_rom_entry_trace_check(uint32_t pc);
+
+/* 【調査用フック・段階2追加】$2000〜のディスク上コードに入った後の
+ * 命令単位トレース。既定は無効。実体は x68k/scsi.c の
+ * webx68k_boot_pc_trace_check()。 */
+extern int32_t webx68k_boot_pc_trace_enabled;
+extern void webx68k_boot_pc_trace_check(uint32_t pc);
+
 int m68k_execute(int num_cycles)
 {
 	/* eat up any reset cycles */
@@ -1002,6 +1014,10 @@ int m68k_execute(int num_cycles)
 				webx68k_leave_rom_pc_check(REG_PC);
 			if (webx68k_code_entry_watch_enabled)
 				webx68k_code_entry_pc_check(REG_PC);
+			if (webx68k_rom_entry_trace_enabled)
+				webx68k_rom_entry_trace_check(REG_PC);
+			if (webx68k_boot_pc_trace_enabled)
+				webx68k_boot_pc_trace_check(REG_PC);
 
 			/* Record previous program counter */
 			REG_PPC = REG_PC;

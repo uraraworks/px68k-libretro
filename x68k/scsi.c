@@ -401,6 +401,92 @@ void webx68k_code_entry_pc_check(uint32_t pc)
 	}
 }
 
+/*
+ * 【調査用フック・段階2追加】RAM上のコードからボードROM窓($ea0000-$eaffff)へ
+ * PCが入る/出る遷移を、初回だけでなく複数回にわたって記録する
+ * (既存のwebx68k_leave_rom_pc_check()は「ROMに一度入った後、外へ出た
+ * 最初の瞬間」だけを見る一回限りのフックで、RAM上のコードがROMへ
+ * 何度も呼び戻す規約を追うには使えなかったため新設)。
+ * 既定は無効(0)、既存フックと同じくグローバル参照+分岐のみで速度に影響しない。
+ */
+int32_t webx68k_rom_entry_trace_enabled = 0;
+static int SCSIRomEntryTraceInside = 0;
+static int SCSIRomEntryTraceEntryCount = 0;
+static int SCSIRomEntryTraceReturnCount = 0;
+#define SCSI_ROM_ENTRY_TRACE_MAX 48
+
+void webx68k_rom_entry_trace_check(uint32_t pc)
+{
+	int inside = (pc >= 0x00ea0000 && pc <= 0x00eaffff);
+
+	if (inside && !SCSIRomEntryTraceInside)
+	{
+		SCSIRomEntryTraceEntryCount++;
+		if (log_cb && SCSIRomEntryTraceEntryCount <= SCSI_ROM_ENTRY_TRACE_MAX)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-ROM-ENTRY] #%d from_pc=$%08x to_pc=$%08x"
+				" d0=$%08x d1=$%08x d2=$%08x d3=$%08x d4=$%08x d5=$%08x d6=$%08x d7=$%08x"
+				" a0=$%08x a1=$%08x a2=$%08x a3=$%08x a4=$%08x a5=$%08x a6=$%08x a7=$%08x sr=$%04x\n",
+				SCSIRomEntryTraceEntryCount,
+				(unsigned)m68k_get_reg(NULL, M68K_REG_PPC), (unsigned)pc,
+				(unsigned)m68k_get_reg(NULL, M68K_REG_D0), (unsigned)m68k_get_reg(NULL, M68K_REG_D1),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_D2), (unsigned)m68k_get_reg(NULL, M68K_REG_D3),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_D4), (unsigned)m68k_get_reg(NULL, M68K_REG_D5),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_D6), (unsigned)m68k_get_reg(NULL, M68K_REG_D7),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_A0), (unsigned)m68k_get_reg(NULL, M68K_REG_A1),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_A2), (unsigned)m68k_get_reg(NULL, M68K_REG_A3),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_A4), (unsigned)m68k_get_reg(NULL, M68K_REG_A5),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_A6), (unsigned)m68k_get_reg(NULL, M68K_REG_A7),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_SR));
+	}
+	if (!inside && SCSIRomEntryTraceInside)
+	{
+		SCSIRomEntryTraceReturnCount++;
+		if (log_cb && SCSIRomEntryTraceReturnCount <= SCSI_ROM_ENTRY_TRACE_MAX)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-ROM-RETURN] #%d from_pc=$%08x to_pc=$%08x d0=$%08x\n",
+				SCSIRomEntryTraceReturnCount,
+				(unsigned)m68k_get_reg(NULL, M68K_REG_PPC), (unsigned)pc,
+				(unsigned)m68k_get_reg(NULL, M68K_REG_D0));
+	}
+	SCSIRomEntryTraceInside = inside;
+}
+
+/*
+ * 【調査用フック・段階2追加】ディスク上のコード($2000〜)へ入った後の
+ * 実行の様子を、命令単位でそのまま記録するトレーサ。段階2で
+ * webx68k_rom_entry_trace_check()だけでは「ROMへ再入していない」ことしか
+ * 分からず、$2000到達後にどこで/どう止まったかが見えなかったため新設。
+ * $2000-$27ffへ最初に入った時点で有効化し、以後は行き先を問わず
+ * 最大SCSI_BOOT_PC_TRACE_MAX命令ぶんPCと主要レジスタを記録する
+ * (脱出先がROM外・IPL内・例外ベクタ経由のハンドラのいずれであっても
+ * そのまま追える)。既定は無効(0)。
+ */
+int32_t webx68k_boot_pc_trace_enabled = 0;
+static int SCSIBootPcTraceActive = 0;
+static int SCSIBootPcTraceCount = 0;
+#define SCSI_BOOT_PC_TRACE_MAX 200
+
+void webx68k_boot_pc_trace_check(uint32_t pc)
+{
+	if (!SCSIBootPcTraceActive)
+	{
+		if (pc < 0x00002000 || pc >= 0x00002800)
+			return;
+		SCSIBootPcTraceActive = 1;
+	}
+	if (SCSIBootPcTraceCount >= SCSI_BOOT_PC_TRACE_MAX)
+		return;
+	SCSIBootPcTraceCount++;
+	if (log_cb)
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-BOOT-TRACE] #%d pc=$%08x sr=$%04x d0=$%08x a7=$%08x\n",
+			SCSIBootPcTraceCount, (unsigned)pc,
+			(unsigned)m68k_get_reg(NULL, M68K_REG_SR),
+			(unsigned)m68k_get_reg(NULL, M68K_REG_D0),
+			(unsigned)m68k_get_reg(NULL, M68K_REG_A7));
+}
+
 void webx68k_iocs_f5_trap_check(void)
 {
 	unsigned int d0 = (unsigned int)m68k_get_reg(NULL, M68K_REG_D0);
@@ -2582,6 +2668,35 @@ static void SCSI_HostCommand(uint8_t cmd)
 
 		if (bootable)
 		{
+			/* 段階2追加実測: 新設した[SCSI-BOOT-TRACE]/[SCSI-ROM-ENTRY]で
+			 * 追跡したところ、$2000のディスク上コードは(a)TRAP#15
+			 * d0=$04相当の呼び出し(正常に戻る)のあと、(b)TRAP#15
+			 * d0=$F5(SCSI IOCS)を呼んでおり、これが本命の失敗原因だった。
+			 * 実測で$0007d4.lを読むと$00ea004a(自前スタブの$e9f800
+			 * 中継、SCSI_Init内のベクタ設定エントリ(cmd $03)が書くはず
+			 * の値)ではなく$00ff1b1e["リセット直後(FD起動時と同じ)の
+			 * 既定値と見られる。$ea0024入口(ベクタ設定エントリ)は
+			 * 通常のHuman68k起動時のドライバ走査で呼ばれるが、SCSI単独
+			 * 起動の$ea0020→$ea0034→$ea0060経路はその走査より前に
+			 * 実行されるため、まだ$7d4.lが書き換わっていなかった]に
+			 * なっていた。trap#15,d0=$F5はこの既定値(IPL内の
+			 * 「SCSI無し」ハンドラ)へ飛び、以後戻らずHuman68kの
+			 * 汎用エラー画面に落ちていた(未確定: $7d4.lが本当に
+			 * IOCS $F5専用の1エントリなのか、trap#15汎用ディスパッチャの
+			 * 作業領域を兼ねているのかは逆アセ無しでは確定できない。
+			 * ここでは「ここへ$ea004aを書けば動く」という実測結果の
+			 * みを採用する)。
+			 * よって、jmp $2000の直前に$0007d4.lへ$00ea004aを自分で
+			 * 書き、ベクタ設定エントリの実行を待たずに済ませる。 */
+			cpu_writemem24(0x000007d4, 0x00);
+			cpu_writemem24(0x000007d5, 0xea);
+			cpu_writemem24(0x000007d6, 0x00);
+			cpu_writemem24(0x000007d7, 0x4a);
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-BOOT] $0007d4.lへ$00ea004aを書いた(IOCS $F5をベクタ設定エントリ実行前に有効化、読み返し=$%08x)\n",
+					(unsigned)cpu_readmem24_dword(0x000007d4));
+
 			/* レジスタは段階1b実測(本物ROM、STORAGE-SCSI.md「段階0」の
 			 * $2000への飛び先レジスタ値)に合わせる。a3のみ、実測値
 			 * $ea0092(本物ROM内部、未逆アセ・呼び出し規約未確定)の
@@ -2790,6 +2905,67 @@ void FASTCALL SCSI_IOCSPort_Write(uint32_t adr, uint8_t data)
 			log_cb(RETRO_LOG_INFO,
 				"[SCSI-IOCS] $F5 HLE: _S_TESTUNIT(知識、未検証)相当 id=$%02x -> d0=$%08x\n",
 				(unsigned)id, (unsigned)d0);
+	}
+	else if (data == 0x25)
+	{
+		/* 段階2追加実測: $ea0074(a3診断)経由ではなく、boot-pc-traceで
+		 * $7d4.l修正後に初めて観測できたIOCS呼び出し。d1=$25、
+		 * d2=$00000002 d3=$00000002 d4=$00000000 a1=$000023e8
+		 * (起動直後、$ea0060がLBA2-3を直接ロードした直後の1回目の
+		 * 呼び出し)。d1=$24の並び($24=TESTUNIT、知識)から1つ増えた
+		 * 番号であることと、直前の段階1b実測(本物ROM)でLBA2-3の次に
+		 * LBA4-5(count=2)が読まれていたことから、「$25はIOCSの
+		 * 逐次読み出し(直前の読み出しの続きから)」という仮説を立てて
+		 * 実装する(未確定、d2/d3のどちらが個数か、a1が本当にバッファか
+		 * も含めて未検証。dir一覧が本物ROMの結果=18ファイルと一致するかで
+		 * 裏取りする)。カーソルは$ea0060のLBA0-3読み出し直後から4で
+		 * 始める。 */
+		static unsigned int seq_lba = 4;
+		static int seq_lba_init = 0;
+		uint32_t count = m68000_get_reg(M68K_D2);
+		uint32_t a1 = m68000_get_reg(M68K_A1);
+		uint32_t k;
+		int ok = 1;
+
+		if (!seq_lba_init)
+		{
+			seq_lba = 4;
+			seq_lba_init = 1;
+		}
+		if (count == 0 || count > 8)
+			count = 1;	/* 異常値なら1セクタだけにして被害を抑える */
+
+		for (k = 0; k < count; k++)
+		{
+			static uint8_t seq_sec[512];
+			if (webx68k_scsi_read_sector(seq_lba + k, seq_sec) != 0)
+			{
+				ok = 0;
+				break;
+			}
+			{
+				uint32_t j;
+				for (j = 0; j < 512; j++)
+					cpu_writemem24(a1 + k * 512 + j, seq_sec[j]);
+			}
+		}
+		if (ok)
+		{
+			if (log_cb && SCSIVerboseLog)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-IOCS] $F5 HLE: $25=逐次READ(知識ではなく仮説、未検証) lba=%u count=%u a1=$%08x -> d0=0\n",
+					seq_lba, (unsigned)count, (unsigned)a1);
+			seq_lba += count;
+			m68000_set_reg(M68K_D0, 0);
+		}
+		else
+		{
+			if (log_cb)
+				log_cb(RETRO_LOG_ERROR,
+					"[SCSI-IOCS] $F5 HLE: $25 lba=%u count=%u 読み出し失敗\n",
+					seq_lba, (unsigned)count);
+			m68000_set_reg(M68K_D0, 0xffffffffu);
+		}
 	}
 }
 
