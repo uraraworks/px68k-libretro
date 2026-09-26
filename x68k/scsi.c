@@ -944,15 +944,34 @@ void SCSI_Init(void)
 		/* $ea0052-$ea005f 予備 (自前ルーチンを $ea0060 に置くための詰め物) */
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		/* $ea0060 起動エントリ本体。
-		 * 実機の CZ-6BS1 ではここがSCSIバスを走査してデバイスを登録する。
-		 * この段階では「呼ばれたか」を測るための印を出すだけで、まだ何も登録しない。 */
-		0x13, 0xfc, 0x00, 0x01, 0x00, 0xe9, 0xf8, 0x02,	/* $ea0060 "move.b #$01, $e9f802" 起動エントリに入った */
-		0x13, 0xfc, 0x00, 0x02, 0x00, 0xe9, 0xf8, 0x02,	/* $ea0068 "move.b #$02, $e9f802" セクタ0をゲストRAMへ載せろ */
-		0x4e, 0x75,							/* $ea0070 "rts" */
-		/* $ea0072-$ea007f 詰め物 */
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		/* $ea0060 起動エントリ本体(段階2、2026-09-26)。
+		 * 実機の CZ-6BS1 ではここがSCSIバスを走査してデバイスを登録するが、
+		 * ここでは「LBA0が"X68SCSI1"で始まるか(段階1b実測の規約) →
+		 * 該当すればLBA2-3(1024バイト)を$2000へ載せてそこへjmp、
+		 * 該当しなければ何もせずrts(FD起動に任せる)」だけを実装する。
+		 * 判定・読み出し・レジスタ設定(a0/a1/a3/a6/a7/sr)はホストコマンド
+		 * $07(SCSI_HostCommand)側で行い、飛ぶかどうかはd0で受け取る。
+		 * PCそのものをホスト側から差し替える手はコアの命令実行ループの
+		 * 内部変数を壊す恐れがあるため使わず(既存のd0書き換えのように
+		 * 「他のレジスタ」だけをホスト側から書き、制御移動そのものは
+		 * このゲスト側asmのjmpで行う、という既存コードの流儀に合わせた)。 */
+		0x13, 0xfc, 0x00, 0x07, 0x00, 0xe9, 0xf8, 0x02,	/* $ea0060 move.b #$07,$e9f802 (起動判定+読み出し)
+												 * d0=0なら起動可(以後tst.b/bneでSRのZ以外は変えず、
+												 * 実測sr=$2004(Z=1)をそのままjmp先へ持ち込める)。
+												 * d0!=0なら起動不可。 */
+		0x4a, 0x00,							/* $ea0068 tst.b d0 */
+		0x66, 0x06,							/* $ea006a bne.s $ea0072 (起動不可、d0!=0) */
+		0x4e, 0xf9, 0x00, 0x00, 0x20, 0x00,	/* $ea006c jmp $00002000 */
+		0x4e, 0x75,							/* $ea0072 rts (起動不可、FD起動へ委ねる) */
+		/* $ea0074 a3診断エントリ(観測用、未実装)。段階1bでは本物ROM使用時に
+		 * 実測したa3=$ea0092(ROM内部)相当の「ディスク上コードから呼び戻す
+		 * 入口」の呼び出し規約がまだ分かっていない。ここを未実装のまま
+		 * ROM内の無関係なバイト列を指すと不正命令実行になるため、
+		 * 呼ばれたら印を出してd0=$ffffffffを返すだけの安全な詰め物にする。 */
+		0x13, 0xfc, 0x00, 0x08, 0x00, 0xe9, 0xf8, 0x02,	/* $ea0074 move.b #$08,$e9f802 */
+		0x4e, 0x75,							/* $ea007c rts */
+		/* $ea007e-$ea007f 詰め物 */
+		0x00, 0x00,
 		/* $ea0080 ベクタ設定エントリの続き(陽性対照つき) */
 		0x13, 0xfc, 0x00, 0x03, 0x00, 0xe9, 0xf8, 0x02,	/* "move.b #$03, $e9f802" ベクタ設定エントリが呼ばれた */
 		/* d2 は「Human68k が後で呼ぶルーチンのアドレス」である(実測)。
@@ -2528,6 +2547,104 @@ static void SCSI_HostCommand(uint8_t cmd)
 				cpu_readmem24(SCSI_BOOT_LOAD_ADDR + 6), cpu_readmem24(SCSI_BOOT_LOAD_ADDR + 7));
 		return;
 	}
+	if (cmd == 0x07)
+	{
+		/* 段階2: 起動エントリ($ea0060)本体。段階1bの実測規約
+		 * (STORAGE-SCSI.md「段階1b: 観測した規約」項目1・3)に基づく:
+		 *   LBA0が"X68SCSI1"で始まる → LBA2-3(1024バイト)を$2000へ →
+		 *   a0=$00ea0020 a1=$00002000 a6=$00001ffc a7=$00001ff4 sr=$2004 を
+		 *   揃えてd0=1を返す(ゲスト側asmがjmp $2000する)。
+		 * a3は本物ROM実測では$ea0092(ROM内部、未逆アセ)を指していたが、
+		 * その呼び出し規約が未確定のため、自前スタブ内の診断エントリ
+		 * ($ea0074、cmd $08)を指す(呼ばれたら記録するだけの安全な詰め物)。
+		 * d1-d5/d7/a2/a4/a5は今回揃えていない(未確認のまま)。 */
+		static uint8_t sec2[512];
+		static uint8_t sec3[512];
+		int bootable = 0;
+
+		if (webx68k_scsi_read_sector(0, sec0) == 0 &&
+			sec0[0] == 'X' && sec0[1] == '6' && sec0[2] == '8' &&
+			sec0[3] == 'S' && sec0[4] == 'C' && sec0[5] == 'S' &&
+			sec0[6] == 'I' && sec0[7] == '1')
+		{
+			if (webx68k_scsi_read_sector(2, sec2) == 0 &&
+				webx68k_scsi_read_sector(3, sec3) == 0)
+			{
+				for (i = 0; i < 512; i++)
+					cpu_writemem24(SCSI_BOOT_LOAD_ADDR + i, sec2[i]);
+				for (i = 0; i < 512; i++)
+					cpu_writemem24(SCSI_BOOT_LOAD_ADDR + 512 + i, sec3[i]);
+				bootable = 1;
+			}
+			else if (log_cb)
+				log_cb(RETRO_LOG_ERROR, "[SCSI-BOOT] LBA2/3を読めない\n");
+		}
+
+		if (bootable)
+		{
+			/* レジスタは段階1b実測(本物ROM、STORAGE-SCSI.md「段階0」の
+			 * $2000への飛び先レジスタ値)に合わせる。a3のみ、実測値
+			 * $ea0092(本物ROM内部、未逆アセ・呼び出し規約未確定)の
+			 * 代わりに自前スタブの診断エントリ($ea0074、cmd $08)を指す。
+			 * sr=$2004(Z=1)を保つため、この後のゲスト側asm(tst.b d0;
+			 * bne.s)で分岐に使うd0は「0=起動可」(通常の0=失敗とは逆)
+			 * にしてあり、tst.bのZ結果がそのままsrに残るようにしている。 */
+			m68000_set_reg(M68K_A0, 0x00ea0020);
+			m68000_set_reg(M68K_A1, SCSI_BOOT_LOAD_ADDR);
+			m68000_set_reg(M68K_A2, 0x02ff0540);
+			m68000_set_reg(M68K_A3, 0x00ea0074);
+			m68000_set_reg(M68K_A4, 0x00e840c0);
+			m68000_set_reg(M68K_A5, 0x00000000);
+			m68000_set_reg(M68K_A6, 0x00001ffc);
+			m68000_set_reg(M68K_A7, 0x00001ff4);
+			m68000_set_reg(M68K_D1, 0x00000026);
+			m68000_set_reg(M68K_D2, 0x00000002);
+			m68000_set_reg(M68K_D3, 0x00000002);
+			m68000_set_reg(M68K_D4, 0x00000000);
+			m68000_set_reg(M68K_D5, 0x00000001);
+			m68000_set_reg(M68K_D6, 0x00000003);
+			m68000_set_reg(M68K_D7, 0x00000000);
+			m68000_set_reg(M68K_SR, 0x2004);
+			m68000_set_reg(M68K_D0, 0);	/* 0=起動可(ゲスト側asmのtst.b/bne.s参照) */
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-BOOT] LBA0が\"X68SCSI1\"、LBA2-3を$%06xへ載せてjmpする"
+					"(a0=$ea0020 a1=$%06x a2=$02ff0540 a3=$ea0074 a4=$e840c0 a5=0"
+					" a6=$1ffc a7=$1ff4 d1=$26 d2=2 d3=2 d4=0 d5=1 d6=3 d7=0 sr=$2004)\n",
+					(unsigned)SCSI_BOOT_LOAD_ADDR, (unsigned)SCSI_BOOT_LOAD_ADDR);
+		}
+		else
+		{
+			m68000_set_reg(M68K_D0, 1);	/* 1=起動不可(ゲスト側asmのtst.b/bne.s参照) */
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-BOOT] LBA0が\"X68SCSI1\"ではない(またはデバイス無し/読み出し失敗)。起動しない\n");
+		}
+		return;
+	}
+	if (cmd == 0x08)
+	{
+		/* $ea0074 診断エントリ(a3経由で呼ばれた場合の観測用)。
+		 * 本物のCZ-6BS1がこの入口をどう使うかは未確定のため、
+		 * 呼び出しがあったこと自体をレジスタ全体とともに記録するだけで、
+		 * 何のサービスも提供しない(d0=$ffffffffで「対応していない」を返す)。 */
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-A3-ENTRY] a3経由の呼び出し(観測用、未実装) pc=$%08x\n"
+				"        d0=$%08x d1=$%08x d2=$%08x d3=$%08x d4=$%08x d5=$%08x d6=$%08x d7=$%08x\n"
+				"        a0=$%08x a1=$%08x a2=$%08x a4=$%08x a5=$%08x a6=$%08x a7=$%08x\n",
+				(unsigned)m68000_get_reg(M68K_PC),
+				(unsigned)m68000_get_reg(M68K_D0), (unsigned)m68000_get_reg(M68K_D1),
+				(unsigned)m68000_get_reg(M68K_D2), (unsigned)m68000_get_reg(M68K_D3),
+				(unsigned)m68000_get_reg(M68K_D4), (unsigned)m68000_get_reg(M68K_D5),
+				(unsigned)m68000_get_reg(M68K_D6), (unsigned)m68000_get_reg(M68K_D7),
+				(unsigned)m68000_get_reg(M68K_A0), (unsigned)m68000_get_reg(M68K_A1),
+				(unsigned)m68000_get_reg(M68K_A2), (unsigned)m68000_get_reg(M68K_A4),
+				(unsigned)m68000_get_reg(M68K_A5), (unsigned)m68000_get_reg(M68K_A6),
+				(unsigned)m68000_get_reg(M68K_A7));
+		m68000_set_reg(M68K_D0, 0xffffffffu);
+		return;
+	}
 	if (cmd >= 0x40 && cmd <= 0x7f)
 	{
 		int k = cmd - 0x40;
@@ -2654,6 +2771,26 @@ void FASTCALL SCSI_IOCSPort_Write(uint32_t adr, uint8_t data)
 			(unsigned)m68000_get_reg(M68K_D3), (unsigned)m68000_get_reg(M68K_D4),
 			(unsigned)m68000_get_reg(M68K_D5), (unsigned)m68000_get_reg(M68K_A1),
 			(unsigned)m68000_get_reg(M68K_PC));
+
+	/* 段階2: SCSI IOCS($F5)の最小HLE。段階1b実測(STORAGE-SCSI.md「段階1b:
+	 * 観測した規約」項目4)で、本物ROM使用時に d1=$24 固定、d4が0〜6と
+	 * 増える呼び出しが7回観測されている。d1=$24を「知識」として
+	 * _S_TESTUNIT(ユニットチェック、d4=対象ID)と当てはめ、
+	 * d4==0(ID0、本タスクで自前スタブが名乗る唯一のドライブ)のときだけ
+	 * d0=0(応答あり)を返し、他IDはd0=$ffffffff(デバイス無し)を返す。
+	 * 戻り値の規約(0=成功、負数=エラー)自体も実測ではなく知識からの
+	 * 当てはめであり、実際にHuman68kがこの値をどう扱うかは
+	 * 起動確認(STORAGE-SCSI.md「段階2」の確認結果表)で裏取りする。 */
+	if (data == 0x24)
+	{
+		uint32_t id = m68000_get_reg(M68K_D4);
+		uint32_t d0 = (id == 0) ? 0 : 0xffffffffu;
+		m68000_set_reg(M68K_D0, d0);
+		if (log_cb && SCSIVerboseLog)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-IOCS] $F5 HLE: _S_TESTUNIT(知識、未検証)相当 id=$%02x -> d0=$%08x\n",
+				(unsigned)id, (unsigned)d0);
+	}
 }
 
 void SCSI_Cleanup(void)
