@@ -96,4 +96,18 @@ extern int32_t webx68k_iocs_f5_watch_enabled;
 void webx68k_leave_rom_watch_refresh(void); /* WebX68k-storage/src/core-shim.c 側で定義 */
 void webx68k_iocs_f5_watch_refresh(void);   /* WebX68k-storage/src/core-shim.c 側で定義 */
 
+/*
+ * 【調査用フック・段階1b項目2/3】READ完了時のゲストRAM全域探索(項目2)と、
+ * ディスク上のコードへPCが初めて入った瞬間の観測(項目3)。既定はどちらも
+ * 無効で速度に影響しない。実体は x68k/scsi.c、有効化は core-shim.c の
+ * 各 refresh() が毎フレーム globalThis から反映する。
+ */
+extern int32_t webx68k_ram_locate_watch_enabled;
+extern int32_t webx68k_code_entry_watch_enabled;
+extern int32_t webx68k_code_entry_lo[2];
+extern int32_t webx68k_code_entry_hi[2];
+
+void webx68k_ram_locate_watch_refresh(void);  /* WebX68k-storage/src/core-shim.c 側で定義 */
+void webx68k_code_entry_watch_refresh(void);  /* WebX68k-storage/src/core-shim.c 側で定義 */
+
 #endif

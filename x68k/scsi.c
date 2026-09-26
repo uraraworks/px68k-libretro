@@ -348,6 +348,57 @@ static int SCSIIocsF5LogCount = 0;
 static int SCSIIocsF5TotalCount = 0;
 #define SCSI_IOCS_F5_LOG_MAX 30
 
+/*
+ * 【調査用フック・段階1b項目2】READのDATAIN完了時に、そのセクタの先頭16バイトを
+ * ゲストRAM全域(0〜Config.ram_size)から一回きりで探し、見つかった番地を記録する。
+ * 既定は無効(0)。実体(webx68k_ram_locate_check())は下(SCSISpcDataBuf等の定義後)。
+ */
+int32_t webx68k_ram_locate_watch_enabled = 0;
+static unsigned int SCSILastReadLba = 0;
+static int SCSILastReadIsRead = 0;
+
+/*
+ * 【調査用フック・段階1b項目3】ディスク上のコード(項目2で分かった番地)へ
+ * PCが初めて入った瞬間のPC・全レジスタを記録する。2区画ぶん(lba2-3用途/
+ * lba4-5用途)を独立に監視できる。既定は無効(範囲外=lo>hi)。
+ */
+int32_t webx68k_code_entry_watch_enabled = 0;
+int32_t webx68k_code_entry_lo[2] = { 1, 1 };
+int32_t webx68k_code_entry_hi[2] = { 0, 0 };
+static int SCSICodeEntryLogged[2] = { 0, 0 };
+static const char *SCSICodeEntryTag[2] = { "区画1(lba2-3想定)", "区画2(lba4-5想定)" };
+
+void webx68k_code_entry_pc_check(uint32_t pc)
+{
+	int i;
+	for (i = 0; i < 2; i++)
+	{
+		if (webx68k_code_entry_lo[i] > webx68k_code_entry_hi[i])
+			continue; /* このスロットは無効 */
+		if (SCSICodeEntryLogged[i])
+			continue;
+		if (pc < (uint32_t)webx68k_code_entry_lo[i] || pc > (uint32_t)webx68k_code_entry_hi[i])
+			continue;
+
+		SCSICodeEntryLogged[i] = 1;
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-CODE-ENTRY] %s pc=$%08x"
+				" d0=$%08x d1=$%08x d2=$%08x d3=$%08x d4=$%08x d5=$%08x d6=$%08x d7=$%08x"
+				" a0=$%08x a1=$%08x a2=$%08x a3=$%08x a4=$%08x a5=$%08x a6=$%08x a7=$%08x sr=$%04x\n",
+				SCSICodeEntryTag[i], (unsigned)pc,
+				(unsigned)m68k_get_reg(NULL, M68K_REG_D0), (unsigned)m68k_get_reg(NULL, M68K_REG_D1),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_D2), (unsigned)m68k_get_reg(NULL, M68K_REG_D3),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_D4), (unsigned)m68k_get_reg(NULL, M68K_REG_D5),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_D6), (unsigned)m68k_get_reg(NULL, M68K_REG_D7),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_A0), (unsigned)m68k_get_reg(NULL, M68K_REG_A1),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_A2), (unsigned)m68k_get_reg(NULL, M68K_REG_A3),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_A4), (unsigned)m68k_get_reg(NULL, M68K_REG_A5),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_A6), (unsigned)m68k_get_reg(NULL, M68K_REG_A7),
+				(unsigned)m68k_get_reg(NULL, M68K_REG_SR));
+	}
+}
+
 void webx68k_iocs_f5_trap_check(void)
 {
 	unsigned int d0 = (unsigned int)m68k_get_reg(NULL, M68K_REG_D0);
@@ -3029,6 +3080,9 @@ static void SCSI_SpcHandleCommand(void)
 
 	SCSISpcDataLen = 0;
 	SCSISpcDataPos = 0;
+	/* 【調査用フック・段階1b項目2】READ以外ではlba不明なので毎回落とす。
+	 * READのcaseで1に戻す。 */
+	SCSILastReadIsRead = 0;
 
 	switch (op)
 	{
@@ -3165,6 +3219,11 @@ static void SCSI_SpcHandleCommand(void)
 			log_cb(RETRO_LOG_INFO, "[SCSI-SPC] コマンド=READ(%d) lba=%u count=%u\n",
 				(op == 0x08) ? 6 : 10, lba, count);
 
+		/* 【調査用フック・段階1b項目2】このREADの先頭セクタのLBAを記録し、
+		 * DATAIN完了時にゲストRAM全域探索へ渡す(webx68k_ram_locate_check()参照)。 */
+		SCSILastReadLba = lba;
+		SCSILastReadIsRead = 1;
+
 		for (i = 0; i < count; i++)
 		{
 			if (webx68k_scsi_read_sector(lba + i, SCSISpcDataBuf + i * 512) != 0)
@@ -3270,6 +3329,46 @@ static void SCSI_SpcCommandByteFromTemp(void)
  * 授受の合図、という仮説の経路で来た」のかを区別できるようにする
  * (詳細は SCSI_SpcXferStart のコメント参照)。
  * STATUS/MSGINは仕様どおり(当てはめ)常に1バイト$00とする。 */
+/*
+ * 【調査用フック・段階1b項目2】直前のREADで読んだセクタの先頭16バイトを
+ * ゲストRAM全域(0〜Config.ram_size)から一回きりで探し、見つかった番地を
+ * ログに出す。DATAIN完了(TC=0でSTATUSへ遷移する直前)から呼ぶ。
+ * 先頭16バイトはREADの最初のセクタ(SCSISpcDataBuf[0..15])のもの。
+ * 見つからなくても(まだCPU側が書き終えていない可能性)「見つからず」と
+ * 明記して記録する(黙って諦めない)。 */
+static void webx68k_ram_locate_check(void)
+{
+	uint32_t limit, addr;
+	int found = -1;
+
+	if (!SCSILastReadIsRead)
+		return;
+	if (SCSISpcDataLen < 16)
+		return;
+
+	limit = (uint32_t)Config.ram_size;
+	for (addr = 0; addr + 16 <= limit; addr++)
+	{
+		if (memcmp(MEM + addr, SCSISpcDataBuf, 16) == 0)
+		{
+			found = (int)addr;
+			break;
+		}
+	}
+
+	if (log_cb)
+	{
+		if (found >= 0)
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-RAM-LOCATE] lba=%u の先頭16バイトをRAM上で発見 addr=$%08x\n",
+				SCSILastReadLba, (unsigned)found);
+		else
+			log_cb(RETRO_LOG_INFO,
+				"[SCSI-RAM-LOCATE] lba=%u の先頭16バイトはRAM上(0-$%08x)で見つからず\n",
+				SCSILastReadLba, (unsigned)limit);
+	}
+}
+
 static uint8_t SCSI_SpcPhaseOutputByte(const char *src)
 {
 	uint8_t v = 0x00;
@@ -3296,6 +3395,8 @@ static uint8_t SCSI_SpcPhaseOutputByte(const char *src)
 			 * 進む。 */
 			SCSI_SpcSstsSetDataBit(0, "DATAIN完了");
 			SCSI_SpcSstsSetTc0Bit(1, "TC=0");
+			if (webx68k_ram_locate_watch_enabled)
+				webx68k_ram_locate_check();
 			SCSI_SpcSetPhase(SCSI_SPC_PHASE_STATUS, "DATAIN完了(TC=0)");
 		}
 		else

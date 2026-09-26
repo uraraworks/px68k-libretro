@@ -2467,6 +2467,8 @@ void retro_run(void)
       webx68k_drv_hook_refresh();
       webx68k_leave_rom_watch_refresh();
       webx68k_iocs_f5_watch_refresh();
+      webx68k_ram_locate_watch_refresh();
+      webx68k_code_entry_watch_refresh();
       /* Initialization done */
       update_variables(0);
       soundbuf_size = current_soundbuf_size();
@@ -2478,6 +2480,8 @@ void retro_run(void)
    webx68k_drv_hook_refresh();
    webx68k_leave_rom_watch_refresh();
    webx68k_iocs_f5_watch_refresh();
+   webx68k_ram_locate_watch_refresh();
+   webx68k_code_entry_watch_refresh();
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       update_variables(1);

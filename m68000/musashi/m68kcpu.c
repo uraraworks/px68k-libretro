@@ -950,6 +950,13 @@ void m68k_set_cpu_type(unsigned int cpu_type)
 extern int32_t webx68k_leave_rom_watch_enabled;
 extern void webx68k_leave_rom_pc_check(uint32_t pc);
 
+/* 【調査用フック・段階1b項目3】ディスク上のコードへPCが初めて入った瞬間を
+ * 観測するフック。既定は無効(webx68k_code_entry_watch_enabled==0)で、その
+ * ときはグローバル参照+分岐のみ。実体は x68k/scsi.c の
+ * webx68k_code_entry_pc_check()。 */
+extern int32_t webx68k_code_entry_watch_enabled;
+extern void webx68k_code_entry_pc_check(uint32_t pc);
+
 int m68k_execute(int num_cycles)
 {
 	/* eat up any reset cycles */
@@ -993,6 +1000,8 @@ int m68k_execute(int num_cycles)
 			 * ボードROM窓($ea0000-$eaffff)から外へ出た最初の瞬間を記録する。 */
 			if (webx68k_leave_rom_watch_enabled)
 				webx68k_leave_rom_pc_check(REG_PC);
+			if (webx68k_code_entry_watch_enabled)
+				webx68k_code_entry_pc_check(REG_PC);
 
 			/* Record previous program counter */
 			REG_PPC = REG_PC;
