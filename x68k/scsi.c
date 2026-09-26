@@ -2656,11 +2656,25 @@ static void SCSI_HostCommand(uint8_t cmd)
 			if (webx68k_scsi_read_sector(2, sec2) == 0 &&
 				webx68k_scsi_read_sector(3, sec3) == 0)
 			{
-				for (i = 0; i < 512; i++)
-					cpu_writemem24(SCSI_BOOT_LOAD_ADDR + i, sec2[i]);
-				for (i = 0; i < 512; i++)
-					cpu_writemem24(SCSI_BOOT_LOAD_ADDR + 512 + i, sec3[i]);
-				bootable = 1;
+				/* 段階2b実測(STORAGE-SCSI.md「SCSI起動 段階2b」): 本物ROMは
+				 * LBA0の署名だけでなく、LBA2先頭バイト(sec2[0])が$60(1バイト、
+				 * それ以外のLBA2/LBA3の内容は無関係)でなければ$2000へ飛ばずに
+				 * 諦める(FD起動に戻る)。ブラックボックス試験(バイト単位の
+				 * 置換・全数に近いニブル総当たり・別ディスクへの単バイト
+				 * 適用による予測的中)で確認した規則であり、逆アセンブルは
+				 * していない。 */
+				if (sec2[0] == 0x60)
+				{
+					for (i = 0; i < 512; i++)
+						cpu_writemem24(SCSI_BOOT_LOAD_ADDR + i, sec2[i]);
+					for (i = 0; i < 512; i++)
+						cpu_writemem24(SCSI_BOOT_LOAD_ADDR + 512 + i, sec3[i]);
+					bootable = 1;
+				}
+				else if (log_cb)
+					log_cb(RETRO_LOG_INFO,
+						"[SCSI-BOOT] LBA2先頭バイトが$60ではない($%02x)。起動不可(本物ROM実測の規則、段階2b)\n",
+						(unsigned)sec2[0]);
 			}
 			else if (log_cb)
 				log_cb(RETRO_LOG_ERROR, "[SCSI-BOOT] LBA2/3を読めない\n");
