@@ -22,6 +22,8 @@ extern int webx68k_scsi_init_a4(void);
 extern int webx68k_scsi_drv_attr(void);
 extern int webx68k_scsi_sram_init(void);
 extern int webx68k_scsi_sram_boot_addr(void);
+extern int webx68k_sram_corrupt_offset(void);
+extern int webx68k_sram_corrupt_value(void);
 
 /* 調査用(2026-09-04、実行トレース): x68k/mem_wrap.c 側の実行トレースを立ち上げる。 */
 extern void webx68k_trace_start(const char *tag);
@@ -1329,6 +1331,32 @@ void SCSI_Init(void)
 		if (log_cb)
 			log_cb(RETRO_LOG_INFO, "[SCSI] SRAM に SCSI ローダ相当の既定値を書いた (読み返し $%02x $%02x $%02x)\n",
 				SRAM_Read(0x00ed006f), SRAM_Read(0x00ed0070), SRAM_Read(0x00ed0071));
+	}
+
+	/* 段階1a-i 実験: SRAM の任意1バイトをホストから壊す(署名破壊の介入実験用)。
+	 * docs/STORAGE-SCSI.md「SCSI起動 段階1a」の追加検証: 正常起動済み(署名有効)の
+	 * プロファイルへ、この1バイトだけ書き換えて再起動し、IPLの初期化コピーが
+	 * 発火するか(=SRAM_Writeの記録にIPL側の書き込みが現れるか)を観測する。
+	 * offset<0(既定)なら何もしない。SCSI_Init()はCPUが1命令も実行する前に
+	 * 呼ばれるため(上のSRAM_BOOT_ADDRブロックと同じ理由)、IPLの署名比較より
+	 * 確実に先に書ける。 */
+	{
+		int corrupt_offset = webx68k_sram_corrupt_offset();
+		if (corrupt_offset >= 0)
+		{
+			int corrupt_value = webx68k_sram_corrupt_value();
+			extern int webx68k_sram_write_call_site;
+			webx68k_sram_write_call_site = 1; /* SCSI_INIT */
+			SRAM_WriteEnable(1);
+			SRAM_Write(0x00ed0000 + (uint32_t)corrupt_offset, (uint8_t)corrupt_value);
+			SRAM_WriteEnable(0);
+			webx68k_sram_write_call_site = 0;
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO,
+					"[SRAM-CORRUPT] 実験: SRAM+$%03x を $%02x に書いた(読み返し $%02x)\n",
+					corrupt_offset, (unsigned)(corrupt_value & 0xff),
+					SRAM_Read(0x00ed0000 + (uint32_t)corrupt_offset));
+		}
 	}
 
 	/* 段階0実験: SRAM の起動デバイス設定を「ROM起動」に書き換える。
