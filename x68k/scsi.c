@@ -21,6 +21,7 @@ extern int webx68k_scsi_init_d2(void);
 extern int webx68k_scsi_init_a4(void);
 extern int webx68k_scsi_drv_attr(void);
 extern int webx68k_scsi_sram_init(void);
+extern int webx68k_scsi_sram_boot_addr(void);
 
 /* 調査用(2026-09-04、実行トレース): x68k/mem_wrap.c 側の実行トレースを立ち上げる。 */
 extern void webx68k_trace_start(const char *tag);
@@ -1193,6 +1194,33 @@ void SCSI_Init(void)
 		if (log_cb)
 			log_cb(RETRO_LOG_INFO, "[SCSI] SRAM に SCSI ローダ相当の既定値を書いた (読み返し $%02x $%02x $%02x)\n",
 				SRAM_Read(0x00ed006f), SRAM_Read(0x00ed0070), SRAM_Read(0x00ed0071));
+	}
+
+	/* 段階0実験: SRAM の起動デバイス設定を「ROM起動」に書き換える。
+	 * 資料の知識(未実測): $ed0018(word)=$a000(ROM起動)、$ed000c(long)=ROM起動アドレス。
+	 * ROM起動アドレスは外付けSCSIボードのIDをnとすると $ea0020 + n*4 (資料の知識、未実測)。
+	 * 値そのものは JS 側の globalThis.__webx68kScsiSramBoot から渡し、非0のときだけ書く。
+	 * 既定(0/未指定)では一切書かず、従来のSRAM値のまま(=挙動を変えない)。 */
+	{
+		int boot_addr = webx68k_scsi_sram_boot_addr();
+		if (boot_addr)
+		{
+			SRAM_WriteEnable(1);
+			SRAM_Write(0x00ed0018, 0xa0);
+			SRAM_Write(0x00ed0019, 0x00);
+			SRAM_Write(0x00ed000c, (uint8_t)((boot_addr >> 24) & 0xff));
+			SRAM_Write(0x00ed000d, (uint8_t)((boot_addr >> 16) & 0xff));
+			SRAM_Write(0x00ed000e, (uint8_t)((boot_addr >> 8) & 0xff));
+			SRAM_Write(0x00ed000f, (uint8_t)(boot_addr & 0xff));
+			SRAM_WriteEnable(0);
+			if (log_cb)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-BOOT] SRAM起動デバイスをROM起動に設定 (要求addr=$%08x, 読み返し $ed0018=$%02x%02x $ed000c=$%02x%02x%02x%02x)\n",
+					(unsigned)boot_addr,
+					SRAM_Read(0x00ed0018), SRAM_Read(0x00ed0019),
+					SRAM_Read(0x00ed000c), SRAM_Read(0x00ed000d),
+					SRAM_Read(0x00ed000e), SRAM_Read(0x00ed000f));
+		}
 	}
 
 	/* d2/a4 の即値差し替えは自前スタブ前提の処理。本物ROM使用中は飛ばす。 */
