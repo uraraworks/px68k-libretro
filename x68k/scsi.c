@@ -2860,6 +2860,8 @@ static void SCSI_HostCommand(uint8_t cmd)
  * 黙って捨てられていた。まず「誰が・どのコマンドで・どんな引数で呼ぶか」を
  * 実測するため、この段階では動作を変えずログだけ取る。 */
 #define SCSI_IOCS_LOG_MAX   64
+/* _S_READ(HLE)で一度に読む物理セクタ数の上限(スタックの静的バッファ保護用)。 */
+#define SCSI_IOCS_READ_MAX_SECTORS 128
 
 void FASTCALL SCSI_IOCSPort_Write(uint32_t adr, uint8_t data)
 {
@@ -2896,6 +2898,23 @@ void FASTCALL SCSI_IOCSPort_Write(uint32_t adr, uint8_t data)
 	 * 戻り値の規約(0=成功、負数=エラー)自体も実測ではなく知識からの
 	 * 当てはめであり、実際にHuman68kがこの値をどう扱うかは
 	 * 起動確認(STORAGE-SCSI.md「段階2」の確認結果表)で裏取りする。 */
+	/*
+	 * 段階2訂正(コーディネータ指摘、2026-09-26): 前回$25を「逐次READ」と
+	 * 独自に当てはめたのは資料の一般知識と食い違っていた。以後は
+	 * コーディネータが示した資料知識(未実測、SCSI IOCS高水準呼び出し)を
+	 * 出発点にし、基準器(本物ROM)のCDB列との一致で裏を取る:
+	 *   $20 _S_INQUIRY
+	 *   $21 _S_READ    (d2=先頭ブロック d3=ブロック数 d4=ID
+	 *                    d5=ブロック長符号(0:256/1:512/2:1024) a1=バッファ)
+	 *   $22 _S_WRITE
+	 *   $24 _S_TESTUNIT(d4=ID)
+	 *   $25 _S_READCAP (d4=ID a1=8バイト: 最終ブロック番号+ブロック長)
+	 *   $26 _S_READEXT (READ(10)相当)
+	 * 戻り値はd0(0=正常、負=エラー)。
+	 * 呼ばれていない命令($20/$22/$26等)は実装しない。
+	 * 実際に読んだLBA/個数は[SCSI-IOCS-CDB]として、本物ROMのCDB列
+	 * (STORAGE-SCSI.md「段階1b」項目1の表)と同じ形式で出し、比較できる
+	 * ようにする。 */
 	if (data == 0x24)
 	{
 		uint32_t id = m68000_get_reg(M68K_D4);
@@ -2903,68 +2922,111 @@ void FASTCALL SCSI_IOCSPort_Write(uint32_t adr, uint8_t data)
 		m68000_set_reg(M68K_D0, d0);
 		if (log_cb && SCSIVerboseLog)
 			log_cb(RETRO_LOG_INFO,
-				"[SCSI-IOCS] $F5 HLE: _S_TESTUNIT(知識、未検証)相当 id=$%02x -> d0=$%08x\n",
+				"[SCSI-IOCS-CDB] _S_TESTUNIT(資料知識) id=$%02x -> d0=$%08x\n",
 				(unsigned)id, (unsigned)d0);
 	}
 	else if (data == 0x25)
 	{
-		/* 段階2追加実測: $ea0074(a3診断)経由ではなく、boot-pc-traceで
-		 * $7d4.l修正後に初めて観測できたIOCS呼び出し。d1=$25、
-		 * d2=$00000002 d3=$00000002 d4=$00000000 a1=$000023e8
-		 * (起動直後、$ea0060がLBA2-3を直接ロードした直後の1回目の
-		 * 呼び出し)。d1=$24の並び($24=TESTUNIT、知識)から1つ増えた
-		 * 番号であることと、直前の段階1b実測(本物ROM)でLBA2-3の次に
-		 * LBA4-5(count=2)が読まれていたことから、「$25はIOCSの
-		 * 逐次読み出し(直前の読み出しの続きから)」という仮説を立てて
-		 * 実装する(未確定、d2/d3のどちらが個数か、a1が本当にバッファか
-		 * も含めて未検証。dir一覧が本物ROMの結果=18ファイルと一致するかで
-		 * 裏取りする)。カーソルは$ea0060のLBA0-3読み出し直後から4で
-		 * 始める。 */
-		static unsigned int seq_lba = 4;
-		static int seq_lba_init = 0;
-		uint32_t count = m68000_get_reg(M68K_D2);
+		/* _S_READCAP(資料知識)。SCSI_SpcCdbExecute()のcase 0x25(READ
+		 * CAPACITY、実SPCエミュレーション経路)と同じ計算・同じ応答形式
+		 * (最終LBA+ブロック長512、いずれもビッグエンディアン4バイト)を
+		 * 使う。d4=ID、a1=8バイトバッファ。d2/d3は使わない(前回の
+		 * 「逐次READ」仮説はここで捨てる)。 */
+		uint32_t id = m68000_get_reg(M68K_D4);
 		uint32_t a1 = m68000_get_reg(M68K_A1);
-		uint32_t k;
-		int ok = 1;
+		int size = webx68k_scsi_get_size();
+		unsigned int last_lba = (size > 512) ? ((unsigned int)(size / 512) - 1) : 0;
 
-		if (!seq_lba_init)
+		if (id != 0)
 		{
-			seq_lba = 4;
-			seq_lba_init = 1;
-		}
-		if (count == 0 || count > 8)
-			count = 1;	/* 異常値なら1セクタだけにして被害を抑える */
-
-		for (k = 0; k < count; k++)
-		{
-			static uint8_t seq_sec[512];
-			if (webx68k_scsi_read_sector(seq_lba + k, seq_sec) != 0)
-			{
-				ok = 0;
-				break;
-			}
-			{
-				uint32_t j;
-				for (j = 0; j < 512; j++)
-					cpu_writemem24(a1 + k * 512 + j, seq_sec[j]);
-			}
-		}
-		if (ok)
-		{
-			if (log_cb && SCSIVerboseLog)
+			m68000_set_reg(M68K_D0, 0xffffffffu);
+			if (log_cb)
 				log_cb(RETRO_LOG_INFO,
-					"[SCSI-IOCS] $F5 HLE: $25=逐次READ(知識ではなく仮説、未検証) lba=%u count=%u a1=$%08x -> d0=0\n",
-					seq_lba, (unsigned)count, (unsigned)a1);
-			seq_lba += count;
-			m68000_set_reg(M68K_D0, 0);
+					"[SCSI-IOCS-CDB] _S_READCAP(資料知識) id=$%02x -> デバイス無し\n",
+					(unsigned)id);
 		}
 		else
 		{
+			cpu_writemem24(a1 + 0, (uint8_t)((last_lba >> 24) & 0xff));
+			cpu_writemem24(a1 + 1, (uint8_t)((last_lba >> 16) & 0xff));
+			cpu_writemem24(a1 + 2, (uint8_t)((last_lba >> 8) & 0xff));
+			cpu_writemem24(a1 + 3, (uint8_t)(last_lba & 0xff));
+			cpu_writemem24(a1 + 4, 0x00);
+			cpu_writemem24(a1 + 5, 0x00);
+			cpu_writemem24(a1 + 6, 0x02);
+			cpu_writemem24(a1 + 7, 0x00);
+			m68000_set_reg(M68K_D0, 0);
+			if (log_cb && SCSIVerboseLog)
+				log_cb(RETRO_LOG_INFO,
+					"[SCSI-IOCS-CDB] _S_READCAP(資料知識) size=%d -> last_lba=%u block=512 a1=$%08x -> d0=0\n",
+					size, last_lba, (unsigned)a1);
+		}
+	}
+	else if (data == 0x21)
+	{
+		/* _S_READ(資料知識)。d2=先頭ブロック d3=ブロック数 d4=ID
+		 * d5=ブロック長符号(0:256/1:512/2:1024)。物理セクタ
+		 * (webx68k_scsi_read_sector()、固定512バイト単位)へは
+		 * バイト数換算で変換する: 開始バイト=d2*ブロック長、
+		 * 物理LBA=開始バイト/512、物理個数=(d3*ブロック長)/512。
+		 * 256バイト符号(d5=0)は512の約数ではなく素直に変換できないため
+		 * 未対応として扱う(観測されていないため実装しない)。 */
+		uint32_t id = m68000_get_reg(M68K_D4);
+		uint32_t start = m68000_get_reg(M68K_D2);
+		uint32_t count = m68000_get_reg(M68K_D3);
+		uint32_t sizecode = m68000_get_reg(M68K_D5);
+		uint32_t a1 = m68000_get_reg(M68K_A1);
+		uint32_t block_bytes = (sizecode == 2) ? 1024u : (sizecode == 1) ? 512u : 0u;
+
+		if (id != 0 || block_bytes == 0 || count == 0)
+		{
+			m68000_set_reg(M68K_D0, 0xffffffffu);
 			if (log_cb)
 				log_cb(RETRO_LOG_ERROR,
-					"[SCSI-IOCS] $F5 HLE: $25 lba=%u count=%u 読み出し失敗\n",
-					seq_lba, (unsigned)count);
-			m68000_set_reg(M68K_D0, 0xffffffffu);
+					"[SCSI-IOCS-CDB] _S_READ(資料知識) id=$%02x start=%u count=%u d5=%u(未対応または異常) -> d0=$ffffffff\n",
+					(unsigned)id, (unsigned)start, (unsigned)count, (unsigned)sizecode);
+		}
+		else
+		{
+			uint32_t phys_lba = (start * block_bytes) / 512u;
+			uint32_t phys_count = (count * block_bytes) / 512u;
+			uint32_t k;
+			int ok = 1;
+
+			if (phys_count > (SCSI_IOCS_READ_MAX_SECTORS))
+				phys_count = SCSI_IOCS_READ_MAX_SECTORS;	/* 異常な大口径要求から静的バッファを守る */
+
+			for (k = 0; k < phys_count; k++)
+			{
+				static uint8_t sec[512];
+				if (webx68k_scsi_read_sector(phys_lba + k, sec) != 0)
+				{
+					ok = 0;
+					break;
+				}
+				{
+					uint32_t j;
+					for (j = 0; j < 512; j++)
+						cpu_writemem24(a1 + k * 512 + j, sec[j]);
+				}
+			}
+			if (ok)
+			{
+				m68000_set_reg(M68K_D0, 0);
+				if (log_cb && SCSIVerboseLog)
+					log_cb(RETRO_LOG_INFO,
+						"[SCSI-IOCS-CDB] _S_READ(資料知識) start=%u count=%u(論理、ブロック長=%u) -> lba=%u count=%u(物理512B) a1=$%08x -> d0=0\n",
+						(unsigned)start, (unsigned)count, (unsigned)block_bytes,
+						phys_lba, phys_count, (unsigned)a1);
+			}
+			else
+			{
+				m68000_set_reg(M68K_D0, 0xffffffffu);
+				if (log_cb)
+					log_cb(RETRO_LOG_ERROR,
+						"[SCSI-IOCS-CDB] _S_READ(資料知識) lba=%u count=%u 読み出し失敗 -> d0=$ffffffff\n",
+						phys_lba, phys_count);
+			}
 		}
 	}
 }
