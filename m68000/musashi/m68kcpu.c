@@ -943,6 +943,13 @@ void m68k_set_cpu_type(unsigned int cpu_type)
 
 /* Execute some instructions until we use up num_cycles clock cycles */
 /* ASG: removed per-instruction interrupt checks */
+/* 【調査用フック・段階1b】ボードROMの外へ制御が移った瞬間を観測するための
+ * フック。既定は無効(webx68k_leave_rom_watch_enabled==0)で、そのときは
+ * グローバル参照+分岐のみ(関数呼び出しなし)なので既存の速度に影響しない。
+ * 実体は x68k/scsi.c の webx68k_leave_rom_pc_check()。 */
+extern int32_t webx68k_leave_rom_watch_enabled;
+extern void webx68k_leave_rom_pc_check(uint32_t pc);
+
 int m68k_execute(int num_cycles)
 {
 	/* eat up any reset cycles */
@@ -981,6 +988,11 @@ int m68k_execute(int num_cycles)
 
 			/* Call external hook to peek at CPU */
 			m68ki_instr_hook(REG_PC); /* auto-disable (see m68kcpu.h) */
+
+			/* 【調査用フック・段階1b】既定は無効(0)。有効時のみ scsi.c 側で
+			 * ボードROM窓($ea0000-$eaffff)から外へ出た最初の瞬間を記録する。 */
+			if (webx68k_leave_rom_watch_enabled)
+				webx68k_leave_rom_pc_check(REG_PC);
 
 			/* Record previous program counter */
 			REG_PPC = REG_PC;

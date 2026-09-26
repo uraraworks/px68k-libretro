@@ -33113,10 +33113,19 @@ static void m68k_op_tas_8_al(void)
 }
 
 
+/* 【調査用フック・段階1b】SCSI IOCS(trap #15, d0=$F5)呼び出しの観測。
+ * 既定は無効(webx68k_iocs_f5_watch_enabled==0)で、そのときはグローバル
+ * 参照+分岐のみ(関数呼び出しなし)。実体は x68k/scsi.c 側。 */
+extern int32_t webx68k_iocs_f5_watch_enabled;
+extern void webx68k_iocs_f5_trap_check(void);
+
 static void m68k_op_trap(void)
 {
+	unsigned int trap_num = REG_IR & 0xf;
+	if (trap_num == 15 && webx68k_iocs_f5_watch_enabled)
+		webx68k_iocs_f5_trap_check();
 	/* Trap#n stacks exception frame type 0 */
-	m68ki_exception_trapN(EXCEPTION_TRAP_BASE + (REG_IR & 0xf));	/* HJB 990403 */
+	m68ki_exception_trapN(EXCEPTION_TRAP_BASE + trap_num);	/* HJB 990403 */
 }
 
 

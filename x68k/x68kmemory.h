@@ -84,4 +84,16 @@ extern int32_t webx68k_drv_hook_outside;
 
 void webx68k_drv_hook_refresh(void); /* WebX68k-storage/src/core-shim.c 側で定義 */
 
+/*
+ * 【調査用フック・段階1b】ボードROMの外へ制御が移った瞬間と、SCSI IOCS
+ * (trap #15, d0=$F5)呼び出しの観測。既定はどちらも無効(0)で速度に影響しない。
+ * 実体は x68k/scsi.c、有効化は core-shim.c の各 refresh() が毎フレーム
+ * globalThis.__webx68kLeaveRomWatch / __webx68kIocsF5Watch から反映する。
+ */
+extern int32_t webx68k_leave_rom_watch_enabled;
+extern int32_t webx68k_iocs_f5_watch_enabled;
+
+void webx68k_leave_rom_watch_refresh(void); /* WebX68k-storage/src/core-shim.c 側で定義 */
+void webx68k_iocs_f5_watch_refresh(void);   /* WebX68k-storage/src/core-shim.c 側で定義 */
+
 #endif

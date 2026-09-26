@@ -287,6 +287,87 @@ static int SCSIIOCSLogCount = 0;
 /* 自己検査の状態: 0=通常, 1=検査中(まだ届いていない), 2=検査中(届いた) */
 static int SCSIIOCSSelfTest = 0;
 
+/*
+ * 【調査用フック・段階1b】ボードROMの外(ディスクから読んだコード)へ初めて
+ * 制御が移った番地とレジスタを観測するための仕組み。
+ * 既定は無効(0)。x68k/mem_wrap.c 経由ではなく m68000/musashi/m68kcpu.c の
+ * 実行ループから毎命令チェックされる(webx68k_leave_rom_watch_enabled が0の
+ * ときは1回のグローバル参照+分岐のみで、既存の速度に影響しない)。
+ * ボードROM窓は $ea0000〜$eaffff に固定(実測で使っている範囲、可変にする
+ * 必要が出れば core-shim.c 側と合わせて広げる)。
+ * webx68k_leave_rom_watch_refresh() (WebX68k src/core-shim.c) が毎フレーム
+ * 先頭で JS 側 globalThis.__webx68kLeaveRomWatch を読み、この値へ反映する。
+ */
+int32_t webx68k_leave_rom_watch_enabled = 0;
+static int SCSILeaveRomSeenInside = 0;
+static int SCSILeaveRomLogged = 0;
+
+void webx68k_leave_rom_pc_check(uint32_t pc)
+{
+	if (SCSILeaveRomLogged)
+		return;
+
+	if (pc >= 0x00ea0000 && pc <= 0x00eaffff)
+	{
+		SCSILeaveRomSeenInside = 1;
+		return;
+	}
+
+	if (!SCSILeaveRomSeenInside)
+		return; /* まだボードROMに入っていない(起動前など) */
+
+	SCSILeaveRomLogged = 1;
+
+	if (log_cb)
+	{
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-LEAVE-ROM] ボードROMの外へ制御移行 pc=$%08x"
+			" d0=$%08x d1=$%08x d2=$%08x d3=$%08x d4=$%08x d5=$%08x d6=$%08x d7=$%08x"
+			" a0=$%08x a1=$%08x a2=$%08x a3=$%08x a4=$%08x a5=$%08x a6=$%08x a7=$%08x sr=$%04x\n",
+			(unsigned)pc,
+			(unsigned)m68k_get_reg(NULL, M68K_REG_D0), (unsigned)m68k_get_reg(NULL, M68K_REG_D1),
+			(unsigned)m68k_get_reg(NULL, M68K_REG_D2), (unsigned)m68k_get_reg(NULL, M68K_REG_D3),
+			(unsigned)m68k_get_reg(NULL, M68K_REG_D4), (unsigned)m68k_get_reg(NULL, M68K_REG_D5),
+			(unsigned)m68k_get_reg(NULL, M68K_REG_D6), (unsigned)m68k_get_reg(NULL, M68K_REG_D7),
+			(unsigned)m68k_get_reg(NULL, M68K_REG_A0), (unsigned)m68k_get_reg(NULL, M68K_REG_A1),
+			(unsigned)m68k_get_reg(NULL, M68K_REG_A2), (unsigned)m68k_get_reg(NULL, M68K_REG_A3),
+			(unsigned)m68k_get_reg(NULL, M68K_REG_A4), (unsigned)m68k_get_reg(NULL, M68K_REG_A5),
+			(unsigned)m68k_get_reg(NULL, M68K_REG_A6), (unsigned)m68k_get_reg(NULL, M68K_REG_A7),
+			(unsigned)m68k_get_reg(NULL, M68K_REG_SR));
+	}
+}
+
+/*
+ * 【調査用フック・段階1b】SCSI IOCS(trap #15, d0=$F5)の呼び出しを観測する。
+ * 本物ROM使用時は自前スタブの$e9f800経路を通らないため、trap#15そのものを
+ * m68k_op_trap()(m68000/musashi/m68kops.c)から呼ぶ。既定は無効(0)。
+ * 最初の30件のみ記録する(それ以降は黙って数えるだけ)。
+ */
+int32_t webx68k_iocs_f5_watch_enabled = 0;
+static int SCSIIocsF5LogCount = 0;
+static int SCSIIocsF5TotalCount = 0;
+#define SCSI_IOCS_F5_LOG_MAX 30
+
+void webx68k_iocs_f5_trap_check(void)
+{
+	unsigned int d0 = (unsigned int)m68k_get_reg(NULL, M68K_REG_D0);
+	if (d0 != 0xf5)
+		return;
+
+	SCSIIocsF5TotalCount++;
+	if (SCSIIocsF5LogCount >= SCSI_IOCS_F5_LOG_MAX)
+		return;
+	SCSIIocsF5LogCount++;
+
+	if (log_cb)
+		log_cb(RETRO_LOG_INFO,
+			"[SCSI-F5] #%d pc=$%08x d1=$%08x d2=$%08x d3=$%08x d4=$%08x a1=$%08x\n",
+			SCSIIocsF5LogCount, (unsigned)m68k_get_reg(NULL, M68K_REG_PPC),
+			(unsigned)m68k_get_reg(NULL, M68K_REG_D1), (unsigned)m68k_get_reg(NULL, M68K_REG_D2),
+			(unsigned)m68k_get_reg(NULL, M68K_REG_D3), (unsigned)m68k_get_reg(NULL, M68K_REG_D4),
+			(unsigned)m68k_get_reg(NULL, M68K_REG_A1));
+}
+
 static int SCSIEntryCallCount = 0;
 static int SCSIZeroCallCount = 0;
 
