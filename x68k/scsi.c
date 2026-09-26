@@ -3340,16 +3340,32 @@ static void webx68k_ram_locate_check(void)
 {
 	uint32_t limit, addr;
 	int found = -1;
+	int k;
 
 	if (!SCSILastReadIsRead)
 		return;
 	if (SCSISpcDataLen < 16)
 		return;
 
+	/* 【重要】MEM[]はバイト単位で$addrそのものではなく$addr^1に格納されている
+	 * (x68k/mem_wrap.c の ram_poke_raw()、!MSB_FIRST時)。単純なmemcmpでは
+	 * 中身が実在しても偶数/奇数バイトが入れ替わって不一致になり、全0以外の
+	 * データを取りこぼす(実測: 最初の実装ではLBA0/2/4/64/66/466/498が
+	 * 「見つからず」だった)。1バイトずつ ^1 を通して比較する。 */
 	limit = (uint32_t)Config.ram_size;
 	for (addr = 0; addr + 16 <= limit; addr++)
 	{
-		if (memcmp(MEM + addr, SCSISpcDataBuf, 16) == 0)
+		int ok = 1;
+		for (k = 0; k < 16; k++)
+		{
+#ifdef MSB_FIRST
+			uint8_t b = MEM[addr + k];
+#else
+			uint8_t b = MEM[(addr + k) ^ 1];
+#endif
+			if (b != SCSISpcDataBuf[k]) { ok = 0; break; }
+		}
+		if (ok)
 		{
 			found = (int)addr;
 			break;
