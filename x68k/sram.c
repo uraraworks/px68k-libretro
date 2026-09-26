@@ -9,6 +9,7 @@
 #include	"sysport.h"
 #include	"x68kmemory.h"
 #include	"sram.h"
+#include	"../m68000/m68000.h"
 
 static int write_enabled = 0;
 uint8_t	SRAM[0x4000];
@@ -113,13 +114,28 @@ uint8_t FASTCALL SRAM_Read(uint32_t adr)
 extern int webx68k_scsi_sram_boot_addr(void);
 static int webx68k_sram_reinject_active = 0; /* 再注入自身の書き込みで再帰しないようにする */
 
+/* 段階1a調査用: SRAM_Write の呼び出し経路を区別する。
+ * mem_wrap.c のメモリ書き込み表からCPU(m68k_execute実行中のゲスト命令、または
+ * cpu_writemem24経由のホストC側直接アクセス)経由で呼ばれる場合は
+ * webx68k_sram_write_call_site==0(既定=SRAM_WRITE_SITE_CPU_OR_HOST_MEMIO)のまま。
+ * SCSI_Init()や本ファイルの再注入フックなど、SRAM_Write()をCの関数呼び出しとして
+ * 直接叩く箇所は、呼ぶ直前にこの変数を立てて区別できるようにする。
+ * 重要な注意: m68k_get_reg(PC)は「現在の68000命令のPC」ではなく「次に実行される
+ * 命令のPC」であり、WinX68k_Reset()はm68k_pulse_reset()でPCをリセットベクタへ
+ * セットした直後(CPUが1命令も実行される前)にSCSI_Init()を呼ぶ。そのため
+ * SCSI_Init()内のSRAM_Write呼び出しでもPCは$00ff0010付近を指してしまい、
+ * PCだけでは「IPL自身が書いたのか、ホストC側がリセット直後に書いたのか」を
+ * 区別できない。呼び出し元ごとの明示フラグが必要な理由はここにある。 */
+int webx68k_sram_write_call_site = 0;
+
 void FASTCALL SRAM_Write(uint32_t adr, uint8_t data)
 {
 	uint32_t orig_adr = adr; /* 下でadr自身を書き換えるため、判定用に元の値を控える */
 
 	if ((adr >= 0x00ed000c && adr <= 0x00ed001b) && log_cb)
-		log_cb(RETRO_LOG_INFO, "[SRAM-WRITE] adr=$%08x data=$%02x write_enabled=%d\n",
-			(unsigned)adr, (unsigned)data, write_enabled);
+		log_cb(RETRO_LOG_INFO, "[SRAM-WRITE] adr=$%08x data=$%02x write_enabled=%d call_site=%d pc=$%08x\n",
+			(unsigned)adr, (unsigned)data, write_enabled, webx68k_sram_write_call_site,
+			(unsigned)m68k_get_reg(NULL, M68K_REG_PC));
 	if ( write_enabled && (adr < 0xed4000) )
 	{
 		adr       &= 0xffff;
@@ -137,12 +153,14 @@ void FASTCALL SRAM_Write(uint32_t adr, uint8_t data)
 		if (boot_addr)
 		{
 			webx68k_sram_reinject_active = 1;
+			webx68k_sram_write_call_site = 2; /* REINJECT */
 			SRAM_Write(0x00ed0018, 0xa0);
 			SRAM_Write(0x00ed0019, 0x00);
 			SRAM_Write(0x00ed000c, (uint8_t)((boot_addr >> 24) & 0xff));
 			SRAM_Write(0x00ed000d, (uint8_t)((boot_addr >> 16) & 0xff));
 			SRAM_Write(0x00ed000e, (uint8_t)((boot_addr >> 8) & 0xff));
 			SRAM_Write(0x00ed000f, (uint8_t)(boot_addr & 0xff));
+			webx68k_sram_write_call_site = 0;
 			webx68k_sram_reinject_active = 0;
 			if (log_cb)
 				log_cb(RETRO_LOG_INFO,

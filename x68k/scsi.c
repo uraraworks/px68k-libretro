@@ -1186,11 +1186,14 @@ void SCSI_Init(void)
 	{
 		/* SRAM は書き込み許可を開けないと無言で捨てられる(実測: 開けずに
 		 * 書いたら読み返しが $ff のままだった)。開けたら必ず閉じる。 */
+		extern int webx68k_sram_write_call_site;
+		webx68k_sram_write_call_site = 1; /* SCSI_INIT: Cから直接呼んでいる(PCはCPUの現在値ではない) */
 		SRAM_WriteEnable(1);
 		SRAM_Write(0x00ed006f, 0x56);
 		SRAM_Write(0x00ed0070, 0x07);
 		SRAM_Write(0x00ed0071, 0x00);
 		SRAM_WriteEnable(0);
+		webx68k_sram_write_call_site = 0;
 		if (log_cb)
 			log_cb(RETRO_LOG_INFO, "[SCSI] SRAM に SCSI ローダ相当の既定値を書いた (読み返し $%02x $%02x $%02x)\n",
 				SRAM_Read(0x00ed006f), SRAM_Read(0x00ed0070), SRAM_Read(0x00ed0071));
@@ -1205,6 +1208,8 @@ void SCSI_Init(void)
 		int boot_addr = webx68k_scsi_sram_boot_addr();
 		if (boot_addr)
 		{
+			extern int webx68k_sram_write_call_site;
+			webx68k_sram_write_call_site = 1; /* SCSI_INIT */
 			SRAM_WriteEnable(1);
 			SRAM_Write(0x00ed0018, 0xa0);
 			SRAM_Write(0x00ed0019, 0x00);
@@ -1213,6 +1218,7 @@ void SCSI_Init(void)
 			SRAM_Write(0x00ed000e, (uint8_t)((boot_addr >> 8) & 0xff));
 			SRAM_Write(0x00ed000f, (uint8_t)(boot_addr & 0xff));
 			SRAM_WriteEnable(0);
+			webx68k_sram_write_call_site = 0;
 			if (log_cb)
 				log_cb(RETRO_LOG_INFO,
 					"[SCSI-BOOT] SRAM起動デバイスをROM起動に設定 (要求addr=$%08x, 読み返し $ed0018=$%02x%02x $ed000c=$%02x%02x%02x%02x)\n",
