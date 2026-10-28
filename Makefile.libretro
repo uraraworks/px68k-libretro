@@ -420,7 +420,7 @@ ifeq ($(DEBUG), 1)
 else ifneq (,$(findstring msvc,$(platform)))
    FLAGS += -O2
 else
-   FLAGS += -O2 -ffast-math -fomit-frame-pointer
+   FLAGS += $(if $(WEBX68K_OPT_FLAGS),$(WEBX68K_OPT_FLAGS),-O2) -ffast-math -fomit-frame-pointer
 endif
 
 ifeq ($(USE_LIBRETRO_VFS),1)
