@@ -1770,6 +1770,9 @@ bool retro_unserialize(const void *data, size_t size)
    st.fastsavestates = UsingFastSavestates();
 
    ret = PX68KSS_LoadSM(&st, 0, 0);
+#ifdef __EMSCRIPTEN__
+   { extern int webx68k_draw_force; webx68k_draw_force = 1; }
+#endif
 
    return ret;
 }
@@ -1946,6 +1949,9 @@ void retro_deinit(void)
 
 void retro_reset(void)
 {
+#ifdef __EMSCRIPTEN__
+   { extern int webx68k_draw_force; webx68k_draw_force = 1; }
+#endif
    WinX68k_Reset();
    if (Config.MIDI_SW && Config.MIDI_Reset)
 	   MIDI_Reset();
@@ -2449,12 +2455,20 @@ static void WinX68k_Exec(void)
    }
 }
 
+#ifdef __EMSCRIPTEN__
+extern int webx68k_draw_changed, webx68k_draw_force;
+#endif
+
 void retro_run(void)
 {
    int i;
    int mouse_x, mouse_y, mouse_l, mouse_r;
    bool updated    = false;
    static bool mbL = false, mbR = false;
+#ifdef __EMSCRIPTEN__
+   webx68k_draw_changed = webx68k_draw_force;
+   webx68k_draw_force = 0;
+#endif
 
    if (firstcall)
    {
@@ -2633,5 +2647,13 @@ void retro_run(void)
 
    audio_batch_cb((const int16_t*)soundbuf, soundbuf_size);
 
+#ifdef __EMSCRIPTEN__
+   {
+      static const uint16_t *previous_video_buffer = NULL;
+      if (menu_mode != menu_out || previous_video_buffer != videoBuffer)
+         webx68k_draw_changed = 1;
+      previous_video_buffer = videoBuffer;
+   }
+#endif
    video_cb(videoBuffer, retrow, retroh, retro_pitch << 1);
 }

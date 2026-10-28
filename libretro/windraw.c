@@ -52,6 +52,11 @@ uint16_t menu_buffer[800*600];
 extern uint8_t Debug_Text, Debug_Grp, Debug_Sp;
 
 static uint16_t *ScrBuf = 0;
+#ifdef __EMSCRIPTEN__
+int webx68k_draw_changed = 1;
+int webx68k_draw_skip = 0;
+int webx68k_draw_force = 1;
+#endif
 
 uint16_t WinDraw_Pal16B, WinDraw_Pal16R, WinDraw_Pal16G;
 
@@ -81,11 +86,17 @@ void FASTCALL WinDraw_Draw(void)
 
 	if (oldtextx != TextDotX)
 	{
+#ifdef __EMSCRIPTEN__
+		webx68k_draw_changed = 1;
+#endif
 		oldtextx = TextDotX;
 		CHANGEAV=1;
 	}
 	if (oldtexty != TextDotY)
 	{
+#ifdef __EMSCRIPTEN__
+		webx68k_draw_changed = 1;
+#endif
 		oldtexty = TextDotY;
 		CHANGEAV=1;
 	}
@@ -333,6 +344,14 @@ void WinDraw_DrawLine(void)
 	if (!TextDirtyLine[VLINE])
 		return;
 
+#ifdef __EMSCRIPTEN__
+	if (webx68k_draw_skip)
+	{
+		webx68k_draw_changed = 1;
+		return;
+	}
+	webx68k_draw_changed = 1;
+#endif
 	TextDirtyLine[VLINE] = 0;
 
 	if (Debug_Grp)
