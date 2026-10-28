@@ -61,7 +61,7 @@ void WinDraw_Init(void)
 	WinDraw_Pal16G = 0x07e0;
 	WinDraw_Pal16B = 0x001f;
 
-	ScrBuf         = malloc(FULLSCREEN_WIDTH * FULLSCREEN_HEIGHT * 2);
+	ScrBuf         = calloc(FULLSCREEN_WIDTH * FULLSCREEN_HEIGHT, 2); /* zeroed: lines not yet drawn must not show heap garbage */
 }
 
 void WinDraw_Cleanup(void)
