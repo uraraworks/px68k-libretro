@@ -107,6 +107,10 @@ char base_dir[MAX_PATH];
 
 static uint8_t Core_Key_State[512];
 static uint8_t Core_old_Key_State[512];
+#ifdef __EMSCRIPTEN__
+uint8_t webx68k_key_state[512];
+int webx68k_key_state_enabled;
+#endif
 
 static bool joypad1, joypad2;
 
@@ -2581,6 +2585,11 @@ void retro_run(void)
    }
 
    /* WebX68k の専用キー(RETROK_EURO 以降)もポーリング対象に含める。 */
+#ifdef __EMSCRIPTEN__
+   if (webx68k_key_state_enabled)
+      memcpy(Core_Key_State, webx68k_key_state, RETROK_LAST);
+   else
+#endif
    for(i = 0; i < RETROK_LAST; i++)
       Core_Key_State[i] = input_state_cb(0, RETRO_DEVICE_KEYBOARD, 0, i) ? 0x80: 0;
 
